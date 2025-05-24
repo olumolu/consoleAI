@@ -29,16 +29,14 @@ Run this from any macos or linux even from android with turmux.
     Clone the repository or download `ai.sh` to your local machine.
     ```bash
     git clone https://github.com/olumolu/consoleAI.git
+    ```
+    ```bash
     cd consoleAI
     ```
     Or just download the `ai.sh` file.
 
-2.  **Make it Executable:**
-    ```bash
-    chmod +x ai.sh
-    ```
-
-3.  **IMPORTANT: Configure API Keys:**
+> [!IMPORTANT]
+> 2.    configure API Keys:**
     You **MUST** add your API keys to the script. Open `ai.sh` in a text editor and locate the API key section:
 
     ```bash
@@ -51,7 +49,27 @@ Run this from any macos or linux even from android with turmux.
     CEREBRAS_API_KEY=""
     ```
     
-4.  **(Optional) Adjust Default Settings:**
+    
+3.  **Make it Executable:**
+    ```bash
+    chmod +x ai.sh
+    ```
+
+
+4.  **To Run This**
+
+To start interacting with a specific AI provider, execute the script from your terminal followed by the provider's name. Here are the supported commands:
+
+    ./ai.sh gemini
+    ./ai.sh groq
+    ./ai.sh chutes
+    ./ai.sh fireworks
+    ./ai.sh together
+    ./ai.sh openrouter
+    ./ai.sh cerebras
+
+> [!NOTE]    
+> 5.  **(Optional) Adjust Default Settings:**
     You can customize other settings near the top of the script:
     *   `MAX_HISTORY_MESSAGES`: Number of past messages (user + AI) to keep in history.
     *   `DEFAULT_OAI_TEMPERATURE`, `DEFAULT_OAI_MAX_TOKENS`, `DEFAULT_OAI_TOP_P`: Parameters for OpenAI-compatible APIs.
