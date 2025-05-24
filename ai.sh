@@ -11,7 +11,7 @@ set -e -E # Exit on error, inherit error traps
 # --- Configuration ---
 MAX_HISTORY_MESSAGES=20 # Keep the last N messages (user + ai). Adjust if needed.
 DEFAULT_OAI_TEMPERATURE=1.0 # Default temperature for OpenAI-compatible APIs
-DEFAULT_OAI_MAX_TOKENS=2048 # Default max_tokens for OpenAI-compatible APIs
+DEFAULT_OAI_MAX_TOKENS=8192 # Default max_tokens for OpenAI-compatible APIs
 DEFAULT_OAI_TOP_P=1.0       # Default top_p for OpenAI-compatible APIs
 
 # --- System Prompt Definition ---
