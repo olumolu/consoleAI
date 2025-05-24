@@ -77,6 +77,7 @@ Choose any model from any provider just by selecting the Number mentioned before
     *   `DEFAULT_OAI_TEMPERATURE`, `DEFAULT_OAI_MAX_TOKENS`, `DEFAULT_OAI_TOP_P`: Parameters for OpenAI-compatible APIs.
     *   `SYSTEM_PROMPT`: The default system-level instruction for the AI. Set to `""` to disable.
 
+
 > [!NOTE]
 > ### Out of scope
 >  *  Image genaration is out of scope as it is a terminal app.
