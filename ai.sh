@@ -10,10 +10,9 @@ set -e -E # Exit on error, inherit error traps
 
 # --- Configuration ---
 MAX_HISTORY_MESSAGES=20       # Keep the last N messages (user + ai). Adjust if needed.
-DEFAULT_OAI_TEMPERATURE=0.8   # t = randomness: Higher = more creative, Lower = more predictable | allowed value 0-2
+DEFAULT_OAI_TEMPERATURE=1     # t = randomness: Higher = more creative, Lower = more predictable | allowed value 0-2
 DEFAULT_OAI_MAX_TOKENS=8192   # Default max_tokens for OpenAI-compatible APIs 
 DEFAULT_OAI_TOP_P=0.9         # p = diversity: Higher = wider vocabulary, Lower = safer word choices | allowed value 0-1
-DEFAULT_OAI_TOP_K=40          # k = selection pool:  Higher = more options, Lower = more focused | allowed value 1-100
 
 # --- System Prompt Definition ---
 # Instruct the AI to use the conversation history to maintain the ongoing task context.
@@ -364,7 +363,7 @@ echo -e "${COLOR_INFO}Provider:${COLOR_RESET}      ${PROVIDER^^}"
 echo -e "${COLOR_INFO}Model:${COLOR_RESET}         ${MODEL_ID}"
 echo -e "${COLOR_INFO}History Limit:${COLOR_RESET} Last $MAX_HISTORY_MESSAGES messages (user+AI)"
 if [[ "$IS_OPENAI_COMPATIBLE" == true ]]; then
-    echo -e "${COLOR_INFO}Temp/MaxTokens/TopP/TopK (OAI):${COLOR_RESET} $DEFAULT_OAI_TEMPERATURE / $DEFAULT_OAI_MAX_TOKENS / $DEFAULT_OAI_TOP_P / $DEFAULT_OAI_TOP_K"
+    echo -e "${COLOR_INFO}Temp/MaxTokens/TopP (OAI):${COLOR_RESET} $DEFAULT_OAI_TEMPERATURE / $DEFAULT_OAI_MAX_TOKENS / $DEFAULT_OAI_TOP_P"
 fi
 
 if [[ -n "$SYSTEM_PROMPT" ]]; then
@@ -480,14 +479,12 @@ while true; do
             --arg temperature_str "$DEFAULT_OAI_TEMPERATURE" \
             --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
             --arg top_p_str "$DEFAULT_OAI_TOP_P" \
-            --arg top_k_str "$DEFAULT_OAI_TOP_K" \
             '{
                 model: $model,
                 messages: $messages,
                 temperature: ($temperature_str | tonumber),
                 max_tokens: ($max_tokens_str | tonumber),
                 top_p: ($top_p_str | tonumber),
-                top_k: ($top_k_str | tonumber),
                 stream: true
              }'
             )
