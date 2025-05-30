@@ -22,8 +22,7 @@ Run this from any macos or linux even from android with turmux.
 *   **Color-Coded Output:** Differentiates between user input, AI responses, errors, and info messages.
 *   **Minimal Dependencies:** Requires only `bash`, `curl`, and `jq`.
 *   **Easy Configuration:** API keys and core settings are managed directly within the script.
-
-## Setup & Configuration
+*   **Tool Calling:** Tool Calling added into gemini with prompt to enable.
 
 1.  **Download the Script:**
     Clone the repository or download `ai.sh` to your local machine.
