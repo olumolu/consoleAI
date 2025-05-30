@@ -5,6 +5,7 @@
 # To Run This Tool First Make It executable with $ chmod +x ai.sh
 # Run This $ ./ai.sh provider (e.g., ./ai.sh gemini)
 # History, system prompt, and streaming are supported.
+# Support for tool-calling in gemini google web serach with in built on off toggle.
 
 set -e -E # Exit on error, inherit error traps
 
@@ -85,6 +86,11 @@ function print_usage() {
   echo -e "${COLOR_INFO}Supported Providers:${COLOR_RESET}"
   echo -e "  gemini, openrouter, groq, together, fireworks, chutes, cerebras"
   echo -e ""
+  echo -e "${COLOR_INFO}Note on Gemini Tool Calling:${COLOR_RESET}"
+  echo -e "  If you select 'gemini' as the provider, you will be asked if you wish to"
+  echo -e "  enable built-in online tool calling (web search, URL context)."
+  echo -e "  This feature is only available for Gemini models."
+  echo -e ""
   echo -e "${COLOR_INFO}Finding Model Identifiers (if needed manually):${COLOR_RESET}"
   echo -e "    ${COLOR_USER}Gemini:${COLOR_RESET}     https://ai.google.dev/models/gemini (Use 'Model name')"
   echo -e "    ${COLOR_USER}OpenRouter:${COLOR_RESET} https://openrouter.ai/models (Includes OpenAI, Anthropic, etc.)"
@@ -98,10 +104,6 @@ function print_usage() {
   echo -e "  ${COLOR_AI}$0 gemini${COLOR_RESET}"
   echo -e "  ${COLOR_AI}$0 groq${COLOR_RESET}"
   echo -e "  ${COLOR_AI}$0 chutes${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 fireworks${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 together${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 openrouter${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 cerebras${COLOR_RESET}"
   echo -e "${COLOR_WARN}NOTE: Ensure API keys are set inside the script before running!${COLOR_RESET}"
 }
 
@@ -176,6 +178,9 @@ if ! command -v curl &> /dev/null || ! command -v jq &> /dev/null; then
     echo -e "${COLOR_ERROR}Error: 'curl' and 'jq' are required. Please install them.${COLOR_RESET}" >&2
     exit 1
 fi
+
+# --- Global Tool Calling Flag (set interactively for Gemini) ---
+ENABLE_TOOL_CALLING=false 
 
 # --- Get API Key and Check Placeholders ---
 API_KEY=""
@@ -321,6 +326,26 @@ case "$PROVIDER" in
         # Use streamGenerateContent with alt=sse for Server-Sent Events
         CHAT_API_URL="${GEMINI_CHAT_URL_BASE}${MODEL_ID}:streamGenerateContent?key=${API_KEY}&alt=sse"
         IS_OPENAI_COMPATIBLE=false # Gemini uses "model" role, not "assistant"
+
+        # --- Interactive prompt for tool calling for Gemini ---
+        echo ""
+        tool_choice_input=""
+        while true; do
+            read -r -p "$(echo -e "${COLOR_INFO}Do you want to enable online tool calling (web search, URL context) for Gemini? (y/n, 1/0): ${COLOR_RESET}")" tool_choice_input
+            tool_choice_input=$(echo "$tool_choice_input" | tr '[:upper:]' '[:lower:]') # Convert to lowercase
+            if [[ "$tool_choice_input" == "y" || "$tool_choice_input" == "1" ]]; then
+                ENABLE_TOOL_CALLING=true
+                echo -e "${COLOR_INFO}Tool calling enabled.${COLOR_RESET}"
+                break
+            elif [[ "$tool_choice_input" == "n" || "$tool_choice_input" == "0" ]]; then
+                ENABLE_TOOL_CALLING=false
+                echo -e "${COLOR_INFO}Tool calling disabled.${COLOR_RESET}"
+                break
+            else
+                echo -e "${COLOR_WARN}Invalid input. Please enter 'y', 'n', '1', or '0'.${COLOR_RESET}" >&2
+            fi
+        done
+        echo ""
         ;;
     openrouter|groq|together|fireworks|chutes|cerebras)
         CHAT_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
@@ -377,6 +402,16 @@ if [[ -n "$SYSTEM_PROMPT" ]]; then
 else
     echo -e "${COLOR_INFO}System Prompt:${COLOR_RESET}   Inactive (set to empty string)"
 fi
+
+# Display tool calling status if it's Gemini
+if [[ "$PROVIDER" == "gemini" ]]; then
+    if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
+        echo -e "${COLOR_INFO}Tool Calling:${COLOR_RESET}    ${COLOR_BOLD}Enabled${COLOR_RESET} (for Gemini models)"
+    else
+        echo -e "${COLOR_INFO}Tool Calling:${COLOR_RESET}    Disabled (for Gemini models)"
+    fi
+fi
+
 echo -e "Enter your prompt below. Type ${COLOR_BOLD}'quit'${COLOR_RESET} or ${COLOR_BOLD}'exit'${COLOR_RESET} to end session."
 echo -e "----------------------------------------"
 
@@ -463,15 +498,22 @@ while true; do
     fi
 
     json_payload=""
-    if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then # Gemini payload (streaming URL handles stream, payload structure is for non-streamed body too)
-        # Gemini streamGenerateContent doesn't usually take temp/max_tokens in request body, rather as query params or SDK config.
-        # For direct HTTP for streamGenerateContent, these are sometimes omitted from body in favor of global model defaults or set elsewhere if supported.
-        # To keep it simple and align with generateContent, we can still include them, API will ignore if not applicable.
+    if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then # Gemini payload
         json_payload=$(jq -n --argjson contents "$history_json_array" \
             --arg temperature_str "1.0" \
             --arg max_tokens_str "4096" \
-            '{contents: $contents, generationConfig: {temperature: ($temperature_str | tonumber), maxOutputTokens: ($max_tokens_str | tonumber)}}'
+            '{
+                contents: $contents,
+                generationConfig: {
+                    temperature: ($temperature_str | tonumber),
+                    maxOutputTokens: ($max_tokens_str | tonumber)
+                }
+            }'
         )
+        # Conditionally add the tools array if ENABLE_TOOL_CALLING is true
+        if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
+            json_payload=$(echo "$json_payload" | jq '. + {tools: [{"urlContext": {}}, {"googleSearch": {}}]}')
+        fi
     else # OpenAI-Compatible payload (add stream:true)
          json_payload=$(jq -n \
             --arg model "$MODEL_ID" \
@@ -591,7 +633,26 @@ while true; do
                      current_sfr=$(echo "$json_chunk" | jq -r '.candidates[0].safetyRatings[]? | select(.blocked == true) | .category // empty' | head -n 1)
                      if [[ -n "$current_sfr" && "$current_sfr" != "null" ]]; then current_sfr="SAFETY"; fi # Normalize safety block to "SAFETY"
                 fi
-            fi
+
+                # Check for tool calls in Gemini response IF tool calling is enabled
+                if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
+                    tool_call_parts=$(echo "$json_chunk" | jq -c '.candidates[0].content.parts[] | select(.functionCall != null) // empty')
+                    if [[ -n "$tool_call_parts" ]]; then
+                        # This script currently doesn't execute tool calls.
+                        # You would need to add logic here to parse and potentially execute the tool call.
+                        # For now, we'll just log it.
+                        if [[ "$first_chunk_received" == false ]]; then
+                            echo -ne "\r\033[K"; echo -n -e "${COLOR_AI}AI:${COLOR_RESET}  ${COLOR_AI}"
+                            first_chunk_received=true
+                        fi
+                        echo -e "\n${COLOR_WARN}AI requested tool call:${COLOR_RESET}" >&2
+                        echo "$tool_call_parts" | jq . >&2 # Pretty print the tool call
+                        echo -e "${COLOR_WARN}(This script does not automatically execute tool calls or return tool output to the model.)\n${COLOR_RESET}" >&2
+                        # Do not append tool call JSON to full_ai_response_text, as it's not "text"
+                        # For a true tool-using agent, you'd feed this tool output back to the model.
+                    fi
+                fi # End check for ENABLE_TOOL_CALLING for Gemini
+            fi # End Gemini specific text/finish reason/tool call extraction
 
             # Store the first non-null finish reason encountered
             if [[ -n "$current_sfr" && "$current_sfr" != "null" && ( -z "$stream_finish_reason" || "$stream_finish_reason" == "null" ) ]]; then
