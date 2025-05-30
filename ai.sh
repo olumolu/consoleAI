@@ -21,13 +21,13 @@ DEFAULT_OAI_TOP_P=0.9         # p = diversity: Higher = wider vocabulary, Lower 
 SYSTEM_PROMPT="You are a helpful assistant running in a command-line interface."
 # SYSTEM_PROMPT="" # Example: Disable system prompt
 
-# --- Color Definitions ---
+# --- Color Definitions --- Use 256-color
 COLOR_RESET='\033[0m'
-COLOR_USER='\033[0;34m'  # Blue for User
-COLOR_AI='\033[0;32m'    # Green for AI
-COLOR_ERROR='\033[0;31m' # Red for Errors
-COLOR_WARN='\033[0;33m' # Yellow for Warnings
-COLOR_INFO='\033[0;36m' # Cyan for Info
+COLOR_USER='\033[38;5;81m'     # Bright cyan-blue
+COLOR_AI='\033[38;5;156m'       # Soft green
+COLOR_ERROR='\033[38;5;203m'    # Vivid red
+COLOR_WARN='\033[38;5;221m'     # Soft yellow
+COLOR_INFO='\033[38;5;159m'     # Light cyan
 COLOR_BOLD='\033[1m'
 
 ##########################################################################
