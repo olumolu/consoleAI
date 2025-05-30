@@ -104,6 +104,10 @@ function print_usage() {
   echo -e "  ${COLOR_AI}$0 gemini${COLOR_RESET}"
   echo -e "  ${COLOR_AI}$0 groq${COLOR_RESET}"
   echo -e "  ${COLOR_AI}$0 chutes${COLOR_RESET}"
+  echo -e "  ${COLOR_AI}$0 fireworks${COLOR_RESET}"
+  echo -e "  ${COLOR_AI}$0 together${COLOR_RESET}"
+  echo -e "  ${COLOR_AI}$0 openrouter${COLOR_RESET}"
+  echo -e "  ${COLOR_AI}$0 cerebras${COLOR_RESET}"
   echo -e "${COLOR_WARN}NOTE: Ensure API keys are set inside the script before running!${COLOR_RESET}"
 }
 
