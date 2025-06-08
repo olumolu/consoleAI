@@ -1,7 +1,7 @@
 #!/bin/bash
 # Universal Chat CLI (Bash/curl/jq) - With Model Selection, HISTORY, SYSTEM PROMPT, STREAMING
 # REQUIREMENTS: bash, curl, jq (must be pre-installed on the system)
-# Supports: Gemini, OpenRouter, Groq, Together AI, Fireworks AI, Chutes AI, Cerebras AI
+# Supports: Gemini, OpenRouter, Groq, Together AI, Fireworks AI, Chutes AI, Cerebras AI, Novita AI
 # To Run This Tool First Make It executable with $ chmod +x ai.sh
 # Run This $ ./ai.sh provider (e.g., ./ai.sh gemini)
 # History, system prompt, and streaming are supported.
@@ -42,7 +42,7 @@ COLOR_BOLD='\033[1m'
 # Fireworks: https://fireworks.ai/api-keys
 # Chutes: https://chutes.ai
 # Cerebras: https://cloud.cerebras.ai/
-
+# Novita: https://novita.ai/
 
 GEMINI_API_KEY=""
 OPENROUTER_API_KEY=""
@@ -51,6 +51,7 @@ TOGETHER_API_KEY=""
 FIREWORKS_API_KEY=""
 CHUTES_API_KEY=""
 CEREBRAS_API_KEY=""
+NOVITA_API_KEY=""
 
 # --- API Endpoints ---
 # Chat Endpoints
@@ -61,6 +62,7 @@ TOGETHER_CHAT_URL="https://api.together.ai/v1/chat/completions"
 FIREWORKS_CHAT_URL="https://api.fireworks.ai/inference/v1/chat/completions"
 CHUTES_CHAT_URL="https://llm.chutes.ai/v1/chat/completions"
 CEREBRAS_CHAT_URL="https://api.cerebras.ai/v1/chat/completions"
+NOVITA_CHAT_URL="https://api.novita.ai/v3/openai/chat/completions"
 
 # Model Listing Endpoints
 GEMINI_MODELS_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models"
@@ -70,6 +72,7 @@ TOGETHER_MODELS_URL="https://api.together.ai/v1/models"
 FIREWORKS_MODELS_URL="https://api.fireworks.ai/inference/v1/models"
 CHUTES_MODELS_URL="https://llm.chutes.ai/v1/models"
 CEREBRAS_MODELS_URL="https://api.cerebras.ai/v1/models"
+NOVITA_MODELS_URL="https://api.novita.ai/v3/models"
 
 # --- Helper Functions ---
 
@@ -84,7 +87,7 @@ function print_usage() {
   echo -e "  It will fetch available models and let you choose one by number."
   echo -e ""
   echo -e "${COLOR_INFO}Supported Providers:${COLOR_RESET}"
-  echo -e "  gemini, openrouter, groq, together, fireworks, chutes, cerebras"
+  echo -e "  gemini, openrouter, groq, together, fireworks, chutes, cerebras, novita"
   echo -e ""
   echo -e "${COLOR_INFO}Note on Gemini Tool Calling:${COLOR_RESET}"
   echo -e "  If you select 'gemini' as the provider, you will be asked if you wish to"
@@ -99,6 +102,7 @@ function print_usage() {
   echo -e "    ${COLOR_USER}Fireworks:${COLOR_RESET}  https://fireworks.ai/models (Look for API ID, often like 'accounts/fireworks/models/...')"
   echo -e "    ${COLOR_USER}Chutes:${COLOR_RESET}     https://chutes.ai (Check their model documentation or use the script's model list)"
   echo -e "    ${COLOR_USER}Cerebras:${COLOR_RESET}   https://cloud.cerebras.ai (Check their model documentation or use the script's model list)"
+  echo -e "    ${COLOR_USER}Novita:${COLOR_RESET}     https://docs.novita.ai (Check their model documentation or use the script's model list)"
   echo -e ""
   echo -e "${COLOR_INFO}Example Commands:${COLOR_RESET}"
   echo -e "  ${COLOR_AI}$0 gemini${COLOR_RESET}"
@@ -108,6 +112,7 @@ function print_usage() {
   echo -e "  ${COLOR_AI}$0 together${COLOR_RESET}"
   echo -e "  ${COLOR_AI}$0 openrouter${COLOR_RESET}"
   echo -e "  ${COLOR_AI}$0 cerebras${COLOR_RESET}"
+  echo -e "  ${COLOR_AI}$0 novita${COLOR_RESET}"
   echo -e "${COLOR_WARN}NOTE: Ensure API keys are set inside the script before running!${COLOR_RESET}"
 }
 
@@ -146,6 +151,9 @@ function check_placeholder_key() {
     elif [[ "$provider_name" == "cerebras" && "$key_value" == "csk-" ]]; then # Specific check for "csk-"
         placeholder_found=true
         message="is the default Cerebras prefix placeholder ('csk-')"
+    elif [[ "$provider_name" == "novita" && ${#key_value} -lt 10 ]]; then # Catches incomplete Novita key
+       placeholder_found=true
+       message="appears to be too short to be a valid key"
     fi
 
     if [[ "$placeholder_found" == true ]]; then
@@ -196,8 +204,9 @@ case "$PROVIDER" in
     fireworks)  API_KEY="$FIREWORKS_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     chutes)     API_KEY="$CHUTES_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     cerebras)   API_KEY="$CEREBRAS_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
+    novita)     API_KEY="$NOVITA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     *)
-        echo -e "${COLOR_ERROR}Error: Unknown provider '$PROVIDER'. Choose from: gemini, openrouter, groq, together, fireworks, chutes, cerebras${COLOR_RESET}" >&2
+        echo -e "${COLOR_ERROR}Error: Unknown provider '$PROVIDER'. Choose from: gemini, openrouter, groq, together, fireworks, chutes, cerebras, novita${COLOR_RESET}" >&2
         print_usage
         exit 1
         ;;
@@ -250,7 +259,12 @@ case "$PROVIDER" in
     cerebras)
         MODELS_URL="$CEREBRAS_MODELS_URL"
         MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
-        JQ_QUERY='.data | sort_by(.id) | .[].id' # Assumes OpenAI-like model list structure
+        JQ_QUERY='.data | sort_by(.id) | .[].id'
+        ;;
+    novita)
+        MODELS_URL="$NOVITA_MODELS_URL"
+        MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
+        JQ_QUERY='.data | sort_by(.id) | .[].id'
         ;;
 esac
 
@@ -351,7 +365,7 @@ case "$PROVIDER" in
         done
         echo ""
         ;;
-    openrouter|groq|together|fireworks|chutes|cerebras)
+    openrouter|groq|together|fireworks|chutes|cerebras|novita)
         CHAT_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
         IS_OPENAI_COMPATIBLE=true # These use "assistant" role
         case "$PROVIDER" in
@@ -365,6 +379,7 @@ case "$PROVIDER" in
             fireworks)  CHAT_API_URL="$FIREWORKS_CHAT_URL" ;;
             chutes)     CHAT_API_URL="$CHUTES_CHAT_URL" ;;
             cerebras)   CHAT_API_URL="$CEREBRAS_CHAT_URL" ;;
+            novita)     CHAT_API_URL="$NOVITA_CHAT_URL" ;;
         esac
         ;;
 esac
