@@ -3,7 +3,7 @@
 # REQUIREMENTS: bash, curl, jq (must be pre-installed on the system)
 # Supports: Gemini, OpenRouter, Groq, Together AI, Fireworks AI, Chutes AI, Cerebras AI, Novita AI
 # To Run This Tool First Make It executable with $ chmod +x ai.sh
-# Run This $ ./ai.sh provider (e.g., ./ai.sh gemini)
+# Run This $ ./ai.sh provider [filter1] [filter2]... (e.g., ./ai.sh openrouter 8b)
 # History, system prompt, and streaming are supported.
 # Support for tool-calling in gemini google web serach with in built on off toggle.
 
@@ -12,7 +12,7 @@ set -e -E # Exit on error, inherit error traps
 # --- Configuration ---
 MAX_HISTORY_MESSAGES=20       # Keep the last N messages (user + ai). Adjust if needed.
 DEFAULT_OAI_TEMPERATURE=1     # t = randomness: Higher = more creative, Lower = more predictable | allowed value 0-2
-DEFAULT_OAI_MAX_TOKENS=8192   # Default max_tokens for OpenAI-compatible APIs 
+DEFAULT_OAI_MAX_TOKENS=8192   # Default max_tokens for OpenAI-compatible APIs
 DEFAULT_OAI_TOP_P=0.9         # p = diversity: Higher = wider vocabulary, Lower = safer word choices | allowed value 0-1
 
 # --- System Prompt Definition ---
@@ -78,12 +78,11 @@ NOVITA_MODELS_URL="https://api.novita.ai/v3/openai/models"
 
 function print_usage() {
   echo -e ""
-  echo -e "${COLOR_INFO}Usage: $0 <provider>${COLOR_RESET}"
+  echo -e "${COLOR_INFO}Usage: $0 <provider> [filter1] [filter2]...${COLOR_RESET}"
   echo -e ""
   echo -e "${COLOR_INFO}Description:${COLOR_RESET}"
-  echo -e "  Starts an interactive chat session with the specified AI provider,"
-  echo -e "  maintaining conversation history, using a system prompt (if applicable),"
-  echo -e "  and streaming responses token by token."
+  echo -e "  Starts an interactive chat session with the specified AI provider."
+  echo -e "  You can add optional filter words (e.g., '8b', 'free', '32k') to narrow down the model list."
   echo -e "  It will fetch available models and let you choose one by number."
   echo -e ""
   echo -e "${COLOR_INFO}Supported Providers:${COLOR_RESET}"
@@ -106,13 +105,9 @@ function print_usage() {
   echo -e ""
   echo -e "${COLOR_INFO}Example Commands:${COLOR_RESET}"
   echo -e "  ${COLOR_AI}$0 gemini${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 groq${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 chutes${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 fireworks${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 together${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 openrouter${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 cerebras${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 novita${COLOR_RESET}"
+  echo -e "  ${COLOR_AI}$0 groq free${COLOR_RESET}                 # Filter for models containing 'free'"
+  echo -e "  ${COLOR_AI}$0 openrouter 8b${COLOR_RESET}               # Filter for models containing '8b'"
+  echo -e "  ${COLOR_AI}$0 together mixtral 32k${COLOR_RESET}        # Filter for models with 'mixtral' AND '32k'"
   echo -e "${COLOR_WARN}NOTE: Ensure API keys are set inside the script before running!${COLOR_RESET}"
 }
 
@@ -178,12 +173,13 @@ function truncate() {
 }
 
 # --- Argument Parsing ---
-if [ "$#" -ne 1 ]; then
+if [ "$#" -lt 1 ]; then
     echo -e "${COLOR_ERROR}Whoops: Follow the guide.${COLOR_RESET}" >&2
     print_usage
     exit 1
 fi
 PROVIDER=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+filters=("${@:2}") # Capture all arguments from the second one onwards as filters
 
 # --- Dependency Check ---
 if ! command -v curl &> /dev/null || ! command -v jq &> /dev/null; then
@@ -192,7 +188,7 @@ if ! command -v curl &> /dev/null || ! command -v jq &> /dev/null; then
 fi
 
 # --- Global Tool Calling Flag (set interactively for Gemini) ---
-ENABLE_TOOL_CALLING=false 
+ENABLE_TOOL_CALLING=false
 
 # --- Get API Key and Check Placeholders ---
 API_KEY=""
@@ -300,36 +296,76 @@ jq_stderr_output=""
 mapfile -t available_models < <(jq -r "$JQ_QUERY" <<< "$model_list_json" 2> >(jq_stderr_output=$(cat); cat >&2))
 jq_exit_code=$?
 
-if [ $jq_exit_code -ne 0 ] || [ ${#available_models[@]} -eq 0 ]; then
-    echo -e "${COLOR_ERROR}Error: No models found or failed to parse successful API response for provider '$PROVIDER'.${COLOR_RESET}" >&2
-    echo -e "${COLOR_INFO}The API call succeeded, but the JQ query ('${COLOR_BOLD}$JQ_QUERY${COLOR_RESET}') might not match the response structure, produced no output, or jq itself failed.${COLOR_RESET}" >&2
-    echo -e "${COLOR_INFO}JQ Exit Code was: ${jq_exit_code}${COLOR_RESET}" >&2
+if [ $jq_exit_code -ne 0 ]; then
+    echo -e "${COLOR_ERROR}Error: Failed to parse API response for provider '$PROVIDER'.${COLOR_RESET}" >&2
+    echo -e "${COLOR_INFO}The API call succeeded, but the JQ query ('${COLOR_BOLD}$JQ_QUERY${COLOR_RESET}') might not match the response structure or jq itself failed.${COLOR_RESET}" >&2
     if [[ -n "$jq_stderr_output" ]]; then
       echo -e "${COLOR_ERROR}JQ Error Output:${COLOR_RESET}\n$jq_stderr_output" >&2
-    elif [[ ${#available_models[@]} -eq 0 && $jq_exit_code -eq 0 ]]; then
-       echo -e "${COLOR_WARN}JQ ran successfully but produced no output. The query likely didn't find matching models in the response.${COLOR_RESET}" >&2
     fi
     echo -e "${COLOR_INFO}Raw API response (first 500 chars):${COLOR_RESET}" >&2
     echo "${model_list_json:0:500}" >&2
     exit 1
 fi
 
-echo -e "${COLOR_INFO}Available Models for ${PROVIDER^^}:${COLOR_RESET}"
-for i in "${!available_models[@]}"; do
-    printf "  ${COLOR_BOLD}%3d${COLOR_RESET}. %s\n" $((i+1)) "${available_models[$i]}"
-done
-echo ""
+# --- Filter models based on additional arguments ---
+if [ ${#filters[@]} -gt 0 ]; then
+    echo -e "${COLOR_INFO}Filtering models with terms: ${filters[*]}${COLOR_RESET}"
+    declare -a filtered_models=()
+    # Convert all filters to lowercase once for efficiency
+    declare -a filters_lower=()
+    for filter in "${filters[@]}"; do
+        filters_lower+=("$(echo "$filter" | tr '[:upper:]' '[:lower:]')")
+    done
+
+    for model in "${available_models[@]}"; do
+        is_match=true
+        model_lower=$(echo "$model" | tr '[:upper:]' '[:lower:]')
+        for filter_lower in "${filters_lower[@]}"; do
+            if [[ ! "$model_lower" == *"$filter_lower"* ]]; then
+                is_match=false
+                break
+            fi
+        done
+        if [[ "$is_match" == true ]]; then
+            filtered_models+=("$model")
+        fi
+    done
+    available_models=("${filtered_models[@]}") # Overwrite with filtered list
+fi
+
+# After potential filtering, check if any models are left
+if [ ${#available_models[@]} -eq 0 ]; then
+    echo -e "${COLOR_ERROR}No models available." >&2
+    if [ ${#filters[@]} -gt 0 ]; then
+        echo -e "${COLOR_WARN}Your filter criteria (${filters[*]}) did not match any models from provider '${PROVIDER^^}'.${COLOR_RESET}" >&2
+    else
+        echo -e "${COLOR_WARN}No models were returned by the API for provider '${PROVIDER^^}'.${COLOR_RESET}" >&2
+    fi
+    exit 1
+fi
 
 MODEL_ID=""
-while true; do
-    read -r -p "$(echo -e "${COLOR_INFO}Select model by number: ${COLOR_RESET}")" choice
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#available_models[@]} ]; then
-        MODEL_ID="${available_models[$((choice-1))]}"
-        break
-    else
-        echo -e "${COLOR_WARN}Invalid selection. Enter number between 1 and ${#available_models[@]}.${COLOR_RESET}" >&2
-    fi
-done
+# --- Auto-select if only one model, otherwise prompt user ---
+if [ ${#available_models[@]} -eq 1 ]; then
+    MODEL_ID="${available_models[0]}"
+    echo -e "${COLOR_INFO}Auto-selecting only matching model.${COLOR_RESET}"
+else
+    echo -e "${COLOR_INFO}Available Models for ${PROVIDER^^}:${COLOR_RESET}"
+    for i in "${!available_models[@]}"; do
+        printf "  ${COLOR_BOLD}%3d${COLOR_RESET}. %s\n" $((i+1)) "${available_models[$i]}"
+    done
+    echo ""
+
+    while true; do
+        read -r -p "$(echo -e "${COLOR_INFO}Select model by number: ${COLOR_RESET}")" choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#available_models[@]} ]; then
+            MODEL_ID="${available_models[$((choice-1))]}"
+            break
+        else
+            echo -e "${COLOR_WARN}Invalid selection. Enter number between 1 and ${#available_models[@]}.${COLOR_RESET}" >&2
+        fi
+    done
+fi
 
 echo -e "${COLOR_INFO}Using model:${COLOR_RESET} ${MODEL_ID}"
 echo ""
@@ -565,7 +601,7 @@ while true; do
     fi
 
     echo -n -e "\r${COLOR_AI}AI:${COLOR_RESET} ${COLOR_INFO}(Waiting for stream...)${COLOR_RESET}"
-    
+
     # Base curl arguments for chat
     base_chat_curl_args=(-sS -L -N -X POST "$CHAT_API_URL" -H "Content-Type: application/json" -H "Accept: application/json") # -N for stream, -S for curl errors
     [ -n "$CHAT_AUTH_HEADER" ] && base_chat_curl_args+=(-H "$CHAT_AUTH_HEADER")
@@ -584,7 +620,7 @@ while true; do
     api_error_occurred=false
     stream_error_message=""
     stream_finish_reason=""
-    first_chunk_received=false 
+    first_chunk_received=false
 
     curl_stderr_temp=$(mktemp)
 
@@ -600,14 +636,14 @@ while true; do
             # Some APIs might send data: [DONE] and then close, others might send a final metadata chunk.
             # The loop should naturally end when curl exits anyway if [DONE] is the very last thing.
             # For robustness, if we see [DONE], we can assume stream is effectively over.
-            break 
+            break
         fi
 
         if [[ "$line" == "data: "* ]]; then
             json_chunk="${line#data: }"
             # Handle case where data line is empty (SSE keep-alive ping typically)
-            if [[ -z "$json_chunk" ]]; then continue; fi 
-            
+            if [[ -z "$json_chunk" ]]; then continue; fi
+
             if ! echo "$json_chunk" | jq empty 2>/dev/null ; then
                 # Potentially log malformed JSON if verbose debugging is on, but generally skip.
                 # echo -e "\n${COLOR_WARN}Warning: Malformed JSON data in stream: $(truncate "$json_chunk" 50)${COLOR_RESET}" >&2
@@ -741,7 +777,7 @@ while true; do
         echo -e "${COLOR_AI}AI:${COLOR_RESET} ${COLOR_ERROR}$stream_error_message${COLOR_RESET}"
     # else: Stream ended, no data, no specific stream error message set -- means likely clean empty stream end if not caught above
     fi
-    
+
     ai_text="$full_ai_response_text" # Final accumulated text from stream
 
     # Create AI message JSON for history
@@ -756,7 +792,7 @@ while true; do
             local_ai_message_json="" # Invalidate it
         fi
     else # Error occurred, or AI returned no text (even if not an "error", empty response isn't useful history)
-        local_ai_message_json="" 
+        local_ai_message_json=""
     fi
 
     # Add AI's message to history OR rollback user's last message if AI failed/gave nothing
