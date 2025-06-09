@@ -24,6 +24,7 @@ Run this from any macos or linux even from android with turmux.
 *   **Minimal Dependencies:** Requires only `bash`, `curl`, and `jq`.
 *   **Easy Configuration:** API keys and core settings are managed directly within the script.
 *   **Tool Calling:** Tool Calling added into gemini with prompt to enable.
+*   **Thinking Budget:** Thinking budget is not supported for gemini models.
 
 1.  **Download the Script:**
     Clone the repository or download `ai.sh` to your local machine.
@@ -78,6 +79,7 @@ Choose any model from any provider just by selecting the Number mentioned before
     *   `MAX_HISTORY_MESSAGES`: Number of past messages (user + AI) to keep in history.
     *   `DEFAULT_OAI_TEMPERATURE`, `DEFAULT_OAI_MAX_TOKENS`, `DEFAULT_OAI_TOP_P`: Parameters for OpenAI-compatible APIs.
     *   `SYSTEM_PROMPT`: The default system-level instruction for the AI. Set to `""` to disable.
+> #### Thinking budget only supported in 2.5 sets of models if you get yes for budget and choose model which does not support thinking budget you will get a error.
 
 
 > [!NOTE]
