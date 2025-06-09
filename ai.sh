@@ -50,7 +50,7 @@ TOGETHER_API_KEY=""
 # Fireworks: https://fireworks.ai/api-keys
 FIREWORKS_API_KEY=""
 
-# Chutes: https://chutes.ai
+# Chutes: https://chutes.ai  #fingerprint= 
 CHUTES_API_KEY=""
 
 # Cerebras: https://cloud.cerebras.ai/
@@ -263,6 +263,7 @@ case "$PROVIDER" in
         MODELS_URL="$NOVITA_MODELS_URL"
         MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
         JQ_QUERY='.data | sort_by(.id) | .[].id'
+        ;;
 esac
 
 model_curl_args=(-sS -L -X GET "$MODELS_URL") # Added -S to show curl errors
@@ -313,7 +314,7 @@ fi
 
 # --- Filter models based on additional arguments ---
 if [ ${#filters[@]} -gt 0 ]; then
-    echo -e "${COLOR_INFO}Filtering models with terms: ${filters[*]}${COLOR_RESET}"Add commentMore actions
+    echo -e "${COLOR_INFO}Filtering models with terms: ${filters[*]}${COLOR_RESET}"
     declare -a filtered_models=()
     # Convert all filters to lowercase once for efficiency
     declare -a filters_lower=()
@@ -378,6 +379,29 @@ CHAT_API_URL=""
 CHAT_AUTH_HEADER=""
 CHAT_EXTRA_HEADERS=()
 IS_OPENAI_COMPATIBLE=false # Determines payload structure and history role names
+ENABLE_TOOL_CALLING=false
+
+# --- Interactive prompt for tool calling for Gemini ---
+if [[ "$PROVIDER" == "gemini" ]]; then
+    echo ""
+    tool_choice_input=""
+    while true; do
+        read -r -p "$(echo -e "${COLOR_INFO}Do you want to enable online tool calling (web search, URL context) for Gemini? (y/n, 1/0): ${COLOR_RESET}")" tool_choice_input
+        tool_choice_input=$(echo "$tool_choice_input" | tr '[:upper:]' '[:lower:]') # Convert to lowercase
+        if [[ "$tool_choice_input" == "y" || "$tool_choice_input" == "1" ]]; then
+            ENABLE_TOOL_CALLING=true
+            echo -e "${COLOR_INFO}Tool calling enabled.${COLOR_RESET}"
+            break
+        elif [[ "$tool_choice_input" == "n" || "$tool_choice_input" == "0" ]]; then
+            ENABLE_TOOL_CALLING=false
+            echo -e "${COLOR_INFO}Tool calling disabled.${COLOR_RESET}"
+            break
+        else
+            echo -e "${COLOR_WARN}Invalid input. Please enter 'y', 'n', '1', or '0'.${COLOR_RESET}" >&2
+        fi
+    done
+    echo ""
+fi
 
 case "$PROVIDER" in
     gemini)
@@ -440,9 +464,16 @@ if [[ -n "$SYSTEM_PROMPT" ]]; then
 else
     echo -e "${COLOR_INFO}System Prompt:${COLOR_RESET}   Inactive (set to empty string)"
 fi
+# Display tool calling status if it's Gemini
+if [[ "$PROVIDER" == "gemini" ]]; then
+    if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
+        echo -e "${COLOR_INFO}Tool Calling:${COLOR_RESET}    ${COLOR_BOLD}Enabled${COLOR_RESET} (for Gemini models)"
+    else
+        echo -e "${COLOR_INFO}Tool Calling:${COLOR_RESET}    Disabled (for Gemini models)"
+    fi
+fi
 echo -e "Enter your prompt below. Type ${COLOR_BOLD}'quit'${COLOR_RESET} or ${COLOR_BOLD}'exit'${COLOR_RESET} to end session."
 echo -e "----------------------------------------"
-
 first_user_message=true
 
 while true; do
@@ -455,7 +486,6 @@ while true; do
          # Non-interactive or no readline support
          read -r -p "$(echo -e "${COLOR_USER}You:${COLOR_RESET} ")" user_input
     fi
-
 
     if [[ "$user_input" == "quit" || "$user_input" == "exit" ]]; then
         echo "Exiting chat."
@@ -535,6 +565,11 @@ while true; do
             --arg max_tokens_str "16384" \
             '{contents: $contents, generationConfig: {temperature: ($temperature_str | tonumber), maxOutputTokens: ($max_tokens_str | tonumber)}}'
         )
+        
+        # Conditionally add the tools array if ENABLE_TOOL_CALLING is true
+        if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
+            json_payload=$(echo "$json_payload" | jq '. + {tools: [{"urlContext": {}}, {"googleSearch": {}}]}')
+        fi
     else # OpenAI-Compatible payload (add stream:true)
          json_payload=$(jq -n \
             --arg model "$MODEL_ID" \
@@ -647,7 +682,25 @@ while true; do
                      current_sfr=$(echo "$json_chunk" | jq -r '.candidates[0].safetyRatings[]? | select(.blocked == true) | .category // empty' | head -n 1)
                      if [[ -n "$current_sfr" && "$current_sfr" != "null" ]]; then current_sfr="SAFETY"; fi # Normalize safety block to "SAFETY"
                 fi
-            fi
+                # Check for tool calls in Gemini response IF tool calling is enabled
+                if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
+                    tool_call_parts=$(echo "$json_chunk" | jq -c '.candidates[0].content.parts[] | select(.functionCall != null) // empty')
+                    if [[ -n "$tool_call_parts" ]]; then
+                        # This script currently doesn't execute tool calls.
+                        # You would need to add logic here to parse and potentially execute the tool call.
+                        # For now, we'll just log it.
+                        if [[ "$first_chunk_received" == false ]]; then
+                            echo -ne "\r\033[K"; echo -n -e "${COLOR_AI}AI:${COLOR_RESET}  ${COLOR_AI}"
+                            first_chunk_received=true
+                        fi
+                        echo -e "\n${COLOR_WARN}AI requested tool call:${COLOR_RESET}" >&2
+                        echo "$tool_call_parts" | jq . >&2 # Pretty print the tool call
+                        echo -e "${COLOR_WARN}(This script does not automatically execute tool calls or return tool output to the model.)\n${COLOR_RESET}" >&2
+                        # Do not append tool call JSON to full_ai_response_text, as it's not "text"
+                        # For a true tool-using agent, you'd feed this tool output back to the model.
+                    fi
+                fi # End check for ENABLE_TOOL_CALLING for Gemini
+            fi # End Gemini specific text/finish reason/tool call extraction
 
             # Store the first non-null finish reason encountered
             if [[ -n "$current_sfr" && "$current_sfr" != "null" && ( -z "$stream_finish_reason" || "$stream_finish_reason" == "null" ) ]]; then
@@ -679,7 +732,7 @@ while true; do
             fi
         # else: ignore non "data: " lines (comments, empty lines, :ping in SSE stream)
         fi
-    done <&3
+    done
     exec 3<&- # Close file descriptor
 
     curl_stderr_content=$(cat "$curl_stderr_temp" 2>/dev/null)
