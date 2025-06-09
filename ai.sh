@@ -3,15 +3,15 @@
 # REQUIREMENTS: bash, curl, jq (must be pre-installed on the system)
 # Supports: Gemini, OpenRouter, Groq, Together AI, Fireworks AI, Chutes AI, Cerebras AI, Novita AI
 # To Run This Tool First Make It executable with $ chmod +x ai.sh
-# Run This $ ./ai.sh provider [filter1] [filter2]... (e.g., ./ai.sh openrouter 8b)
+# Run This $ ./ai.sh provider
+# filter support added [filter] ... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
 # History, system prompt, and streaming are supported.
-# Support for tool-calling in gemini google web serach with in built on off toggle.
 
 set -e -E # Exit on error, inherit error traps
 
 # --- Configuration ---
 MAX_HISTORY_MESSAGES=20       # Keep the last N messages (user + ai). Adjust if needed.
-DEFAULT_OAI_TEMPERATURE=1     # t = randomness: Higher = more creative, Lower = more predictable | allowed value 0-2
+DEFAULT_OAI_TEMPERATURE=0.7   # t = randomness: Higher = more creative, Lower = more predictable | allowed value 0-2
 DEFAULT_OAI_MAX_TOKENS=8192   # Default max_tokens for OpenAI-compatible APIs
 DEFAULT_OAI_TOP_P=0.9         # p = diversity: Higher = wider vocabulary, Lower = safer word choices | allowed value 0-1
 
@@ -23,7 +23,7 @@ SYSTEM_PROMPT="You are a helpful assistant running in a command-line interface."
 
 # --- Color Definitions --- Use 256-color
 COLOR_RESET='\033[0m'
-COLOR_USER='\033[38;5;81m'     # Bright cyan-blue
+COLOR_USER='\033[38;5;81m'      # Bright cyan-blue
 COLOR_AI='\033[38;5;156m'       # Soft green
 COLOR_ERROR='\033[38;5;203m'    # Vivid red
 COLOR_WARN='\033[38;5;221m'     # Soft yellow
@@ -36,21 +36,27 @@ COLOR_BOLD='\033[1m'
 ##########################################################################
 # Get keys from:
 # Gemini: https://aistudio.google.com/app/apikey
-# OpenRouter: https://openrouter.ai/keys
-# Groq: https://console.groq.com/keys
-# Together: https://api.together.ai/settings/api-keys
-# Fireworks: https://fireworks.ai/api-keys
-# Chutes: https://chutes.ai
-# Cerebras: https://cloud.cerebras.ai/
-# Novita: https://novita.ai/
-
 GEMINI_API_KEY=""
+
+# OpenRouter: https://openrouter.ai/keys
 OPENROUTER_API_KEY=""
+
+# Groq: https://console.groq.com/keys
 GROQ_API_KEY=""
+
+# Together: https://api.together.ai/settings/api-keys
 TOGETHER_API_KEY=""
+
+# Fireworks: https://fireworks.ai/api-keys
 FIREWORKS_API_KEY=""
+
+# Chutes: https://chutes.ai
 CHUTES_API_KEY=""
+
+# Cerebras: https://cloud.cerebras.ai/
 CEREBRAS_API_KEY=""
+
+# Novita: https://novita.ai/
 NOVITA_API_KEY=""
 
 # --- API Endpoints ---
@@ -78,20 +84,17 @@ NOVITA_MODELS_URL="https://api.novita.ai/v3/openai/models"
 
 function print_usage() {
   echo -e ""
-  echo -e "${COLOR_INFO}Usage: $0 <provider> [filter1] [filter2]...${COLOR_RESET}"
+  echo -e "${COLOR_INFO}Usage: $0 <provider>${COLOR_RESET}"
+  echo -e "${COLOR_INFO}Usage: $0 <provider> [filter]...${COLOR_RESET}"
   echo -e ""
   echo -e "${COLOR_INFO}Description:${COLOR_RESET}"
-  echo -e "  Starts an interactive chat session with the specified AI provider."
-  echo -e "  You can add optional filter words (e.g., '8b', 'free', '32k') to narrow down the model list."
+  echo -e "  Starts an interactive chat session with the specified AI provider,"
+  echo -e "  maintaining conversation history, using a system prompt (if applicable),"
+  echo -e "  and streaming responses token by token."
   echo -e "  It will fetch available models and let you choose one by number."
   echo -e ""
   echo -e "${COLOR_INFO}Supported Providers:${COLOR_RESET}"
   echo -e "  gemini, openrouter, groq, together, fireworks, chutes, cerebras, novita"
-  echo -e ""
-  echo -e "${COLOR_INFO}Note on Gemini Tool Calling:${COLOR_RESET}"
-  echo -e "  If you select 'gemini' as the provider, you will be asked if you wish to"
-  echo -e "  enable built-in online tool calling (web search, URL context)."
-  echo -e "  This feature is only available for Gemini models."
   echo -e ""
   echo -e "${COLOR_INFO}Finding Model Identifiers (if needed manually):${COLOR_RESET}"
   echo -e "    ${COLOR_USER}Gemini:${COLOR_RESET}     https://ai.google.dev/models/gemini (Use 'Model name')"
@@ -105,9 +108,13 @@ function print_usage() {
   echo -e ""
   echo -e "${COLOR_INFO}Example Commands:${COLOR_RESET}"
   echo -e "  ${COLOR_AI}$0 gemini${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 groq free${COLOR_RESET}                 # Filter for models containing 'free'"
-  echo -e "  ${COLOR_AI}$0 openrouter 8b${COLOR_RESET}               # Filter for models containing '8b'"
-  echo -e "  ${COLOR_AI}$0 together mixtral 32k${COLOR_RESET}        # Filter for models with 'mixtral' AND '32k'"
+  echo -e "  ${COLOR_AI}$0 groq${COLOR_RESET}"
+  echo -e "  ${COLOR_AI}$0 chutes${COLOR_RESET}"
+  echo -e "  ${COLOR_AI}$0 fireworks${COLOR_RESET}"
+  echo -e "  ${COLOR_AI}$0 together${COLOR_RESET}"
+  echo -e "  ${COLOR_AI}$0 openrouter${COLOR_RESET}"
+  echo -e "  ${COLOR_AI}$0 cerebras${COLOR_RESET}"
+  echo -e "  ${COLOR_AI}$0 novita${COLOR_RESET}"
   echo -e "${COLOR_WARN}NOTE: Ensure API keys are set inside the script before running!${COLOR_RESET}"
 }
 
@@ -127,28 +134,26 @@ function check_placeholder_key() {
         placeholder_found=true
         message="appears to be a generic placeholder"
     elif [[ "$provider_name" == "gemini" && "$key_value" == "-" ]]; then
-         placeholder_found=true
-         message="is the default placeholder ('-')"
+        placeholder_found=true
+        message="is the default placeholder ('-')"
     elif [[ "$provider_name" == "openrouter" && "$key_value" == "sk-or-v1-" ]]; then
         placeholder_found=true
         message="is the default OpenRouter prefix placeholder"
-     elif [[ "$provider_name" == "groq" && "$key_value" == "gsk_"* && ${#key_value} -lt 10 ]]; then # Catches incomplete Groq key
+    elif [[ "$provider_name" == "groq" && "$key_value" == "gsk_"* && ${#key_value} -lt 10 ]]; then
         placeholder_found=true
         message="appears to be an incomplete Groq key (starts with gsk_ but is too short)"
-    # Note: Empty "" GROQ_API_KEY is caught by initial -z check
-    elif [[ "$provider_name" == "fireworks" && "$key_value" == "fw-"* && ${#key_value} -lt 10 ]]; then # Catches incomplete Fireworks key
-         placeholder_found=true
-         message="appears to be an incomplete Fireworks key (starts with fw- but is too short)"
-    # Note: Empty "" FIREWORKS_API_KEY is caught by initial -z check
-    elif [[ "$provider_name" == "chutes" && "$key_value" == ".." ]]; then # Specific check for ".."
+    elif [[ "$provider_name" == "fireworks" && "$key_value" == "fw-"* && ${#key_value} -lt 10 ]]; then
+        placeholder_found=true
+        message="appears to be an incomplete Fireworks key (starts with fw- but is too short)"
+    elif [[ "$provider_name" == "chutes" && "$key_value" == ".." ]]; then
         placeholder_found=true
         message="is the default placeholder ('..')"
-    elif [[ "$provider_name" == "cerebras" && "$key_value" == "csk-" ]]; then # Specific check for "csk-"
+    elif [[ "$provider_name" == "cerebras" && "$key_value" == "csk-" ]]; then
         placeholder_found=true
         message="is the default Cerebras prefix placeholder ('csk-')"
     elif [[ "$provider_name" == "novita" && ${#key_value} -lt 10 ]]; then # Catches incomplete Novita key
-       placeholder_found=true
-       message="appears to be too short to be a valid key"
+        placeholder_found=true
+        message="appears to be too short to be a valid key"
     fi
 
     if [[ "$placeholder_found" == true ]]; then
@@ -174,7 +179,7 @@ function truncate() {
 
 # --- Argument Parsing ---
 if [ "$#" -lt 1 ]; then
-    echo -e "${COLOR_ERROR}Whoops: Follow the guide.${COLOR_RESET}" >&2
+    echo -e "${COLOR_ERROR}Error: Invalid number of arguments.${COLOR_RESET}" >&2
     print_usage
     exit 1
 fi
@@ -186,9 +191,6 @@ if ! command -v curl &> /dev/null || ! command -v jq &> /dev/null; then
     echo -e "${COLOR_ERROR}Error: 'curl' and 'jq' are required. Please install them.${COLOR_RESET}" >&2
     exit 1
 fi
-
-# --- Global Tool Calling Flag (set interactively for Gemini) ---
-ENABLE_TOOL_CALLING=false
 
 # --- Get API Key and Check Placeholders ---
 API_KEY=""
@@ -245,7 +247,7 @@ case "$PROVIDER" in
     fireworks)
         MODELS_URL="$FIREWORKS_MODELS_URL"
         MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
-        JQ_QUERY='.data[]? | select(.type == "chat_completion" or .supports_chat == true) | .id' # Updated for Fireworks flexibility
+        JQ_QUERY='.data[]? | select(.type == "chat_completion" or .supports_chat == true) | .id'
         ;;
     chutes)
         MODELS_URL="$CHUTES_MODELS_URL"
@@ -261,7 +263,6 @@ case "$PROVIDER" in
         MODELS_URL="$NOVITA_MODELS_URL"
         MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
         JQ_QUERY='.data | sort_by(.id) | .[].id'
-        ;;
 esac
 
 model_curl_args=(-sS -L -X GET "$MODELS_URL") # Added -S to show curl errors
@@ -296,11 +297,14 @@ jq_stderr_output=""
 mapfile -t available_models < <(jq -r "$JQ_QUERY" <<< "$model_list_json" 2> >(jq_stderr_output=$(cat); cat >&2))
 jq_exit_code=$?
 
-if [ $jq_exit_code -ne 0 ]; then
-    echo -e "${COLOR_ERROR}Error: Failed to parse API response for provider '$PROVIDER'.${COLOR_RESET}" >&2
-    echo -e "${COLOR_INFO}The API call succeeded, but the JQ query ('${COLOR_BOLD}$JQ_QUERY${COLOR_RESET}') might not match the response structure or jq itself failed.${COLOR_RESET}" >&2
+if [ $jq_exit_code -ne 0 ] || [ ${#available_models[@]} -eq 0 ]; then
+    echo -e "${COLOR_ERROR}Error: No models found or failed to parse successful API response for provider '$PROVIDER'.${COLOR_RESET}" >&2
+    echo -e "${COLOR_INFO}The API call succeeded, but the JQ query ('${COLOR_BOLD}$JQ_QUERY${COLOR_RESET}') might not match the response structure, produced no output, or jq itself failed.${COLOR_RESET}" >&2
+    echo -e "${COLOR_INFO}JQ Exit Code was: ${jq_exit_code}${COLOR_RESET}" >&2
     if [[ -n "$jq_stderr_output" ]]; then
       echo -e "${COLOR_ERROR}JQ Error Output:${COLOR_RESET}\n$jq_stderr_output" >&2
+    elif [[ ${#available_models[@]} -eq 0 && $jq_exit_code -eq 0 ]]; then
+       echo -e "${COLOR_WARN}JQ ran successfully but produced no output. The query likely didn't find matching models in the response.${COLOR_RESET}" >&2
     fi
     echo -e "${COLOR_INFO}Raw API response (first 500 chars):${COLOR_RESET}" >&2
     echo "${model_list_json:0:500}" >&2
@@ -309,14 +313,13 @@ fi
 
 # --- Filter models based on additional arguments ---
 if [ ${#filters[@]} -gt 0 ]; then
-    echo -e "${COLOR_INFO}Filtering models with terms: ${filters[*]}${COLOR_RESET}"
+    echo -e "${COLOR_INFO}Filtering models with terms: ${filters[*]}${COLOR_RESET}"Add commentMore actions
     declare -a filtered_models=()
     # Convert all filters to lowercase once for efficiency
     declare -a filters_lower=()
     for filter in "${filters[@]}"; do
         filters_lower+=("$(echo "$filter" | tr '[:upper:]' '[:lower:]')")
     done
-
     for model in "${available_models[@]}"; do
         is_match=true
         model_lower=$(echo "$model" | tr '[:upper:]' '[:lower:]')
@@ -326,6 +329,7 @@ if [ ${#filters[@]} -gt 0 ]; then
                 break
             fi
         done
+        
         if [[ "$is_match" == true ]]; then
             filtered_models+=("$model")
         fi
@@ -345,6 +349,7 @@ if [ ${#available_models[@]} -eq 0 ]; then
 fi
 
 MODEL_ID=""
+
 # --- Auto-select if only one model, otherwise prompt user ---
 if [ ${#available_models[@]} -eq 1 ]; then
     MODEL_ID="${available_models[0]}"
@@ -355,7 +360,6 @@ else
         printf "  ${COLOR_BOLD}%3d${COLOR_RESET}. %s\n" $((i+1)) "${available_models[$i]}"
     done
     echo ""
-
     while true; do
         read -r -p "$(echo -e "${COLOR_INFO}Select model by number: ${COLOR_RESET}")" choice
         if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#available_models[@]} ]; then
@@ -380,26 +384,6 @@ case "$PROVIDER" in
         # Use streamGenerateContent with alt=sse for Server-Sent Events
         CHAT_API_URL="${GEMINI_CHAT_URL_BASE}${MODEL_ID}:streamGenerateContent?key=${API_KEY}&alt=sse"
         IS_OPENAI_COMPATIBLE=false # Gemini uses "model" role, not "assistant"
-
-        # --- Interactive prompt for tool calling for Gemini ---
-        echo ""
-        tool_choice_input=""
-        while true; do
-            read -r -p "$(echo -e "${COLOR_INFO}Do you want to enable online tool calling (web search, URL context) for Gemini? (y/n, 1/0): ${COLOR_RESET}")" tool_choice_input
-            tool_choice_input=$(echo "$tool_choice_input" | tr '[:upper:]' '[:lower:]') # Convert to lowercase
-            if [[ "$tool_choice_input" == "y" || "$tool_choice_input" == "1" ]]; then
-                ENABLE_TOOL_CALLING=true
-                echo -e "${COLOR_INFO}Tool calling enabled.${COLOR_RESET}"
-                break
-            elif [[ "$tool_choice_input" == "n" || "$tool_choice_input" == "0" ]]; then
-                ENABLE_TOOL_CALLING=false
-                echo -e "${COLOR_INFO}Tool calling disabled.${COLOR_RESET}"
-                break
-            else
-                echo -e "${COLOR_WARN}Invalid input. Please enter 'y', 'n', '1', or '0'.${COLOR_RESET}" >&2
-            fi
-        done
-        echo ""
         ;;
     openrouter|groq|together|fireworks|chutes|cerebras|novita)
         CHAT_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
@@ -437,7 +421,6 @@ if [[ -n "$SYSTEM_PROMPT" ]]; then
     fi
 fi
 
-
 echo -e "--- ${COLOR_INFO}Starting Chat${COLOR_RESET} ---"
 echo -e "${COLOR_INFO}Provider:${COLOR_RESET}      ${PROVIDER^^}"
 echo -e "${COLOR_INFO}Model:${COLOR_RESET}         ${MODEL_ID}"
@@ -457,16 +440,6 @@ if [[ -n "$SYSTEM_PROMPT" ]]; then
 else
     echo -e "${COLOR_INFO}System Prompt:${COLOR_RESET}   Inactive (set to empty string)"
 fi
-
-# Display tool calling status if it's Gemini
-if [[ "$PROVIDER" == "gemini" ]]; then
-    if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
-        echo -e "${COLOR_INFO}Tool Calling:${COLOR_RESET}    ${COLOR_BOLD}Enabled${COLOR_RESET} (for Gemini models)"
-    else
-        echo -e "${COLOR_INFO}Tool Calling:${COLOR_RESET}    Disabled (for Gemini models)"
-    fi
-fi
-
 echo -e "Enter your prompt below. Type ${COLOR_BOLD}'quit'${COLOR_RESET} or ${COLOR_BOLD}'exit'${COLOR_RESET} to end session."
 echo -e "----------------------------------------"
 
@@ -553,22 +526,15 @@ while true; do
     fi
 
     json_payload=""
-    if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then # Gemini payload
+    if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then # Gemini payload (streaming URL handles stream, payload structure is for non-streamed body too)
+        # Gemini streamGenerateContent doesn't usually take temp/max_tokens in request body, rather as query params or SDK config.
+        # For direct HTTP for streamGenerateContent, these are sometimes omitted from body in favor of global model defaults or set elsewhere if supported.
+        # To keep it simple and align with generateContent, we can still include them, API will ignore if not applicable.
         json_payload=$(jq -n --argjson contents "$history_json_array" \
             --arg temperature_str "1.0" \
-            --arg max_tokens_str "4096" \
-            '{
-                contents: $contents,
-                generationConfig: {
-                    temperature: ($temperature_str | tonumber),
-                    maxOutputTokens: ($max_tokens_str | tonumber)
-                }
-            }'
+            --arg max_tokens_str "16384" \
+            '{contents: $contents, generationConfig: {temperature: ($temperature_str | tonumber), maxOutputTokens: ($max_tokens_str | tonumber)}}'
         )
-        # Conditionally add the tools array if ENABLE_TOOL_CALLING is true
-        if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
-            json_payload=$(echo "$json_payload" | jq '. + {tools: [{"urlContext": {}}, {"googleSearch": {}}]}')
-        fi
     else # OpenAI-Compatible payload (add stream:true)
          json_payload=$(jq -n \
             --arg model "$MODEL_ID" \
@@ -601,26 +567,19 @@ while true; do
     fi
 
     echo -n -e "\r${COLOR_AI}AI:${COLOR_RESET} ${COLOR_INFO}(Waiting for stream...)${COLOR_RESET}"
-
+    
     # Base curl arguments for chat
     base_chat_curl_args=(-sS -L -N -X POST "$CHAT_API_URL" -H "Content-Type: application/json" -H "Accept: application/json") # -N for stream, -S for curl errors
     [ -n "$CHAT_AUTH_HEADER" ] && base_chat_curl_args+=(-H "$CHAT_AUTH_HEADER")
     [ ${#CHAT_EXTRA_HEADERS[@]} -gt 0 ] && base_chat_curl_args+=("${CHAT_EXTRA_HEADERS[@]}")
     base_chat_curl_args+=(-d "$json_payload")
 
-    # --- DEBUG ---
-    # echo -e "\n${COLOR_WARN}DEBUG: Payload for ${PROVIDER^^}:${COLOR_RESET}"
-    # echo "$json_payload" | jq .
-    # echo -e "${COLOR_WARN}DEBUG: Curl Command:${COLOR_RESET}"
-    # printf "curl"; printf " '%s'" "${base_chat_curl_args[@]}"; echo -e "\n"
-    # --- END DEBUG ---
-
     full_ai_response_text=""
     local_ai_message_json="" # For this turn's AI response
     api_error_occurred=false
     stream_error_message=""
     stream_finish_reason=""
-    first_chunk_received=false
+    first_chunk_received=false 
 
     curl_stderr_temp=$(mktemp)
 
@@ -636,14 +595,14 @@ while true; do
             # Some APIs might send data: [DONE] and then close, others might send a final metadata chunk.
             # The loop should naturally end when curl exits anyway if [DONE] is the very last thing.
             # For robustness, if we see [DONE], we can assume stream is effectively over.
-            break
+            break 
         fi
 
         if [[ "$line" == "data: "* ]]; then
             json_chunk="${line#data: }"
             # Handle case where data line is empty (SSE keep-alive ping typically)
-            if [[ -z "$json_chunk" ]]; then continue; fi
-
+            if [[ -z "$json_chunk" ]]; then continue; fi 
+            
             if ! echo "$json_chunk" | jq empty 2>/dev/null ; then
                 # Potentially log malformed JSON if verbose debugging is on, but generally skip.
                 # echo -e "\n${COLOR_WARN}Warning: Malformed JSON data in stream: $(truncate "$json_chunk" 50)${COLOR_RESET}" >&2
@@ -688,26 +647,7 @@ while true; do
                      current_sfr=$(echo "$json_chunk" | jq -r '.candidates[0].safetyRatings[]? | select(.blocked == true) | .category // empty' | head -n 1)
                      if [[ -n "$current_sfr" && "$current_sfr" != "null" ]]; then current_sfr="SAFETY"; fi # Normalize safety block to "SAFETY"
                 fi
-
-                # Check for tool calls in Gemini response IF tool calling is enabled
-                if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
-                    tool_call_parts=$(echo "$json_chunk" | jq -c '.candidates[0].content.parts[] | select(.functionCall != null) // empty')
-                    if [[ -n "$tool_call_parts" ]]; then
-                        # This script currently doesn't execute tool calls.
-                        # You would need to add logic here to parse and potentially execute the tool call.
-                        # For now, we'll just log it.
-                        if [[ "$first_chunk_received" == false ]]; then
-                            echo -ne "\r\033[K"; echo -n -e "${COLOR_AI}AI:${COLOR_RESET}  ${COLOR_AI}"
-                            first_chunk_received=true
-                        fi
-                        echo -e "\n${COLOR_WARN}AI requested tool call:${COLOR_RESET}" >&2
-                        echo "$tool_call_parts" | jq . >&2 # Pretty print the tool call
-                        echo -e "${COLOR_WARN}(This script does not automatically execute tool calls or return tool output to the model.)\n${COLOR_RESET}" >&2
-                        # Do not append tool call JSON to full_ai_response_text, as it's not "text"
-                        # For a true tool-using agent, you'd feed this tool output back to the model.
-                    fi
-                fi # End check for ENABLE_TOOL_CALLING for Gemini
-            fi # End Gemini specific text/finish reason/tool call extraction
+            fi
 
             # Store the first non-null finish reason encountered
             if [[ -n "$current_sfr" && "$current_sfr" != "null" && ( -z "$stream_finish_reason" || "$stream_finish_reason" == "null" ) ]]; then
@@ -777,7 +717,7 @@ while true; do
         echo -e "${COLOR_AI}AI:${COLOR_RESET} ${COLOR_ERROR}$stream_error_message${COLOR_RESET}"
     # else: Stream ended, no data, no specific stream error message set -- means likely clean empty stream end if not caught above
     fi
-
+    
     ai_text="$full_ai_response_text" # Final accumulated text from stream
 
     # Create AI message JSON for history
@@ -792,7 +732,7 @@ while true; do
             local_ai_message_json="" # Invalidate it
         fi
     else # Error occurred, or AI returned no text (even if not an "error", empty response isn't useful history)
-        local_ai_message_json=""
+        local_ai_message_json="" 
     fi
 
     # Add AI's message to history OR rollback user's last message if AI failed/gave nothing
