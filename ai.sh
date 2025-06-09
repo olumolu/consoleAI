@@ -72,7 +72,7 @@ TOGETHER_MODELS_URL="https://api.together.ai/v1/models"
 FIREWORKS_MODELS_URL="https://api.fireworks.ai/inference/v1/models"
 CHUTES_MODELS_URL="https://llm.chutes.ai/v1/models"
 CEREBRAS_MODELS_URL="https://api.cerebras.ai/v1/models"
-NOVITA_MODELS_URL="https://api.novita.ai/v3/models"
+NOVITA_MODELS_URL="https://api.novita.ai/v3/openai/models"
 
 # --- Helper Functions ---
 
