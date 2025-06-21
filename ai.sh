@@ -50,7 +50,7 @@ TOGETHER_API_KEY=""
 # Fireworks: https://fireworks.ai/api-keys
 FIREWORKS_API_KEY=""
 
-# Chutes: https://chutes.ai  #fingerprint= 
+# Chutes: https://chutes.ai
 CHUTES_API_KEY=""
 
 # Cerebras: https://cloud.cerebras.ai/
