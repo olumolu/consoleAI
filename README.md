@@ -81,6 +81,6 @@ Choose any model from any provider just by selecting the Number mentioned before
 
 
 > [!NOTE]
-> ### Out of scope
+> **Out of scope**
 >  *  Image genaration is out of scope as it is a terminal app.
 >  *  Image upload for VL models is not yet implemented.
