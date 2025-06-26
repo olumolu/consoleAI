@@ -27,7 +27,7 @@ COLOR_USER='\033[38;5;81m'      # Bright cyan-blue
 COLOR_AI='\033[38;5;156m'       # Soft green
 COLOR_ERROR='\033[38;5;203m'    # Vivid red
 COLOR_WARN='\033[38;5;221m'     # Soft yellow
-COLOR_INFO='\033[38;5;159m'     # Light cyan
+COLOR_INFO='\033[38;5;75m'      # Darker cyan-blue
 COLOR_BOLD='\033[1m'
 
 ##########################################################################
