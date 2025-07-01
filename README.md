@@ -3,8 +3,6 @@ A versatile Bash script that provides a command-line interface (CLI) for
 interacting with various Large Language Models (LLMs) from multiple AI providers. 
 It supports model selection, conversation history, system prompts, and 
 real-time streaming of responses.
-Filter support added [filter] ... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
-/history for show conversation log and <think>...</think> in a different colour for better visual experience.
 Run this from any macos or linux even from android with turmux.
 
 ## Features
@@ -19,13 +17,15 @@ Run this from any macos or linux even from android with turmux.
     *   Cerebras AI
     *   Novita AI
 *   **Dynamic Model Selection:** Fetches and lists available models from the chosen provider, allowing you to select one interactively.
-*   **Conversation History:** Remembers the last `N` messages (configurable) to maintain context.
+*   **Conversation History:** Remembers the last `N` messages (configurable) to maintain context. `/history` to recall conversation logs.
 *   **System Prompt:** Define a system-level instruction for the AI (configurable).
 *   **Streaming Responses:** AI responses are streamed token by token for a real-time feel.
-*   **Color-Coded Output:** Differentiates between user input, AI responses, errors, and info messages.
+*   **Color-Coded Output:** Differentiates between user input, AI responses, errors, and info messages. <think>...</think> in different colour.
 *   **Minimal Dependencies:** Requires only `bash`, `curl`, and `jq`.
 *   **Easy Configuration:** API keys and core settings are managed directly within the script.
 *   **Tool Calling:** Tool Calling added into gemini with prompt to enable.
+*   **search filter:** Filter support added [filter] ... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
+*   
 
 1.  **Download the Script:**
     Clone the repository or download `ai.sh` to your local machine.
