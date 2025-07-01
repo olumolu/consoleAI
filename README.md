@@ -25,7 +25,6 @@ Run this from any macos or linux even from android with turmux.
 *   **Easy Configuration:** API keys and core settings are managed directly within the script.
 *   **Tool Calling:** Tool Calling added into gemini with prompt to enable.
 *   **search filter:** Filter support added [filter] ... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
-*   
 
 1.  **Download the Script:**
     Clone the repository or download `ai.sh` to your local machine.
