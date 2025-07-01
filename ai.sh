@@ -182,9 +182,9 @@ function truncate() {
     local s="$1"
     local max_chars="$2"
     if [[ ${#s} -gt $max_chars ]]; then
-        echo "${s:0:$((max_chars-3))}..."
+        echo "${s:0:$((max_chars-3))}...";
     else
-        echo "$s"
+        echo "$s";
     fi
 }
 
