@@ -3,6 +3,8 @@ A versatile Bash script that provides a command-line interface (CLI) for
 interacting with various Large Language Models (LLMs) from multiple AI providers. 
 It supports model selection, conversation history, system prompts, and 
 real-time streaming of responses.
+Filter support added [filter] ... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
+/history for show conversation log and <think>...</think> in a different colour for better visual experience.
 Run this from any macos or linux even from android with turmux.
 
 ## Features
