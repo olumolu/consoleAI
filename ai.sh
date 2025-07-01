@@ -6,8 +6,19 @@
 # Run This $ ./ai.sh provider
 # filter support added [filter] ... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
 # History, system prompt, and streaming are supported.
+# /history for show conversation log and <think>...</think> in a different colour for better visual experience.
 
 set -e -E # Exit on error, inherit error traps
+
+# --- Cleanup Trap ---
+# Ensures temporary files are removed on script exit/interruption.
+CURL_STDERR_TEMP=""
+function cleanup() {
+    if [[ -n "$CURL_STDERR_TEMP" && -f "$CURL_STDERR_TEMP" ]]; then
+        rm -f "$CURL_STDERR_TEMP"
+    fi
+}
+trap cleanup EXIT
 
 # --- Configuration ---
 MAX_HISTORY_MESSAGES=20       # Keep the last N messages (user + ai). Adjust if needed.
@@ -17,14 +28,14 @@ DEFAULT_OAI_TOP_P=0.9         # p = diversity: Higher = wider vocabulary, Lower 
 
 # --- System Prompt Definition ---
 # Instruct the AI to use the conversation history to maintain the ongoing task context.
-# Set to "" if you want no system prompt.
 SYSTEM_PROMPT="You are a helpful assistant running in a command-line interface."
 # SYSTEM_PROMPT="" # Example: Disable system prompt
 
 # --- Color Definitions --- Use 256-color
 COLOR_RESET='\033[0m'
-COLOR_USER='\033[38;5;81m'      # Bright cyan-blue
-COLOR_AI='\033[38;5;156m'       # Soft green
+COLOR_USER='\033[38;5;213m'     # Bright Pink/Magenta
+COLOR_AI='\033[38;5;40m'        # Bright green
+COLOR_THINK='\033[38;5;214m'    # Soft orange
 COLOR_ERROR='\033[38;5;203m'    # Vivid red
 COLOR_WARN='\033[38;5;221m'     # Soft yellow
 COLOR_INFO='\033[38;5;75m'      # Darker cyan-blue
@@ -50,7 +61,7 @@ TOGETHER_API_KEY=""
 # Fireworks: https://fireworks.ai/api-keys
 FIREWORKS_API_KEY=""
 
-# Chutes: https://chutes.ai
+# Chutes: https://chutes.ai/app/api
 CHUTES_API_KEY=""
 
 # Cerebras: https://cloud.cerebras.ai/
@@ -171,9 +182,9 @@ function truncate() {
     local s="$1"
     local max_chars="$2"
     if [[ ${#s} -gt $max_chars ]]; then
-        echo "${s:0:$((max_chars-3))}...";
+        echo "${s:0:$((max_chars-3))}..."
     else
-        echo "$s";
+        echo "$s"
     fi
 }
 
@@ -449,9 +460,7 @@ echo -e "--- ${COLOR_INFO}Starting Chat${COLOR_RESET} ---"
 echo -e "${COLOR_INFO}Provider:${COLOR_RESET}      ${PROVIDER^^}"
 echo -e "${COLOR_INFO}Model:${COLOR_RESET}         ${MODEL_ID}"
 echo -e "${COLOR_INFO}History Limit:${COLOR_RESET} Last $MAX_HISTORY_MESSAGES messages (user+AI)"
-if [[ "$IS_OPENAI_COMPATIBLE" == true ]]; then
-    echo -e "${COLOR_INFO}Temp/MaxTokens/TopP (OAI):${COLOR_RESET} $DEFAULT_OAI_TEMPERATURE / $DEFAULT_OAI_MAX_TOKENS / $DEFAULT_OAI_TOP_P"
-fi
+echo -e "${COLOR_INFO}Temp/Tokens/TopP (Defaults):${COLOR_RESET} $DEFAULT_OAI_TEMPERATURE / $DEFAULT_OAI_MAX_TOKENS / $DEFAULT_OAI_TOP_P"
 
 if [[ -n "$SYSTEM_PROMPT" ]]; then
      if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then
@@ -472,7 +481,7 @@ if [[ "$PROVIDER" == "gemini" ]]; then
         echo -e "${COLOR_INFO}Tool Calling:${COLOR_RESET}    Disabled (for Gemini models)"
     fi
 fi
-echo -e "Enter your prompt below. Type ${COLOR_BOLD}'quit'${COLOR_RESET} or ${COLOR_BOLD}'exit'${COLOR_RESET} to end session."
+echo -e "Enter your prompt below. Type ${COLOR_BOLD}'quit'${COLOR_RESET}, ${COLOR_BOLD}'exit'${COLOR_RESET}, or ${COLOR_BOLD}'/history'${COLOR_RESET} to view conversation log."
 echo -e "----------------------------------------"
 first_user_message=true
 
@@ -491,6 +500,30 @@ while true; do
         echo "Exiting chat."
         break
     fi
+
+    if [[ "$user_input" == "/history" ]]; then
+        echo -e "${COLOR_INFO}--- Current Conversation History (${#chat_history[@]} messages) ---${COLOR_RESET}"
+        if [ ${#chat_history[@]} -eq 0 ]; then
+            echo "(History is empty)" >&2
+        else
+            # This jq filter makes the output much more readable
+            printf '%s\n' "${chat_history[@]}" | jq -s -c '.[]' | while IFS= read -r msg; do
+                role=$(echo "$msg" | jq -r '.role')
+                content=$(echo "$msg" | jq -r '.content // .parts[0].text')
+                
+                if [[ "$role" == "user" ]]; then
+                    echo -e "${COLOR_USER}[$role]${COLOR_RESET} $content"
+                elif [[ "$role" == "assistant" || "$role" == "model" ]]; then
+                    echo -e "${COLOR_AI}[$role]${COLOR_RESET} $content"
+                else # system
+                    echo -e "${COLOR_WARN}[$role]${COLOR_RESET} $content"
+                fi
+            done >&2
+        fi
+        echo -e "${COLOR_INFO}--------------------------------------------${COLOR_RESET}"
+        continue
+    fi
+
     if [[ -z "$user_input" ]]; then
         continue
     fi
@@ -525,17 +558,14 @@ while true; do
          system_offset=1 # Account for system prompt not being part of MAX_HISTORY_MESSAGES count
     fi
     allowed_conversational_messages=$(( MAX_HISTORY_MESSAGES )) # user + AI messages
-    # Total allowed entries depends on whether there is a system message at history[0]
-    # If system_offset is 1, history size can be MAX_HISTORY_MESSAGES + 1
-    # If system_offset is 0, history size can be MAX_HISTORY_MESSAGES
     effective_max_history_entries=$(( allowed_conversational_messages + system_offset ))
 
     if [[ $current_history_size -gt $effective_max_history_entries ]]; then
         elements_to_remove=$((current_history_size - effective_max_history_entries))
         if [[ $system_offset -eq 1 ]]; then # Keep system prompt, remove from user/AI messages
-            chat_history=("${chat_history[0]}" "${chat_history[@]:(1 + elements_to_remove)}")
+            chat_history=("${chat_history[0]}" "${chat_history[@]:(1 + ${elements_to_remove})}")
         else # No system prompt, remove from the beginning
-            chat_history=("${chat_history[@]:$elements_to_remove}")
+            chat_history=("${chat_history[@]:${elements_to_remove}}")
         fi
     fi
 
@@ -545,7 +575,6 @@ while true; do
         echo -e "${COLOR_ERROR}Error: Failed to create valid JSON array from history. Rolling back last user message.${COLOR_RESET}" >&2
         if [ ${#chat_history[@]} -gt 0 ]; then
              last_idx=$(( ${#chat_history[@]} - 1 ))
-             # Ensure it's a user message we're removing (the one just added)
              last_role_raw=$(echo "${chat_history[$last_idx]}" | jq -r .role 2>/dev/null)
              if [[ "$last_role_raw" == "user" ]]; then
                  unset 'chat_history[$last_idx]'
@@ -556,17 +585,13 @@ while true; do
     fi
 
     json_payload=""
-    if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then # Gemini payload (streaming URL handles stream, payload structure is for non-streamed body too)
-        # Gemini streamGenerateContent doesn't usually take temp/max_tokens in request body, rather as query params or SDK config.
-        # For direct HTTP for streamGenerateContent, these are sometimes omitted from body in favor of global model defaults or set elsewhere if supported.
-        # To keep it simple and align with generateContent, we can still include them, API will ignore if not applicable.
+    if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then # Gemini payload
         json_payload=$(jq -n --argjson contents "$history_json_array" \
-            --arg temperature_str "1.0" \
-            --arg max_tokens_str "16384" \
-            '{contents: $contents, generationConfig: {temperature: ($temperature_str | tonumber), maxOutputTokens: ($max_tokens_str | tonumber)}}'
+            --arg temperature_str "$DEFAULT_OAI_TEMPERATURE" \
+            --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
+            --arg top_p_str "$DEFAULT_OAI_TOP_P" \
+            '{contents: $contents, generationConfig: {temperature: ($temperature_str | tonumber), maxOutputTokens: ($max_tokens_str | tonumber), topP: ($top_p_str | tonumber)}}'
         )
-        
-        # Conditionally add the tools array if ENABLE_TOOL_CALLING is true
         if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
             json_payload=$(echo "$json_payload" | jq '. + {tools: [{"urlContext": {}}, {"googleSearch": {}}]}')
         fi
@@ -604,7 +629,7 @@ while true; do
     echo -n -e "\r${COLOR_AI}AI:${COLOR_RESET} ${COLOR_INFO}(Waiting for stream...)${COLOR_RESET}"
     
     # Base curl arguments for chat
-    base_chat_curl_args=(-sS -L -N -X POST "$CHAT_API_URL" -H "Content-Type: application/json" -H "Accept: application/json") # -N for stream, -S for curl errors
+    base_chat_curl_args=(-sS -L -N -X POST "$CHAT_API_URL" -H "Content-Type: application/json" -H "Accept: application/json")
     [ -n "$CHAT_AUTH_HEADER" ] && base_chat_curl_args+=(-H "$CHAT_AUTH_HEADER")
     [ ${#CHAT_EXTRA_HEADERS[@]} -gt 0 ] && base_chat_curl_args+=("${CHAT_EXTRA_HEADERS[@]}")
     base_chat_curl_args+=(-d "$json_payload")
@@ -614,21 +639,24 @@ while true; do
     api_error_occurred=false
     stream_error_message=""
     stream_finish_reason=""
-    first_chunk_received=false 
+    first_chunk_received=false
+    
+    ### MODIFICATION START ###
+    # State variable for tracking if we are inside <think> tags. Reset for each turn.
+    is_thinking=false
+    ### MODIFICATION END ###
 
-    curl_stderr_temp=$(mktemp)
+    CURL_STDERR_TEMP=$(mktemp)
 
     # Process substitution to read from curl's stdout line by line
-    exec 3< <(curl "${base_chat_curl_args[@]}" 2>"$curl_stderr_temp")
+    exec 3< <(curl "${base_chat_curl_args[@]}" 2>"$CURL_STDERR_TEMP")
 
     while IFS= read -r line <&3; do
         # OpenAI specific stream end marker (often followed by a final data packet with finish_reason)
         # Check if this is the OpenAI stream end marker for graceful exit from loop
         if [[ "$line" == "data: [DONE]" && "$IS_OPENAI_COMPATIBLE" == true ]]; then
-            # The actual final chunk with finish_reason might still come after or before this.
-            # This is more of a signal that no more *content* deltas will come.
+	    # The actual final chunk with finish_reason might still come after or before this.
             # Some APIs might send data: [DONE] and then close, others might send a final metadata chunk.
-            # The loop should naturally end when curl exits anyway if [DONE] is the very last thing.
             # For robustness, if we see [DONE], we can assume stream is effectively over.
             break 
         fi
@@ -636,12 +664,10 @@ while true; do
         if [[ "$line" == "data: "* ]]; then
             json_chunk="${line#data: }"
             # Handle case where data line is empty (SSE keep-alive ping typically)
-            if [[ -z "$json_chunk" ]]; then continue; fi 
+            if [[ -z "$json_chunk" ]]; then continue; fi
             
             if ! echo "$json_chunk" | jq empty 2>/dev/null ; then
-                # Potentially log malformed JSON if verbose debugging is on, but generally skip.
-                # echo -e "\n${COLOR_WARN}Warning: Malformed JSON data in stream: $(truncate "$json_chunk" 50)${COLOR_RESET}" >&2
-                continue # Skip malformed chunk
+                continue 
             fi
 
             # Universal error check in SSE data (e.g. OAI .error, Gemini .error in the JSON payload)
@@ -677,7 +703,7 @@ while true; do
             else # Gemini (using alt=sse)
                 text_chunk=$(echo "$json_chunk" | jq -r '.candidates[0].content.parts[0].text // empty')
                 current_sfr=$(echo "$json_chunk" | jq -r '.candidates[0].finishReason // empty') # Sometimes in .candidates[0].finishReason
-                 # Also check if finishReason is within a candidate's safetyRatings for some Gemini responses
+                # Also check if finishReason is within a candidate's safetyRatings for some Gemini responses
                 if [[ -z "$current_sfr" || "$current_sfr" == "null" ]]; then
                      current_sfr=$(echo "$json_chunk" | jq -r '.candidates[0].safetyRatings[]? | select(.blocked == true) | .category // empty' | head -n 1)
                      if [[ -n "$current_sfr" && "$current_sfr" != "null" ]]; then current_sfr="SAFETY"; fi # Normalize safety block to "SAFETY"
@@ -694,7 +720,7 @@ while true; do
                             first_chunk_received=true
                         fi
                         echo -e "\n${COLOR_WARN}AI requested tool call:${COLOR_RESET}" >&2
-                        echo "$tool_call_parts" | jq . >&2 # Pretty print the tool call
+                        echo "$tool_call_parts" | jq . >&2 
                         echo -e "${COLOR_WARN}(This script does not automatically execute tool calls or return tool output to the model.)\n${COLOR_RESET}" >&2
                         # Do not append tool call JSON to full_ai_response_text, as it's not "text"
                         # For a true tool-using agent, you'd feed this tool output back to the model.
@@ -709,13 +735,53 @@ while true; do
 
             # UI update for first received chunk
             if [[ "$first_chunk_received" == false && -n "$text_chunk" ]]; then
-                echo -ne "\r\033[K"; echo -n -e "${COLOR_AI}AI:${COLOR_RESET}  ${COLOR_AI}" # Clear "Waiting..." and print AI prefix
+                echo -ne "\r\033[K"; echo -n -e "${COLOR_AI}AI:${COLOR_RESET}  "
                 first_chunk_received=true
             fi
-            # Print and accumulate text
+            
+            ### MODIFICATION START ###
+            # Print and accumulate text, handling <think> tag coloring.
             if [[ -n "$text_chunk" ]]; then
-                echo -n "$text_chunk"; full_ai_response_text+="$text_chunk"
+                # Always accumulate the raw text with tags for potential debugging and for the stripping process later
+                full_ai_response_text+="$text_chunk"
+                
+                # Process the chunk for colored display
+                processing_chunk="$text_chunk"
+                while [[ -n "$processing_chunk" ]]; do
+                    if [[ "$is_thinking" == true ]]; then
+                        # Currently in a think block, look for the closing tag
+                        if [[ "$processing_chunk" == *"</think>"* ]]; then
+                            before_tag="${processing_chunk%%</think>*}"
+                            after_tag="${processing_chunk#*</think>}"
+                            echo -n "${before_tag}"
+                            # Print the closing tag in think color, then switch back to AI color
+                            echo -n -e "</think>${COLOR_AI}"
+                            is_thinking=false
+                            processing_chunk="$after_tag"
+                        else
+                            # No closing tag in this chunk, print the whole thing in think color
+                            echo -n "${processing_chunk}"
+                            processing_chunk=""
+                        fi
+                    else
+                        # Not in a think block, look for the opening tag
+                        if [[ "$processing_chunk" == *"<think>"* ]]; then
+                            before_tag="${processing_chunk%%<think>*}"
+                            after_tag="${processing_chunk#*<think>}"
+                            # Print the normal text, then switch to think color for the tag
+                            echo -n "${before_tag}"
+                            echo -n -e "${COLOR_THINK}<think>"
+                            is_thinking=true
+                            processing_chunk="$after_tag"
+                        else
+                            # No opening tag in this chunk, print the whole thing in normal AI color
+                            echo -n -e "${COLOR_AI}${processing_chunk}"
+                            processing_chunk=""
+                        fi
+                    fi
+                done
             fi
+            ### MODIFICATION END ###
 
             # For Gemini, any non-null finishReason usually means the end of its content stream for that turn.
             if [[ "$IS_OPENAI_COMPATIBLE" == false && -n "$stream_finish_reason" && "$stream_finish_reason" != "null" ]]; then
@@ -728,63 +794,81 @@ while true; do
                          # Not necessarily a 'hard' api_error_occurred for history, as partial content is useful
                      fi
                 fi
-                break # Gemini signals end effectively with a finish_reason in a data packet.
+                break # Gemini signals end with a finish_reason in a data packet.
             fi
-        # else: ignore non "data: " lines (comments, empty lines, :ping in SSE stream)
         fi
     done
-    exec 3<&- # Close file descriptor
+    exec 3<&- 
 
-    curl_stderr_content=$(cat "$curl_stderr_temp" 2>/dev/null)
-    rm -f "$curl_stderr_temp"
+    curl_stderr_content=$(cat "$CURL_STDERR_TEMP" 2>/dev/null)
+    # Explicitly remove the stderr temp file now that we've read it.
+    rm -f "$CURL_STDERR_TEMP"
 
     # --- Post-stream processing and UI update ---
     if [[ "$first_chunk_received" == false && -z "$stream_error_message" ]]; then # No data chunks ever received AND no stream error already flagged
-        echo -ne "\r\033[K" # Clear "Waiting..." line
-        if [[ -n "$curl_stderr_content" ]]; then # Curl itself failed or wrote to stderr
+        echo -ne "\r\033[K" 
+        if [[ -n "$curl_stderr_content" ]]; then 
             stream_error_message="API call failed. $(truncate "$curl_stderr_content" 150)"
             api_error_occurred=true
             echo -e "${COLOR_AI}AI:${COLOR_RESET} ${COLOR_ERROR}$stream_error_message${COLOR_RESET}"
         else # No data, no curl error, no stream error. API just closed connection or sent empty stream without [DONE] or error JSON.
             echo -e "${COLOR_AI}AI:${COLOR_RESET} ${COLOR_INFO}(No content in response or empty stream ended prematurely)${COLOR_RESET}"
-            # full_ai_response_text is already empty. This is not an "error" for history rollback unless desired to treat as such.
         fi
-    elif [[ "$first_chunk_received" == true ]]; then # At least one chunk was received and printed
-        echo -e "${COLOR_RESET}" # Reset color and ensure newline after the streamed AI response (AI color already active)
+    elif [[ "$first_chunk_received" == true ]]; then
+        # Ensure colors are reset at the end of a stream
+        echo -e "${COLOR_RESET}" 
         if [[ "$api_error_occurred" == true && -n "$stream_error_message" ]]; then
-            # Error occurred mid-stream or at the end after some content was printed
             echo -e "${COLOR_ERROR}$stream_error_message${COLOR_RESET}"
         else
             # Check and display noteworthy finish reasons if no explicit stream_error_message took precedence
             declare -A normal_finish_reasons=(
                 ["stop"]=1 ["done"]=1 ["length"]=1 # Common OAI
                 ["STOP"]=1 ["MAX_TOKENS"]=1 ["MODEL_LENGTH"]=1 # Common Gemini & others
-                # "null" can be normal if API just ends stream without explicit reason and content is there
             )
             if [[ -n "$stream_finish_reason" && "$stream_finish_reason" != "null" && -z "${normal_finish_reasons[$stream_finish_reason]}" ]]; then
                 echo -e "${COLOR_WARN}(Finish Reason: $stream_finish_reason)${COLOR_RESET}"
             fi
         fi
-    elif [[ "$api_error_occurred" == true && -n "$stream_error_message" ]]; then # Error was flagged, but no chunks ever printed (e.g. immediate JSON error from API)
-        echo -ne "\r\033[K" # Clear "Waiting..."
+    elif [[ "$api_error_occurred" == true && -n "$stream_error_message" ]]; then 
+        echo -ne "\r\033[K"
         echo -e "${COLOR_AI}AI:${COLOR_RESET} ${COLOR_ERROR}$stream_error_message${COLOR_RESET}"
-    # else: Stream ended, no data, no specific stream error message set -- means likely clean empty stream end if not caught above
     fi
     
-    ai_text="$full_ai_response_text" # Final accumulated text from stream
+    # Strip <think>...</think> blocks from the full response before saving to history.
+    text_to_clean="$full_ai_response_text"
+    cleaned_text=""
+    while [[ "$text_to_clean" == *"<think>"* ]]; do
+        # Add the part before the first <think> tag
+        cleaned_text+="${text_to_clean%%<think>*}"
+        # Isolate the part after the first <think> tag
+        after_think_tag="${text_to_clean#*<think>}"
+        # Check if a corresponding </think> tag exists
+        if [[ "$after_think_tag" == *"</think>"* ]]; then
+            # If so, continue processing from after the </think> tag
+            text_to_clean="${after_think_tag#*</think>}"
+        else
+            # Unclosed <think> tag, discard the rest of the string
+            text_to_clean=""
+            break
+        fi
+    done
+    # Add any remaining text after the last </think> tag
+    cleaned_text+="$text_to_clean"
+    # This is the final, clean text to be saved in history
+    ai_text="$cleaned_text"
 
-    # Create AI message JSON for history
-    if [[ "$api_error_occurred" == false && -n "$ai_text" ]]; then # Only add to history if no error and text exists
-        if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then # Gemini
+    # Create AI message JSON for history using the *cleaned* text
+    if [[ "$api_error_occurred" == false && -n "$ai_text" ]]; then 
+        if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then 
             local_ai_message_json=$(jq -n --arg text "$ai_text" '{role: "model", parts: [{text: $text}]}')
-        else # OpenAI-Compatible
+        else 
             local_ai_message_json=$(jq -n --arg content "$ai_text" '{role: "assistant", content: $content}')
         fi
-        if ! echo "$local_ai_message_json" | jq empty 2>/dev/null; then # Check if jq failed
+        if ! echo "$local_ai_message_json" | jq empty 2>/dev/null; then 
             echo -e "${COLOR_WARN}Warning: Internal error creating AI message JSON for history. AI response not added to history.${COLOR_RESET}" >&2
-            local_ai_message_json="" # Invalidate it
+            local_ai_message_json=""
         fi
-    else # Error occurred, or AI returned no text (even if not an "error", empty response isn't useful history)
+    else
         local_ai_message_json="" 
     fi
 
@@ -793,9 +877,8 @@ while true; do
          chat_history+=("$local_ai_message_json")
     else
         # Error occurred, or AI returned no text. Roll back last user message.
-        # (The $api_error_occurred || -z "$ai_text" condition)
-        if [[ $current_history_size -gt 0 && "$full_ai_response_text" != *"Content blocked by API"* ]]; then # Don't show rollback message if content was blocked, already messaged.
-            # Avoid rolling back if initial prompt was just a system context that didn't expect a response for history
+        if [[ $current_history_size -gt 0 && "$full_ai_response_text" != *"Content blocked by API"* ]]; then
+	    # Avoid rolling back if initial prompt was just a system context that didn't expect a response for history
             last_idx_before_ai_response=$(( ${#chat_history[@]} - 1 ))
             last_role_check=$(echo "${chat_history[$last_idx_before_ai_response]}" | jq -r .role 2>/dev/null)
 
