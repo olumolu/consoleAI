@@ -739,7 +739,6 @@ while true; do
                 first_chunk_received=true
             fi
             
-            ### MODIFICATION START ###
             # Print and accumulate text, handling <think> tag coloring.
             if [[ -n "$text_chunk" ]]; then
                 # Always accumulate the raw text with tags for potential debugging and for the stripping process later
@@ -781,8 +780,7 @@ while true; do
                     fi
                 done
             fi
-            ### MODIFICATION END ###
-
+	    
             # For Gemini, any non-null finishReason usually means the end of its content stream for that turn.
             if [[ "$IS_OPENAI_COMPATIBLE" == false && -n "$stream_finish_reason" && "$stream_finish_reason" != "null" ]]; then
                 if [[ "$stream_finish_reason" == "SAFETY" || "$stream_finish_reason" == "RECITATION" || "$stream_finish_reason" == "OTHER" ]]; then
