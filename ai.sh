@@ -641,11 +641,9 @@ while true; do
     stream_finish_reason=""
     first_chunk_received=false
     
-    ### MODIFICATION START ###
     # State variable for tracking if we are inside <think> tags. Reset for each turn.
     is_thinking=false
-    ### MODIFICATION END ###
-
+    
     CURL_STDERR_TEMP=$(mktemp)
 
     # Process substitution to read from curl's stdout line by line
