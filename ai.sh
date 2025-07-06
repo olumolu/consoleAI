@@ -595,22 +595,39 @@ while true; do
         if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
             json_payload=$(echo "$json_payload" | jq '. + {tools: [{"urlContext": {}}, {"googleSearch": {}}]}')
         fi
-    else # OpenAI-Compatible payload (add stream:true)
-         json_payload=$(jq -n \
-            --arg model "$MODEL_ID" \
-            --argjson messages "$history_json_array" \
-            --arg temperature_str "$DEFAULT_OAI_TEMPERATURE" \
-            --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
-            --arg top_p_str "$DEFAULT_OAI_TOP_P" \
-            '{
-                model: $model,
-                messages: $messages,
-                temperature: ($temperature_str | tonumber),
-                max_tokens: ($max_tokens_str | tonumber),
-                top_p: ($top_p_str | tonumber),
-                stream: true
-             }'
+    else # OpenAI-Compatible payload
+         # *** FIX APPLIED HERE: Create different payloads based on provider ***
+         if [[ "$PROVIDER" == "together" ]]; then
+            # Together AI has some models that fail with extra parameters. Send a minimal payload.
+            json_payload=$(jq -n \
+                --arg model "$MODEL_ID" \
+                --argjson messages "$history_json_array" \
+                --arg temperature_str "$DEFAULT_OAI_TEMPERATURE" \
+                '{
+                    model: $model,
+                    messages: $messages,
+                    temperature: ($temperature_str | tonumber),
+                    stream: true
+                }'
             )
+         else
+            # Standard payload for other OpenAI-compatible providers
+            json_payload=$(jq -n \
+                --arg model "$MODEL_ID" \
+                --argjson messages "$history_json_array" \
+                --arg temperature_str "$DEFAULT_OAI_TEMPERATURE" \
+                --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
+                --arg top_p_str "$DEFAULT_OAI_TOP_P" \
+                '{
+                    model: $model,
+                    messages: $messages,
+                    temperature: ($temperature_str | tonumber),
+                    max_tokens: ($max_tokens_str | tonumber),
+                    top_p: ($top_p_str | tonumber),
+                    stream: true
+                }'
+            )
+         fi
     fi
 
     if [ -z "$json_payload" ]; then
@@ -696,7 +713,8 @@ while true; do
             # Extract text chunk and finish reason based on provider type
             text_chunk=""; current_sfr="" # current_stream_finish_reason
             if [[ "$IS_OPENAI_COMPATIBLE" == true ]]; then
-                text_chunk=$(echo "$json_chunk" | jq -r '.choices[0].delta.content // empty')
+                # Added fallback to .choices[0].text for providers like TogetherAI
+                text_chunk=$(echo "$json_chunk" | jq -r '.choices[0].delta.content // .choices[0].text // empty')
                 current_sfr=$(echo "$json_chunk" | jq -r '.choices[0].finish_reason // empty')
             else # Gemini (using alt=sse)
                 text_chunk=$(echo "$json_chunk" | jq -r '.candidates[0].content.parts[0].text // empty')
@@ -873,7 +891,7 @@ while true; do
          chat_history+=("$local_ai_message_json")
     else
         # Error occurred, or AI returned no text. Roll back last user message.
-        if [[ $current_history_size -gt 0 && "$full_ai_response_text" != *"Content blocked by API"* ]]; then
+        if [[ ${#chat_history[@]} -gt 0 && "$full_ai_response_text" != *"Content blocked by API"* ]]; then
 	    # Avoid rolling back if initial prompt was just a system context that didn't expect a response for history
             last_idx_before_ai_response=$(( ${#chat_history[@]} - 1 ))
             last_role_check=$(echo "${chat_history[$last_idx_before_ai_response]}" | jq -r .role 2>/dev/null)
