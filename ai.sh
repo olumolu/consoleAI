@@ -602,6 +602,7 @@ while true; do
                 --arg model "$MODEL_ID" \
                 --argjson messages "$history_json_array" \
                 --arg temperature_str "$DEFAULT_OAI_TEMPERATURE" \
+		--arg top_p_str "$DEFAULT_OAI_TOP_P" \
                 '{
                     model: $model,
                     messages: $messages,
