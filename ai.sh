@@ -596,7 +596,6 @@ while true; do
             json_payload=$(echo "$json_payload" | jq '. + {tools: [{"urlContext": {}}, {"googleSearch": {}}]}')
         fi
     else # OpenAI-Compatible payload
-         # *** FIX APPLIED HERE: Create different payloads based on provider ***
          if [[ "$PROVIDER" == "together" ]]; then
             # Together AI has some models that fail with extra parameters. Send a minimal payload.
             json_payload=$(jq -n \
