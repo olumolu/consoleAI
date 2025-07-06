@@ -9,7 +9,7 @@ Run this from any macos or linux even from android with turmux.
 
 *   **Multi-Provider Support:** Chat with models from:
     *   Google Gemini
-    *   OpenRouter (access to OpenAI, Anthropic, Mistral, etc.)
+    *   OpenRouter (access to multi model providers)
     *   Groq
     *   Together AI
     *   Fireworks AI
