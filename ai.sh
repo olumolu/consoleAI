@@ -108,24 +108,24 @@ function print_usage() {
   echo -e "  gemini, openrouter, groq, together, fireworks, chutes, cerebras, novita"
   echo -e ""
   echo -e "${COLOR_INFO}Finding Model Identifiers (if needed manually):${COLOR_RESET}"
-  echo -e "    ${COLOR_USER}Gemini:${COLOR_RESET}     https://ai.google.dev/models/gemini"
-  echo -e "    ${COLOR_USER}OpenRouter:${COLOR_RESET} https://openrouter.ai/models"
-  echo -e "    ${COLOR_USER}Groq:${COLOR_RESET}       https://console.groq.com/docs/models"
-  echo -e "    ${COLOR_USER}Together:${COLOR_RESET}   https://docs.together.ai/docs/inference-models"
-  echo -e "    ${COLOR_USER}Fireworks:${COLOR_RESET}  https://fireworks.ai/models"
-  echo -e "    ${COLOR_USER}Chutes:${COLOR_RESET}     https://chutes.ai"
-  echo -e "    ${COLOR_USER}Cerebras:${COLOR_RESET}   https://cloud.cerebras.ai"
-  echo -e "    ${COLOR_USER}Novita:${COLOR_RESET}     https://docs.novita.ai"
+  echo -e "    ${COLOR_BOLD}${COLOR_USER}Gemini:${COLOR_RESET}     https://ai.google.dev/models/gemini"
+  echo -e "    ${COLOR_BOLD}${COLOR_USER}OpenRouter:${COLOR_RESET} https://openrouter.ai/models"
+  echo -e "    ${COLOR_BOLD}${COLOR_USER}Groq:${COLOR_RESET}       https://console.groq.com/docs/models"
+  echo -e "    ${COLOR_BOLD}${COLOR_USER}Together:${COLOR_RESET}   https://docs.together.ai/docs/inference-models"
+  echo -e "    ${COLOR_BOLD}${COLOR_USER}Fireworks:${COLOR_RESET}  https://fireworks.ai/models"
+  echo -e "    ${COLOR_BOLD}${COLOR_USER}Chutes:${COLOR_RESET}     https://chutes.ai"
+  echo -e "    ${COLOR_BOLD}${COLOR_USER}Cerebras:${COLOR_RESET}   https://cloud.cerebras.ai"
+  echo -e "    ${COLOR_BOLD}${COLOR_USER}Novita:${COLOR_RESET}     https://docs.novita.ai"
   echo -e ""
-  echo -e "${COLOR_INFO}Example Commands:${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 gemini${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 groq${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 chutes${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 fireworks${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 together${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 openrouter${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 cerebras${COLOR_RESET}"
-  echo -e "  ${COLOR_AI}$0 novita${COLOR_RESET}"
+  echo -e "${COLOR_BOLD}${COLOR_INFO}Example Commands:${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 gemini${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 groq${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 chutes${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 fireworks${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 together${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 openrouter${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 cerebras${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 novita${COLOR_RESET}"
   echo -e "${COLOR_WARN}NOTE: Ensure API keys are set inside the script before running!${COLOR_RESET}"
 }
 
@@ -488,12 +488,12 @@ first_user_message=true
 while true; do
     if [[ -t 0 && $- == *i* ]] && builtin command -v read -e &> /dev/null; then
          # Interactive mode with readline support
-         read -r -e -p "$(echo -e "${COLOR_USER}You:${COLOR_RESET} ")" user_input
+         read -r -e -p "$(echo -e "${COLOR_BOLD}${COLOR_USER}You:${COLOR_RESET} ")" user_input
          # Add to shell history if input is not empty
          [[ -n "$user_input" ]] && history -s "$user_input"
     else
          # Non-interactive or no readline support
-         read -r -p "$(echo -e "${COLOR_USER}You:${COLOR_RESET} ")" user_input
+         read -r -p "$(echo -e "${COLOR_BOLD}${COLOR_USER}You:${COLOR_RESET} ")" user_input
     fi
 
     if [[ "$user_input" == "quit" || "$user_input" == "exit" ]]; then
