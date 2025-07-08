@@ -1,13 +1,13 @@
 #!/bin/bash
 # Universal Chat CLI (Bash/curl/jq) - With Model Selection, HISTORY, SYSTEM PROMPT, STREAMING
 # REQUIREMENTS: bash, curl, jq (must be pre-installed on the system)
-# Supports: Gemini, OpenRouter, Groq, Together AI, Fireworks AI, Chutes AI, Cerebras AI, Novita AI
+# Supports: Gemini, OpenRouter, Groq, Together AI, Chutes AI, Cerebras AI, Novita AI
 # To Run This Tool First Make It executable with $ chmod +x ai.sh
 # Run This $ ./ai.sh provider
 # filter support added [filter] ... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
 # History, system prompt, and streaming are supported.
 # /history for show conversation log and <think>...</think> in a different colour for better visual experience.
-# Session management commands: /save <name>, /load <name>, /new
+# Session management commands: /save <name>, /load <name>, /clear
 
 set -e -E # Exit on error, inherit error traps
 
@@ -60,9 +60,6 @@ GROQ_API_KEY=""
 # Together: https://api.together.ai/settings/api-keys
 TOGETHER_API_KEY=""
 
-# Fireworks: https://fireworks.ai/api-keys
-FIREWORKS_API_KEY=""
-
 # Chutes: https://chutes.ai/app/api
 CHUTES_API_KEY=""
 
@@ -78,7 +75,6 @@ GEMINI_CHAT_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models/"
 OPENROUTER_CHAT_URL="https://openrouter.ai/api/v1/chat/completions"
 GROQ_CHAT_URL="https://api.groq.com/openai/v1/chat/completions"
 TOGETHER_CHAT_URL="https://api.together.ai/v1/chat/completions"
-FIREWORKS_CHAT_URL="https://api.fireworks.ai/inference/v1/chat/completions"
 CHUTES_CHAT_URL="https://llm.chutes.ai/v1/chat/completions"
 CEREBRAS_CHAT_URL="https://api.cerebras.ai/v1/chat/completions"
 NOVITA_CHAT_URL="https://api.novita.ai/v3/openai/chat/completions"
@@ -88,7 +84,6 @@ GEMINI_MODELS_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
 GROQ_MODELS_URL="https://api.groq.com/openai/v1/models"
 TOGETHER_MODELS_URL="https://api.together.ai/v1/models"
-FIREWORKS_MODELS_URL="https://api.fireworks.ai/inference/v1/models"
 CHUTES_MODELS_URL="https://llm.chutes.ai/v1/models"
 CEREBRAS_MODELS_URL="https://api.cerebras.ai/v1/models"
 NOVITA_MODELS_URL="https://api.novita.ai/v3/openai/models"
@@ -107,14 +102,13 @@ function print_usage() {
   echo -e "  It will fetch available models and let you choose one by number."
   echo -e ""
   echo -e "${COLOR_INFO}Supported Providers:${COLOR_RESET}"
-  echo -e "  gemini, openrouter, groq, together, fireworks, chutes, cerebras, novita"
+  echo -e "  gemini, openrouter, groq, together, chutes, cerebras, novita"
   echo -e ""
   echo -e "${COLOR_INFO}Finding Model Identifiers (if needed manually):${COLOR_RESET}"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Gemini:${COLOR_RESET}     https://ai.google.dev/models/gemini"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}OpenRouter:${COLOR_RESET} https://openrouter.ai/models"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Groq:${COLOR_RESET}       https://console.groq.com/docs/models"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Together:${COLOR_RESET}   https://docs.together.ai/docs/inference-models"
-  echo -e "    ${COLOR_BOLD}${COLOR_USER}Fireworks:${COLOR_RESET}  https://fireworks.ai/models"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Chutes:${COLOR_RESET}     https://chutes.ai"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Cerebras:${COLOR_RESET}   https://cloud.cerebras.ai"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Novita:${COLOR_RESET}     https://docs.novita.ai"
@@ -123,7 +117,6 @@ function print_usage() {
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 gemini${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 groq${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 chutes${COLOR_RESET}"
-  echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 fireworks${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 together${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 openrouter${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 cerebras${COLOR_RESET}"
@@ -155,9 +148,6 @@ function check_placeholder_key() {
     elif [[ "$provider_name" == "groq" && "$key_value" == "gsk_"* && ${#key_value} -lt 10 ]]; then
         placeholder_found=true
         message="appears to be an incomplete Groq key (starts with gsk_ but is too short)"
-    elif [[ "$provider_name" == "fireworks" && "$key_value" == "fw-"* && ${#key_value} -lt 10 ]]; then
-        placeholder_found=true
-        message="appears to be an incomplete Fireworks key (starts with fw- but is too short)"
     elif [[ "$provider_name" == "chutes" && "$key_value" == ".." ]]; then
         placeholder_found=true
         message="is the default placeholder ('..')"
@@ -212,12 +202,11 @@ case "$PROVIDER" in
     openrouter) API_KEY="$OPENROUTER_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     groq)       API_KEY="$GROQ_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     together)   API_KEY="$TOGETHER_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
-    fireworks)  API_KEY="$FIREWORKS_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     chutes)     API_KEY="$CHUTES_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     cerebras)   API_KEY="$CEREBRAS_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     novita)     API_KEY="$NOVITA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     *)
-        echo -e "${COLOR_ERROR}Error: Unknown provider '$PROVIDER'. Choose from: gemini, openrouter, groq, together, fireworks, chutes, cerebras, novita${COLOR_RESET}" >&2
+        echo -e "${COLOR_ERROR}Error: Unknown provider '$PROVIDER'. Choose from: gemini, openrouter, groq, together, chutes, cerebras, novita${COLOR_RESET}" >&2
         print_usage
         exit 1
         ;;
@@ -256,11 +245,6 @@ case "$PROVIDER" in
         MODELS_URL="$TOGETHER_MODELS_URL"
         MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
         JQ_QUERY='. | sort_by(.id) | .[].id' # Together AI lists models in a root array
-        ;;
-    fireworks)
-        MODELS_URL="$FIREWORKS_MODELS_URL"
-        MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
-        JQ_QUERY='.data[]? | select(.type == "chat_completion" or .supports_chat == true) | .id'
         ;;
     chutes)
         MODELS_URL="$CHUTES_MODELS_URL"
@@ -422,7 +406,7 @@ case "$PROVIDER" in
         CHAT_API_URL="${GEMINI_CHAT_URL_BASE}${MODEL_ID}:streamGenerateContent?key=${API_KEY}&alt=sse"
         IS_OPENAI_COMPATIBLE=false # Gemini uses "model" role, not "assistant"
         ;;
-    openrouter|groq|together|fireworks|chutes|cerebras|novita)
+    openrouter|groq|together|chutes|cerebras|novita)
         CHAT_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
         IS_OPENAI_COMPATIBLE=true # These use "assistant" role
         case "$PROVIDER" in
@@ -433,7 +417,6 @@ case "$PROVIDER" in
                 ;;
             groq)       CHAT_API_URL="$GROQ_CHAT_URL" ;;
             together)   CHAT_API_URL="$TOGETHER_CHAT_URL" ;;
-            fireworks)  CHAT_API_URL="$FIREWORKS_CHAT_URL" ;;
             chutes)     CHAT_API_URL="$CHUTES_CHAT_URL" ;;
             cerebras)   CHAT_API_URL="$CEREBRAS_CHAT_URL" ;;
             novita)     CHAT_API_URL="$NOVITA_CHAT_URL" ;;
@@ -490,7 +473,7 @@ if [[ "$PROVIDER" == "gemini" ]]; then
 fi
 
 # Updated help text to include new session commands
-echo -e "Enter prompt. Type ${COLOR_BOLD}'quit'/'exit'${COLOR_RESET}. Commands: ${COLOR_BOLD}/history, /save <name>, /load <name>, /new${COLOR_RESET}"
+echo -e "Enter prompt. Type ${COLOR_BOLD}'quit'/'exit'${COLOR_RESET}. Commands: ${COLOR_BOLD}/history, /save <name>, /load <name>, /clear${COLOR_RESET}"
 echo -e "---------------------------------------------------------------------------------------"
 first_user_message=true
 
@@ -564,10 +547,22 @@ while true; do
                 echo -e "${COLOR_INFO}Use /history to see the loaded conversation.${COLOR_RESET}"
                 continue
                 ;;
-            "/new")
-                initialize_history
-                first_user_message=true
-                echo -e "${COLOR_INFO}New session started. History cleared.${COLOR_RESET}"
+            "/clear")
+                if [ ! -d "$SESSION_DIR" ] || [ -z "$(ls -A "$SESSION_DIR"/*.json 2>/dev/null)" ]; then
+                    echo -e "${COLOR_INFO}No saved sessions to clear.${COLOR_RESET}" >&2
+                    continue
+                fi
+                echo -e "${COLOR_WARN}This will permanently delete all saved chat sessions in ${SESSION_DIR}:${COLOR_RESET}" >&2
+                # List files to be deleted
+                ls -1 "${SESSION_DIR}"/*.json >&2
+                read -r -p "$(echo -e "${COLOR_WARN}Are you sure you want to proceed? (y/N): ${COLOR_RESET}")" confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    # Using find to be safer with filenames with special characters
+                    find "$SESSION_DIR" -maxdepth 1 -type f -name "*.json" -delete
+                    echo -e "${COLOR_INFO}All saved sessions have been cleared.${COLOR_RESET}"
+                else
+                    echo -e "${COLOR_INFO}Clear operation cancelled.${COLOR_RESET}"
+                fi
                 continue
                 ;;
         esac
