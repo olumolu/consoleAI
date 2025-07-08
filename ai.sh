@@ -7,6 +7,7 @@
 # filter support added [filter] ... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
 # History, system prompt, and streaming are supported.
 # /history for show conversation log and <think>...</think> in a different colour for better visual experience.
+# Session management commands: /save <name>, /load <name>, /new
 
 set -e -E # Exit on error, inherit error traps
 
@@ -25,15 +26,16 @@ MAX_HISTORY_MESSAGES=20       # Keep the last N messages (user + ai). Adjust if 
 DEFAULT_OAI_TEMPERATURE=0.7   # t = randomness: Higher = more creative, Lower = more predictable | allowed value 0-2
 DEFAULT_OAI_MAX_TOKENS=8192   # Default max_tokens for OpenAI-compatible APIs
 DEFAULT_OAI_TOP_P=0.9         # p = diversity: Higher = wider vocabulary, Lower = safer word choices | allowed value 0-1
+SESSION_DIR="${HOME}/.chat_sessions"    # Directory for storing chat session history files.
 
 # --- System Prompt Definition ---
 # Instruct the AI to use the conversation history to maintain the ongoing task context.
-SYSTEM_PROMPT="You are a helpful assistant running in a command-line interface."
+SYSTEM_PROMPT="You are a helpful assistant running in a a command-line interface."
 # SYSTEM_PROMPT="" # Example: Disable system prompt
 
 # --- Color Definitions --- Use 256-color
 COLOR_RESET='\033[0m'
-COLOR_USER='\033[38;5;213m'     # Bright Pink/Magenta
+COLOR_USER='\033[38;5;199m'     # Bright Magenta
 COLOR_AI='\033[38;5;40m'        # Bright green
 COLOR_THINK='\033[38;5;214m'    # Soft orange
 COLOR_ERROR='\033[38;5;203m'    # Vivid red
@@ -441,20 +443,25 @@ esac
 
 declare -a chat_history=()
 
-if [[ -n "$SYSTEM_PROMPT" ]]; then
-    system_message_json=""
-    if [[ "$IS_OPENAI_COMPATIBLE" == true ]]; then # OpenAI compatible system prompt
-        system_message_json=$(jq -n --arg content "$SYSTEM_PROMPT" '{role: "system", content: $content}')
+function initialize_history() {
+    chat_history=() # Clear the array
+    if [[ -n "$SYSTEM_PROMPT" ]]; then
+        local system_message_json=""
+        if [[ "$IS_OPENAI_COMPATIBLE" == true ]]; then # OpenAI compatible system prompt
+            system_message_json=$(jq -n --arg content "$SYSTEM_PROMPT" '{role: "system", content: $content}')
+        fi
+        if [[ -n "$system_message_json" ]]; then
+            chat_history+=("$system_message_json")
+        elif [[ "$IS_OPENAI_COMPATIBLE" == false && -n "$SYSTEM_PROMPT" ]]; then
+            # For Gemini, system prompt is handled by prepending to first user message.
+            : # No object added to chat_history for Gemini's system prompt here.
+        elif [[ -n "$SYSTEM_PROMPT" ]]; then # Failed to create JSON for OAI
+            echo -e "${COLOR_WARN}Warning: Failed to create system prompt JSON (jq error?). System prompt may not be active.${COLOR_RESET}" >&2
+        fi
     fi
-    if [[ -n "$system_message_json" ]]; then
-        chat_history+=("$system_message_json")
-    elif [[ "$IS_OPENAI_COMPATIBLE" == false && -n "$SYSTEM_PROMPT" ]]; then
-        # For Gemini, system prompt is handled by prepending to first user message.
-        : # No object added to chat_history for Gemini's system prompt here.
-    elif [[ -n "$SYSTEM_PROMPT" ]]; then # Failed to create JSON for OAI
-        echo -e "${COLOR_WARN}Warning: Failed to create system prompt JSON (jq error?). System prompt may not be active.${COLOR_RESET}" >&2
-    fi
-fi
+}
+
+initialize_history # Set up the initial history (with system prompt if applicable)
 
 echo -e "--- ${COLOR_INFO}Starting Chat${COLOR_RESET} ---"
 echo -e "${COLOR_INFO}Provider:${COLOR_RESET}      ${PROVIDER^^}"
@@ -481,8 +488,10 @@ if [[ "$PROVIDER" == "gemini" ]]; then
         echo -e "${COLOR_INFO}Tool Calling:${COLOR_RESET}    Disabled (for Gemini models)"
     fi
 fi
-echo -e "Enter your prompt below. Type ${COLOR_BOLD}'quit'${COLOR_RESET}, ${COLOR_BOLD}'exit'${COLOR_RESET}, or ${COLOR_BOLD}'/history'${COLOR_RESET} to view conversation log."
-echo -e "----------------------------------------"
+
+# Updated help text to include new session commands
+echo -e "Enter prompt. Type ${COLOR_BOLD}'quit'/'exit'${COLOR_RESET}. Commands: ${COLOR_BOLD}/history, /save <name>, /load <name>, /new${COLOR_RESET}"
+echo -e "---------------------------------------------------------------------------------------"
 first_user_message=true
 
 while true; do
@@ -501,27 +510,67 @@ while true; do
         break
     fi
 
-    if [[ "$user_input" == "/history" ]]; then
-        echo -e "${COLOR_INFO}--- Current Conversation History (${#chat_history[@]} messages) ---${COLOR_RESET}"
-        if [ ${#chat_history[@]} -eq 0 ]; then
-            echo "(History is empty)" >&2
-        else
-            # This jq filter makes the output much more readable
-            printf '%s\n' "${chat_history[@]}" | jq -s -c '.[]' | while IFS= read -r msg; do
-                role=$(echo "$msg" | jq -r '.role')
-                content=$(echo "$msg" | jq -r '.content // .parts[0].text')
-                
-                if [[ "$role" == "user" ]]; then
-                    echo -e "${COLOR_USER}[$role]${COLOR_RESET} $content"
-                elif [[ "$role" == "assistant" || "$role" == "model" ]]; then
-                    echo -e "${COLOR_AI}[$role]${COLOR_RESET} $content"
-                else # system
-                    echo -e "${COLOR_WARN}[$role]${COLOR_RESET} $content"
+    ### --- Session Management Logic --- ###
+    if [[ "$user_input" == /* ]]; then
+        read -r cmd args <<< "$user_input"
+        case "$cmd" in
+            "/history")
+                echo -e "${COLOR_INFO}--- Current Conversation History (${#chat_history[@]} messages) ---${COLOR_RESET}"
+                if [ ${#chat_history[@]} -eq 0 ]; then
+                    echo "(History is empty)" >&2
+                else
+                    printf '%s\n' "${chat_history[@]}" | jq -s -c '.[]' | while IFS= read -r msg; do
+                        role=$(echo "$msg" | jq -r '.role')
+                        content=$(echo "$msg" | jq -r '.content // .parts[0].text')
+                        
+                        if [[ "$role" == "user" ]]; then
+                            echo -e "${COLOR_USER}[$role]${COLOR_RESET} $content"
+                        elif [[ "$role" == "assistant" || "$role" == "model" ]]; then
+                            echo -e "${COLOR_AI}[$role]${COLOR_RESET} $content"
+                        else # system
+                            echo -e "${COLOR_WARN}[$role]${COLOR_RESET} $content"
+                        fi
+                    done >&2
                 fi
-            done >&2
-        fi
-        echo -e "${COLOR_INFO}--------------------------------------------${COLOR_RESET}"
-        continue
+                echo -e "${COLOR_INFO}--------------------------------------------${COLOR_RESET}"
+                continue
+                ;;
+            "/save")
+                if [[ -z "$args" ]]; then
+                    echo -e "${COLOR_WARN}Usage: /save <session_name>${COLOR_RESET}" >&2
+                    continue
+                fi
+                mkdir -p "$SESSION_DIR"
+                session_file="${SESSION_DIR}/${args}.json"
+                # Combine history array into a single JSON array and save
+                printf '%s\n' "${chat_history[@]}" | jq -s . > "$session_file"
+                echo -e "${COLOR_INFO}Session saved to: $session_file${COLOR_RESET}"
+                continue
+                ;;
+            "/load")
+                if [[ -z "$args" ]]; then
+                    echo -e "${COLOR_WARN}Usage: /load <session_name>${COLOR_RESET}" >&2
+                    continue
+                fi
+                session_file="${SESSION_DIR}/${args}.json"
+                if [[ ! -f "$session_file" ]]; then
+                    echo -e "${COLOR_ERROR}Error: Session file not found: $session_file${COLOR_RESET}" >&2
+                    continue
+                fi
+                # Load JSON array from file into the chat_history bash array
+                mapfile -t chat_history < <(jq -c '.[]' "$session_file")
+                first_user_message=false # A loaded session is not a "first message"
+                echo -e "${COLOR_INFO}Session loaded from: $session_file${COLOR_RESET}"
+                echo -e "${COLOR_INFO}Use /history to see the loaded conversation.${COLOR_RESET}"
+                continue
+                ;;
+            "/new")
+                initialize_history
+                first_user_message=true
+                echo -e "${COLOR_INFO}New session started. History cleared.${COLOR_RESET}"
+                continue
+                ;;
+        esac
     fi
 
     if [[ -z "$user_input" ]]; then
@@ -596,37 +645,33 @@ while true; do
             json_payload=$(echo "$json_payload" | jq '. + {tools: [{"urlContext": {}}, {"googleSearch": {}}]}')
         fi
     else # OpenAI-Compatible payload
-         if [[ "$PROVIDER" == "together" ]]; then
-            # Together AI has some models that fail with extra parameters. Send a minimal payload.
-            json_payload=$(jq -n \
-                --arg model "$MODEL_ID" \
-                --argjson messages "$history_json_array" \
-                --arg temperature_str "$DEFAULT_OAI_TEMPERATURE" \
-		--arg top_p_str "$DEFAULT_OAI_TOP_P" \
-                '{
-                    model: $model,
-                    messages: $messages,
-                    temperature: ($temperature_str | tonumber),
-                    stream: true
+         ### --- Dynamic Payload Construction --- ###
+         # Start with a base payload common to all OpenAI-compatible providers
+         base_payload=$(jq -n \
+            --arg model "$MODEL_ID" \
+            --argjson messages "$history_json_array" \
+            --arg temperature_str "$DEFAULT_OAI_TEMPERATURE" \
+            '{
+                model: $model,
+                messages: $messages,
+                temperature: ($temperature_str | tonumber),
+                stream: true
+            }'
+         )
+
+         # Conditionally add parameters for providers that support them.
+         # TogetherAI, for example, can be sensitive to extra parameters on some models.
+         if [[ "$PROVIDER" != "together" ]]; then
+            json_payload=$(echo "$base_payload" | jq \
+                --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
+                --arg top_p_str "$DEFAULT_OAI_TOP_P" \
+                '. + {
+                    max_tokens: ($max_tokens_str | tonumber),
+                    top_p: ($top_p_str | tonumber)
                 }'
             )
          else
-            # Standard payload for other OpenAI-compatible providers
-            json_payload=$(jq -n \
-                --arg model "$MODEL_ID" \
-                --argjson messages "$history_json_array" \
-                --arg temperature_str "$DEFAULT_OAI_TEMPERATURE" \
-                --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
-                --arg top_p_str "$DEFAULT_OAI_TOP_P" \
-                '{
-                    model: $model,
-                    messages: $messages,
-                    temperature: ($temperature_str | tonumber),
-                    max_tokens: ($max_tokens_str | tonumber),
-                    top_p: ($top_p_str | tonumber),
-                    stream: true
-                }'
-            )
+            json_payload="$base_payload"
          fi
     fi
 
