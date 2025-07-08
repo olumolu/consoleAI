@@ -76,7 +76,7 @@ To start interacting with a specific AI provider, execute the script from your t
 Choose any model from any provider just by selecting the Number mentioned before the model name from the list of available models.
 
 > [!NOTE]
-5.>  **(Optional) Adjust Default Settings:**
+5.  **(Optional) Adjust Default Settings:**
     You can customize other settings near the top of the script:
   >   `MAX_HISTORY_MESSAGES`: Number of past messages (user + AI) to keep in history.
   >   `DEFAULT_OAI_TEMPERATURE`, `DEFAULT_OAI_MAX_TOKENS`, `DEFAULT_OAI_TOP_P`: Parameters for OpenAI-compatible APIs.
