@@ -39,7 +39,7 @@ Run this from any macos or linux even from android with turmux.
     Or just download the `ai.sh` file.
 
 > [!IMPORTANT]
- 2.    configure API Keys:**
+> 2.    configure API Keys:**
     You **MUST** add your API keys to the script. Open `ai.sh` in a text editor and locate the API key section:
 
     ```bash
