@@ -78,9 +78,13 @@ Choose any model from any provider just by selecting the Number mentioned before
 > [!NOTE]    
 > 5.  **(Optional) Adjust Default Settings:**
     You can customize other settings near the top of the script:
+> [!NOTE]   
   >   `MAX_HISTORY_MESSAGES`: Number of past messages (user + AI) to keep in history.
+> [!NOTE]   
   >   `DEFAULT_OAI_TEMPERATURE`, `DEFAULT_OAI_MAX_TOKENS`, `DEFAULT_OAI_TOP_P`: Parameters for OpenAI-compatible APIs.
+> [!NOTE]   
   >  `SYSTEM_PROMPT`: The default system-level instruction for the AI. Set to `""` to disable.
+> [!NOTE]   
   >   `SESSION_DIR`  : Change location for saving session with /save. 
 
 
