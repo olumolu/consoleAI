@@ -25,6 +25,8 @@ Run this from any macos or linux even from android with turmux.
 *   **Easy Configuration:** API keys and core settings are managed directly within the script.
 *   **Tool Calling:** Tool Calling added into gemini with prompt to enable.
 *   **search filter:** Filter support added [filter] ... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
+*   **Session management commands:** /save <name>, /load <name>, /new .
+*   **Vision support:** Vision support for vision models. just drag and drop or filename with location (e.g., /var/home/user/Downloads/filename.png into the file into the terminal(console) chat window and ask.
 
 1.  **Download the Script:**
     Clone the repository or download `ai.sh` to your local machine.
@@ -84,4 +86,3 @@ Choose any model from any provider just by selecting the Number mentioned before
 > [!NOTE]
 > **Out of scope**
 >  *  Image genaration is out of scope as it is a terminal app.
->  *  Image upload for VL models is not yet implemented.
