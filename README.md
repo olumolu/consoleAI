@@ -77,7 +77,7 @@ Choose any model from any provider just by selecting the Number mentioned before
 
 
 > [!IMPORTANT]
-5.  **(Optional) Adjust Default Settings:**
+> 5.  **(Optional) Adjust Default Settings:**
 
 You can customize other settings near the top of the script:
 *   `MAX_HISTORY_MESSAGES`: Number of past messages (user + AI) to keep in history.
