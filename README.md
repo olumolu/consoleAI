@@ -1,8 +1,8 @@
 # consoleAI
-A versatile Bash script that provides a command-line interface (CLI) for 
-interacting with various Large Language Models (LLMs) from multiple AI providers. 
+A versatile script that provides a command-line interface (CLI) for 
+interacting with various Large Language Models (LLMs) from multiple inference providers. 
 It supports model selection, conversation history, system prompts, and 
-real-time streaming of responses.
+real-time streaming of responses, filter from the models and off|on tool calling.
 Run this from any macos or linux even from android with turmux.
 
 ## Features
