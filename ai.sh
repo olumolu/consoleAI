@@ -1,7 +1,7 @@
 #!/bin/bash
 # Universal Chat CLI (Bash/curl/jq) - With Model Selection, HISTORY, SYSTEM PROMPT, STREAMING
 # REQUIREMENTS: bash, curl, jq (must be pre-installed on the system)
-# Supports: Gemini, OpenRouter, Groq, Together AI, Chutes AI, Cerebras AI, Novita AI
+# Supports: Gemini, OpenRouter, Groq, Together AI, Cerebras AI, Novita AI
 # To Run This Tool First Make It executable with $ chmod +x ai.sh
 # Run This $ ./ai.sh provider
 # filter support added [filter] ... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
@@ -60,9 +60,6 @@ GROQ_API_KEY=""
 # Together: https://api.together.ai/settings/api-keys
 TOGETHER_API_KEY=""
 
-# Chutes: https://chutes.ai/app/api
-CHUTES_API_KEY=""
-
 # Cerebras: https://cloud.cerebras.ai/
 CEREBRAS_API_KEY=""
 
@@ -75,7 +72,6 @@ GEMINI_CHAT_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models/"
 OPENROUTER_CHAT_URL="https://openrouter.ai/api/v1/chat/completions"
 GROQ_CHAT_URL="https://api.groq.com/openai/v1/chat/completions"
 TOGETHER_CHAT_URL="https://api.together.ai/v1/chat/completions"
-CHUTES_CHAT_URL="https://llm.chutes.ai/v1/chat/completions"
 CEREBRAS_CHAT_URL="https://api.cerebras.ai/v1/chat/completions"
 NOVITA_CHAT_URL="https://api.novita.ai/v3/openai/chat/completions"
 
@@ -84,7 +80,6 @@ GEMINI_MODELS_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
 GROQ_MODELS_URL="https://api.groq.com/openai/v1/models"
 TOGETHER_MODELS_URL="https://api.together.ai/v1/models"
-CHUTES_MODELS_URL="https://llm.chutes.ai/v1/models"
 CEREBRAS_MODELS_URL="https://api.cerebras.ai/v1/models"
 NOVITA_MODELS_URL="https://api.novita.ai/v3/openai/models"
 
@@ -102,21 +97,19 @@ function print_usage() {
   echo -e "  It will fetch available models and let you choose one by number."
   echo -e ""
   echo -e "${COLOR_INFO}Supported Providers:${COLOR_RESET}"
-  echo -e "  gemini, openrouter, groq, together, chutes, cerebras, novita"
+  echo -e "  gemini, openrouter, groq, together, cerebras, novita"
   echo -e ""
   echo -e "${COLOR_INFO}Finding Model Identifiers (if needed manually):${COLOR_RESET}"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Gemini:${COLOR_RESET}     https://ai.google.dev/models/gemini"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}OpenRouter:${COLOR_RESET} https://openrouter.ai/models"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Groq:${COLOR_RESET}       https://console.groq.com/docs/models"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Together:${COLOR_RESET}   https://docs.together.ai/docs/inference-models"
-  echo -e "    ${COLOR_BOLD}${COLOR_USER}Chutes:${COLOR_RESET}     https://chutes.ai"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Cerebras:${COLOR_RESET}   https://cloud.cerebras.ai"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Novita:${COLOR_RESET}     https://docs.novita.ai"
   echo -e ""
   echo -e "${COLOR_BOLD}${COLOR_INFO}Example Commands:${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 gemini${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 groq${COLOR_RESET}"
-  echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 chutes${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 together${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 openrouter${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 cerebras${COLOR_RESET}"
@@ -148,9 +141,6 @@ function check_placeholder_key() {
     elif [[ "$provider_name" == "groq" && "$key_value" == "gsk_"* && ${#key_value} -lt 10 ]]; then
         placeholder_found=true
         message="appears to be an incomplete Groq key (starts with gsk_ but is too short)"
-    elif [[ "$provider_name" == "chutes" && "$key_value" == ".." ]]; then
-        placeholder_found=true
-        message="is the default placeholder ('..')"
     elif [[ "$provider_name" == "cerebras" && "$key_value" == "csk-" ]]; then
         placeholder_found=true
         message="is the default Cerebras prefix placeholder ('csk-')"
@@ -202,11 +192,10 @@ case "$PROVIDER" in
     openrouter) API_KEY="$OPENROUTER_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     groq)       API_KEY="$GROQ_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     together)   API_KEY="$TOGETHER_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
-    chutes)     API_KEY="$CHUTES_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     cerebras)   API_KEY="$CEREBRAS_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     novita)     API_KEY="$NOVITA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
     *)
-        echo -e "${COLOR_ERROR}Error: Unknown provider '$PROVIDER'. Choose from: gemini, openrouter, groq, together, chutes, cerebras, novita${COLOR_RESET}" >&2
+        echo -e "${COLOR_ERROR}Error: Unknown provider '$PROVIDER'. Choose from: gemini, openrouter, groq, together, cerebras, novita${COLOR_RESET}" >&2
         print_usage
         exit 1
         ;;
@@ -244,12 +233,7 @@ case "$PROVIDER" in
     together)
         MODELS_URL="$TOGETHER_MODELS_URL"
         MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
-        JQ_QUERY='. | sort_by(.id) | .[].id' # Together AI lists models in a root array
-        ;;
-    chutes)
-        MODELS_URL="$CHUTES_MODELS_URL"
-        MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
-        JQ_QUERY='.data | sort_by(.id) | .[].id'
+        JQ_QUERY='. | sort_by(.id) | .[].id'
         ;;
     cerebras)
         MODELS_URL="$CEREBRAS_MODELS_URL"
@@ -406,7 +390,7 @@ case "$PROVIDER" in
         CHAT_API_URL="${GEMINI_CHAT_URL_BASE}${MODEL_ID}:streamGenerateContent?key=${API_KEY}&alt=sse"
         IS_OPENAI_COMPATIBLE=false # Gemini uses "model" role, not "assistant"
         ;;
-    openrouter|groq|together|chutes|cerebras|novita)
+    openrouter|groq|together|cerebras|novita)
         CHAT_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
         IS_OPENAI_COMPATIBLE=true # These use "assistant" role
         case "$PROVIDER" in
@@ -417,7 +401,6 @@ case "$PROVIDER" in
                 ;;
             groq)       CHAT_API_URL="$GROQ_CHAT_URL" ;;
             together)   CHAT_API_URL="$TOGETHER_CHAT_URL" ;;
-            chutes)     CHAT_API_URL="$CHUTES_CHAT_URL" ;;
             cerebras)   CHAT_API_URL="$CEREBRAS_CHAT_URL" ;;
             novita)     CHAT_API_URL="$NOVITA_CHAT_URL" ;;
         esac
