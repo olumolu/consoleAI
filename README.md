@@ -12,7 +12,6 @@ Run this from any macos or linux even from android with turmux.
     *   OpenRouter (access to multi model providers)
     *   Groq
     *   Together AI
-    *   Chutes AI
     *   Cerebras AI
     *   Novita AI
 *   **Dynamic Model Selection:** Fetches and lists available models from the chosen provider, allowing you to select one interactively.
@@ -45,8 +44,6 @@ Run this from any macos or linux even from android with turmux.
     OPENROUTER_API_KEY=""
     GROQ_API_KEY=""
     TOGETHER_API_KEY=""
-    FIREWORKS_API_KEY=""
-    CHUTES_API_KEY=""
     CEREBRAS_API_KEY=""
     NOVITA_API_KEY=""
     ```
@@ -64,8 +61,6 @@ To start interacting with a specific AI provider, execute the script from your t
 
     ./ai.sh gemini
     ./ai.sh groq
-    ./ai.sh chutes
-    ./ai.sh fireworks
     ./ai.sh together
     ./ai.sh openrouter
     ./ai.sh cerebras
