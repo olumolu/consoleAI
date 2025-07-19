@@ -1,6 +1,6 @@
 #!/bin/bash
 # Universal Chat CLI (Bash/curl/jq) - With Model Selection, HISTORY, SYSTEM PROMPT, STREAMING
-# REQUIREMENTS: bash, curl, jq (must be pre-installed on the system)
+# REQUIREMENTS: bash, curl, jq, bc (must be pre-installed on the system)
 # Supports: Gemini, OpenRouter, Groq, Together AI, Cerebras AI, Novita AI
 # To Run This Tool First Make It executable with $ chmod +x ai.sh
 # Run This $ ./ai.sh provider
@@ -11,22 +11,38 @@
 
 set -e -E # Exit on error, inherit error traps
 
-# --- Cleanup Trap ---
-# Ensures temporary files are removed on script exit/interruption.
-CURL_STDERR_TEMP=""
-function cleanup() {
-    if [[ -n "$CURL_STDERR_TEMP" && -f "$CURL_STDERR_TEMP" ]]; then
-        rm -f "$CURL_STDERR_TEMP"
-    fi
-}
-trap cleanup EXIT
-
 # --- Configuration ---
 MAX_HISTORY_MESSAGES=20       # Keep the last N messages (user + ai). Adjust if needed.
+MAX_MESSAGE_LENGTH=50000      # Maximum length for a single message
 DEFAULT_OAI_TEMPERATURE=0.7   # t = randomness: Higher = more creative, Lower = more predictable | allowed value 0-2
 DEFAULT_OAI_MAX_TOKENS=8192   # Default max_tokens for OpenAI-compatible APIs
 DEFAULT_OAI_TOP_P=0.9         # p = diversity: Higher = wider vocabulary, Lower = safer word choices | allowed value 0-1
 SESSION_DIR="${HOME}/.chat_sessions"    # Directory for storing chat session history files.
+
+# --- Validate Configuration ---
+validate_numeric() {
+    local value="$1"
+    local min="$2"
+    local max="$3"
+    local name="$4"
+    
+    if ! [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "Error: $name must be a number, got: $value" >&2
+        return 1
+    fi
+    
+    # Use bc for comparison but convert result to integer for bash
+    if [ "$(echo "$value < $min" | bc)" = "1" ] || [ "$(echo "$value > $max" | bc)" = "1" ]; then
+        echo "Error: $name must be between $min and $max, got: $value" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Validate configuration values
+validate_numeric "$DEFAULT_OAI_TEMPERATURE" 0 2 "DEFAULT_OAI_TEMPERATURE" || exit 1
+validate_numeric "$DEFAULT_OAI_TOP_P" 0 1 "DEFAULT_OAI_TOP_P" || exit 1
+validate_numeric "$DEFAULT_OAI_MAX_TOKENS" 1 1000000 "DEFAULT_OAI_MAX_TOKENS" || exit 1
 
 # --- System Prompt Definition ---
 # Instruct the AI to use the conversation history to maintain the ongoing task context.
@@ -72,6 +88,7 @@ GEMINI_CHAT_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models/"
 OPENROUTER_CHAT_URL="https://openrouter.ai/api/v1/chat/completions"
 GROQ_CHAT_URL="https://api.groq.com/openai/v1/chat/completions"
 TOGETHER_CHAT_URL="https://api.together.ai/v1/chat/completions"
+
 CEREBRAS_CHAT_URL="https://api.cerebras.ai/v1/chat/completions"
 NOVITA_CHAT_URL="https://api.novita.ai/v3/openai/chat/completions"
 
@@ -82,6 +99,27 @@ GROQ_MODELS_URL="https://api.groq.com/openai/v1/models"
 TOGETHER_MODELS_URL="https://api.together.ai/v1/models"
 CEREBRAS_MODELS_URL="https://api.cerebras.ai/v1/models"
 NOVITA_MODELS_URL="https://api.novita.ai/v3/openai/models"
+
+# --- Cleanup Trap ---
+# Ensures temporary files are removed on script exit/interruption.
+CURL_STDERR_TEMP=""
+STREAM_FD=""
+
+function cleanup() {
+    # Close any open file descriptors
+    if [[ -n "$STREAM_FD" ]] && [[ -e /proc/$$/fd/$STREAM_FD ]]; then
+        exec {STREAM_FD}<&-
+    fi
+    
+    # Remove temporary files
+    if [[ -n "$CURL_STDERR_TEMP" && -f "$CURL_STDERR_TEMP" ]]; then
+        rm -f "$CURL_STDERR_TEMP"
+    fi
+}
+
+# Enhanced signal handling
+trap cleanup EXIT
+trap 'echo -e "\n${COLOR_WARN}Interrupted. Cleaning up...${COLOR_RESET}"; cleanup; exit 130' INT TERM
 
 # --- Helper Functions ---
 
@@ -115,6 +153,20 @@ function print_usage() {
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 cerebras${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 novita${COLOR_RESET}"
   echo -e "${COLOR_WARN}NOTE: Ensure API keys are set inside the script before running!${COLOR_RESET}"
+}
+
+# Validate session name - only allow alphanumeric, dash, underscore
+function validate_session_name() {
+    local name="$1"
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo -e "${COLOR_ERROR}Error: Session name can only contain letters, numbers, dash and underscore.${COLOR_RESET}" >&2
+        return 1
+    fi
+    if [[ ${#name} -gt 100 ]]; then
+        echo -e "${COLOR_ERROR}Error: Session name is too long (max 100 characters).${COLOR_RESET}" >&2
+        return 1
+    fi
+    return 0
 }
 
 # Checks if API key looks like a placeholder
@@ -170,6 +222,37 @@ function truncate() {
     fi
 }
 
+# Efficiently remove think tags from text
+function strip_think_tags() {
+    local text="$1"
+    local result=""
+    local remaining="$text"
+    
+    while [[ -n "$remaining" ]]; do
+        if [[ "$remaining" == *"<think>"* ]]; then
+            # Add everything before the <think> tag
+            result+="${remaining%%<think>*}"
+            # Get everything after <think>
+            remaining="${remaining#*<think>}"
+            
+            if [[ "$remaining" == *"</think>"* ]]; then
+                # Skip to after </think>
+                remaining="${remaining#*</think>}"
+            else
+                # Unclosed think tag - keep the rest as is (don't discard)
+                result+="<think>$remaining"
+                break
+            fi
+        else
+            # No more <think> tags
+            result+="$remaining"
+            break
+        fi
+    done
+    
+    echo "$result"
+}
+
 # --- Argument Parsing ---
 if [ "$#" -lt 1 ]; then
     echo -e "${COLOR_ERROR}Error: Invalid number of arguments.${COLOR_RESET}" >&2
@@ -182,6 +265,11 @@ filters=("${@:2}") # Capture all arguments from the second one onwards as filter
 # --- Dependency Check ---
 if ! command -v curl &> /dev/null || ! command -v jq &> /dev/null; then
     echo -e "${COLOR_ERROR}Error: 'curl' and 'jq' are required. Please install them.${COLOR_RESET}" >&2
+    exit 1
+fi
+
+if ! command -v bc &> /dev/null; then
+    echo -e "${COLOR_ERROR}Error: 'bc' is required for numeric validation. Please install it.${COLOR_RESET}" >&2
     exit 1
 fi
 
@@ -293,9 +381,10 @@ if [ $jq_exit_code -ne 0 ] || [ ${#available_models[@]} -eq 0 ]; then
     exit 1
 fi
 
-# --- Filter models based on additional arguments ---
+# --- Filter models based on additional arguments with improved matching ---
 if [ ${#filters[@]} -gt 0 ]; then
     echo -e "${COLOR_INFO}Filtering models with terms: ${filters[*]}${COLOR_RESET}"
+    echo -e "${COLOR_INFO}Using word boundary matching for better precision${COLOR_RESET}"
     declare -a filtered_models=()
     # Convert all filters to lowercase once for efficiency
     declare -a filters_lower=()
@@ -306,7 +395,9 @@ if [ ${#filters[@]} -gt 0 ]; then
         is_match=true
         model_lower=$(echo "$model" | tr '[:upper:]' '[:lower:]')
         for filter_lower in "${filters_lower[@]}"; do
-            if [[ ! "$model_lower" == *"$filter_lower"* ]]; then
+            # Use word boundary matching for better precision
+            # This will match "3" in "gpt-3" but not in "13b"
+            if ! echo "$model_lower" | grep -E "(^|[^[:alnum:]])${filter_lower}([^[:alnum:]]|$)" >/dev/null 2>&1; then
                 is_match=false
                 break
             fi
@@ -324,6 +415,7 @@ if [ ${#available_models[@]} -eq 0 ]; then
     echo -e "${COLOR_ERROR}No models available." >&2
     if [ ${#filters[@]} -gt 0 ]; then
         echo -e "${COLOR_WARN}Your filter criteria (${filters[*]}) did not match any models from provider '${PROVIDER^^}'.${COLOR_RESET}" >&2
+        echo -e "${COLOR_INFO}Filters use word boundary matching (e.g., '3' matches 'gpt-3' but not '13b')${COLOR_RESET}" >&2
     else
         echo -e "${COLOR_WARN}No models were returned by the API for provider '${PROVIDER^^}'.${COLOR_RESET}" >&2
     fi
@@ -427,12 +519,49 @@ function initialize_history() {
     fi
 }
 
+# Validate a loaded session file
+function validate_session() {
+    local session_file="$1"
+    
+    # Check if it's valid JSON array
+    if ! jq -e 'type == "array"' "$session_file" >/dev/null 2>&1; then
+        echo -e "${COLOR_ERROR}Error: Session file is not a valid JSON array.${COLOR_RESET}" >&2
+        return 1
+    fi
+    
+    # Check each message has required fields
+    local validation_result
+    validation_result=$(jq -r 'map(
+        if type != "object" then 
+            "Item is not an object"
+        elif .role == null then 
+            "Missing role field"
+        elif (.role == "user" or .role == "assistant" or .role == "system") and .content == null then 
+            "Missing content field for OpenAI format"
+        elif .role == "user" and .parts == null then 
+            "Missing parts field for Gemini user format"
+        elif .role == "model" and .parts == null then 
+            "Missing parts field for Gemini model format"
+        else 
+            null
+        end
+    ) | map(select(. != null)) | if length > 0 then .[0] else null end' "$session_file")
+    
+    if [[ -n "$validation_result" && "$validation_result" != "null" ]]; then
+        echo -e "${COLOR_ERROR}Error: Invalid session format - $validation_result${COLOR_RESET}" >&2
+        return 1
+    fi
+    
+    return 0
+}
+
 initialize_history # Set up the initial history (with system prompt if applicable)
 
 echo -e "--- ${COLOR_INFO}Starting Chat${COLOR_RESET} ---"
 echo -e "${COLOR_INFO}Provider:${COLOR_RESET}      ${PROVIDER^^}"
 echo -e "${COLOR_INFO}Model:${COLOR_RESET}         ${MODEL_ID}"
 echo -e "${COLOR_INFO}History Limit:${COLOR_RESET} Last $MAX_HISTORY_MESSAGES messages (user+AI)"
+echo -e "${COLOR_INFO}Message Limit:${COLOR_RESET} $MAX_MESSAGE_LENGTH characters per message"
 echo -e "${COLOR_INFO}Temp/Tokens/TopP (Defaults):${COLOR_RESET} $DEFAULT_OAI_TEMPERATURE / $DEFAULT_OAI_MAX_TOKENS / $DEFAULT_OAI_TOP_P"
 
 if [[ -n "$SYSTEM_PROMPT" ]]; then
@@ -490,11 +619,11 @@ while true; do
                         content=$(echo "$msg" | jq -r '.content // .parts[0].text')
                         
                         if [[ "$role" == "user" ]]; then
-                            echo -e "${COLOR_USER}[$role]${COLOR_RESET} $content"
+                            echo -e "${COLOR_USER}[$role]${COLOR_RESET} $(truncate "$content" 500)"
                         elif [[ "$role" == "assistant" || "$role" == "model" ]]; then
-                            echo -e "${COLOR_AI}[$role]${COLOR_RESET} $content"
+                            echo -e "${COLOR_AI}[$role]${COLOR_RESET} $(truncate "$content" 500)"
                         else # system
-                            echo -e "${COLOR_WARN}[$role]${COLOR_RESET} $content"
+                            echo -e "${COLOR_WARN}[$role]${COLOR_RESET} $(truncate "$content" 500)"
                         fi
                     done >&2
                 fi
@@ -504,6 +633,9 @@ while true; do
             "/save")
                 if [[ -z "$args" ]]; then
                     echo -e "${COLOR_WARN}Usage: /save <session_name>${COLOR_RESET}" >&2
+                    continue
+                fi
+                if ! validate_session_name "$args"; then
                     continue
                 fi
                 mkdir -p "$SESSION_DIR"
@@ -518,16 +650,35 @@ while true; do
                     echo -e "${COLOR_WARN}Usage: /load <session_name>${COLOR_RESET}" >&2
                     continue
                 fi
+                if ! validate_session_name "$args"; then
+                    continue
+                fi
+                
+                # Create session directory if it doesn't exist
+                mkdir -p "$SESSION_DIR"
+                
                 session_file="${SESSION_DIR}/${args}.json"
                 if [[ ! -f "$session_file" ]]; then
                     echo -e "${COLOR_ERROR}Error: Session file not found: $session_file${COLOR_RESET}" >&2
+                    # List available sessions if any exist
+                    if compgen -G "${SESSION_DIR}/*.json" > /dev/null; then
+                        echo -e "${COLOR_INFO}Available sessions:${COLOR_RESET}" >&2
+                        ls -1 "${SESSION_DIR}"/*.json 2>/dev/null | xargs -n1 basename | sed 's/.json$//' >&2
+                    fi
                     continue
                 fi
+                
+                # Validate session file before loading
+                if ! validate_session "$session_file"; then
+                    echo -e "${COLOR_ERROR}Session file is corrupted or invalid. Cannot load.${COLOR_RESET}" >&2
+                    continue
+                fi
+                
                 # Load JSON array from file into the chat_history bash array
                 mapfile -t chat_history < <(jq -c '.[]' "$session_file")
                 first_user_message=false # A loaded session is not a "first message"
                 echo -e "${COLOR_INFO}Session loaded from: $session_file${COLOR_RESET}"
-                echo -e "${COLOR_INFO}Use /history to see the loaded conversation.${COLOR_RESET}"
+                echo -e "${COLOR_INFO}Loaded ${#chat_history[@]} messages. Use /history to see the conversation.${COLOR_RESET}"
                 continue
                 ;;
             "/clear")
@@ -537,7 +688,7 @@ while true; do
                 fi
                 echo -e "${COLOR_WARN}This will permanently delete all saved chat sessions in ${SESSION_DIR}:${COLOR_RESET}" >&2
                 # List files to be deleted
-                ls -1 "${SESSION_DIR}"/*.json >&2
+                ls -1 "${SESSION_DIR}"/*.json 2>/dev/null | xargs -n1 basename | sed 's/.json$//' >&2
                 read -r -p "$(echo -e "${COLOR_WARN}Are you sure you want to proceed? (y/N): ${COLOR_RESET}")" confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then
                     # Using find to be safer with filenames with special characters
@@ -552,6 +703,13 @@ while true; do
     fi
 
     if [[ -z "$user_input" ]]; then
+        continue
+    fi
+    
+    # Check message length limit
+    if [[ ${#user_input} -gt $MAX_MESSAGE_LENGTH ]]; then
+        echo -e "${COLOR_ERROR}Error: Message too long (${#user_input} chars). Maximum is $MAX_MESSAGE_LENGTH characters.${COLOR_RESET}" >&2
+        echo -e "${COLOR_INFO}Please shorten your message and try again.${COLOR_RESET}" >&2
         continue
     fi
 
@@ -649,6 +807,7 @@ while true; do
                 }'
             )
          else
+            # For Together, we'll try with just the base payload first
             json_payload="$base_payload"
          fi
     fi
@@ -686,10 +845,10 @@ while true; do
     
     CURL_STDERR_TEMP=$(mktemp)
 
-    # Process substitution to read from curl's stdout line by line
-    exec 3< <(curl "${base_chat_curl_args[@]}" 2>"$CURL_STDERR_TEMP")
+    # Process substitution with proper file descriptor management
+    exec {STREAM_FD}< <(curl "${base_chat_curl_args[@]}" 2>"$CURL_STDERR_TEMP")
 
-    while IFS= read -r line <&3; do
+    while IFS= read -r line <&${STREAM_FD}; do
         # OpenAI specific stream end marker (often followed by a final data packet with finish_reason)
         # Check if this is the OpenAI stream end marker for graceful exit from loop
         if [[ "$line" == "data: [DONE]" && "$IS_OPENAI_COMPATIBLE" == true ]]; then
@@ -835,11 +994,13 @@ while true; do
             fi
         fi
     done
-    exec 3<&- 
+    exec {STREAM_FD}<&- # Close the file descriptor
+    STREAM_FD="" # Clear the variable
 
     curl_stderr_content=$(cat "$CURL_STDERR_TEMP" 2>/dev/null)
     # Explicitly remove the stderr temp file now that we've read it.
     rm -f "$CURL_STDERR_TEMP"
+    CURL_STDERR_TEMP="" # Clear the variable
 
     # --- Post-stream processing and UI update ---
     if [[ "$first_chunk_received" == false && -z "$stream_error_message" ]]; then # No data chunks ever received AND no stream error already flagged
@@ -871,28 +1032,14 @@ while true; do
         echo -e "${COLOR_AI}AI:${COLOR_RESET} ${COLOR_ERROR}$stream_error_message${COLOR_RESET}"
     fi
     
+    # Check response length limit
+    if [[ ${#full_ai_response_text} -gt $MAX_MESSAGE_LENGTH ]]; then
+        echo -e "${COLOR_WARN}Warning: AI response was truncated (exceeded $MAX_MESSAGE_LENGTH characters)${COLOR_RESET}" >&2
+        full_ai_response_text="${full_ai_response_text:0:$MAX_MESSAGE_LENGTH}"
+    fi
+    
     # Strip <think>...</think> blocks from the full response before saving to history.
-    text_to_clean="$full_ai_response_text"
-    cleaned_text=""
-    while [[ "$text_to_clean" == *"<think>"* ]]; do
-        # Add the part before the first <think> tag
-        cleaned_text+="${text_to_clean%%<think>*}"
-        # Isolate the part after the first <think> tag
-        after_think_tag="${text_to_clean#*<think>}"
-        # Check if a corresponding </think> tag exists
-        if [[ "$after_think_tag" == *"</think>"* ]]; then
-            # If so, continue processing from after the </think> tag
-            text_to_clean="${after_think_tag#*</think>}"
-        else
-            # Unclosed <think> tag, discard the rest of the string
-            text_to_clean=""
-            break
-        fi
-    done
-    # Add any remaining text after the last </think> tag
-    cleaned_text+="$text_to_clean"
-    # This is the final, clean text to be saved in history
-    ai_text="$cleaned_text"
+    ai_text=$(strip_think_tags "$full_ai_response_text")
 
     # Create AI message JSON for history using the *cleaned* text
     if [[ "$api_error_occurred" == false && -n "$ai_text" ]]; then 

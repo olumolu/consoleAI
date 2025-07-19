@@ -19,7 +19,7 @@ Run this from any macos or linux even from android with turmux.
 *   **System Prompt:** Define a system-level instruction for the AI (configurable).
 *   **Streaming Responses:** AI responses are streamed token by token for a real-time feel.
 *   **Color-Coded Output:** Differentiates between user input, AI responses, errors, and info messages. <think>...</think> in different colour.
-*   **Minimal Dependencies:** Requires only `bash`, `curl`, and `jq`.
+*   **Minimal Dependencies:** Requires only `bash`, `curl`, `bc`, and `jq`.
 *   **Easy Configuration:** API keys and core settings are managed directly within the script.
 *   **Tool Calling:** Tool Calling added into gemini with prompt to enable.
 *   **search filter:** Filter support added [filter] ... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
