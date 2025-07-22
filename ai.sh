@@ -15,7 +15,7 @@ set -e -E # Exit on error, inherit error traps
 MAX_HISTORY_MESSAGES=20       # Keep the last N messages (user + ai). Adjust if needed.
 MAX_MESSAGE_LENGTH=50000      # Maximum length for a single message
 DEFAULT_OAI_TEMPERATURE=0.7   # t = randomness: Higher = more creative, Lower = more predictable | allowed value 0-2
-DEFAULT_OAI_MAX_TOKENS=8192   # Default max_tokens for OpenAI-compatible APIs
+DEFAULT_OAI_MAX_TOKENS=8000   # Default max_tokens for OpenAI-compatible APIs
 DEFAULT_OAI_TOP_P=0.9         # p = diversity: Higher = wider vocabulary, Lower = safer word choices | allowed value 0-1
 SESSION_DIR="${HOME}/.chat_sessions"    # Directory for storing chat session history files.
 
