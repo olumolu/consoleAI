@@ -8,6 +8,7 @@
 # History, system prompt, and streaming are supported.
 # /history for show conversation log and <think>...</think> in a different colour for better visual experience.
 # Session management commands: /save <name>, /load <name>, /clear
+
 set -e -E # Exit on error, inherit error traps
 # --- Configuration ---
 MAX_HISTORY_MESSAGES=20       # Keep the last N messages (user + ai). Adjust if needed.
@@ -42,25 +43,23 @@ validate_numeric() {
         return 1
     fi
     # Use bc for comparison but convert result to integer for bash
-    # Check if bc is available before using it
-    if ! command -v bc &> /dev/null; then
-        echo "Error: 'bc' is required for numeric validation but not found." >&2
-        return 1
-    fi
     if [ "$(echo "$value < $min" | bc)" = "1" ] || [ "$(echo "$value > $max" | bc)" = "1" ]; then
         echo "Error: $name must be between $min and $max, got: $value" >&2
         return 1
     fi
     return 0
 }
+
 # Validate configuration values
 validate_numeric "$DEFAULT_OAI_TEMPERATURE" 0 2 "DEFAULT_OAI_TEMPERATURE" || exit 1
 validate_numeric "$DEFAULT_OAI_TOP_P" 0 1 "DEFAULT_OAI_TOP_P" || exit 1
 validate_numeric "$DEFAULT_OAI_MAX_TOKENS" 1 1000000 "DEFAULT_OAI_MAX_TOKENS" || exit 1
+
 # --- System Prompt Definition ---
 # Instruct the AI to use the conversation history to maintain the ongoing task context.
 SYSTEM_PROMPT="You are a helpful assistant running in a a command-line interface."
 # SYSTEM_PROMPT="" # Example: Disable system prompt
+
 # --- Color Definitions --- Use 256-color
 COLOR_RESET='\033[0m'
 COLOR_USER='\033[38;5;199m'     # Bright Magenta
@@ -87,6 +86,7 @@ TOGETHER_API_KEY=""
 CEREBRAS_API_KEY=""
 # Novita: https://novita.ai/
 NOVITA_API_KEY=""
+
 # --- API Endpoints ---
 # Chat Endpoints
 GEMINI_CHAT_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models/"
@@ -95,6 +95,7 @@ GROQ_CHAT_URL="https://api.groq.com/openai/v1/chat/completions"
 TOGETHER_CHAT_URL="https://api.together.ai/v1/chat/completions"
 CEREBRAS_CHAT_URL="https://api.cerebras.ai/v1/chat/completions"
 NOVITA_CHAT_URL="https://api.novita.ai/v3/openai/chat/completions"
+
 # Model Listing Endpoints
 GEMINI_MODELS_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
@@ -102,6 +103,7 @@ GROQ_MODELS_URL="https://api.groq.com/openai/v1/models"
 TOGETHER_MODELS_URL="https://api.together.ai/v1/models"
 CEREBRAS_MODELS_URL="https://api.cerebras.ai/v1/models"
 NOVITA_MODELS_URL="https://api.novita.ai/v3/openai/models"
+
 # --- Cleanup Trap ---
 # Ensures temporary files are removed on script exit/interruption.
 CURL_STDERR_TEMP=""
@@ -116,10 +118,12 @@ function cleanup() {
         rm -f "$CURL_STDERR_TEMP"
     fi
 }
+
 # Enhanced signal handling
 trap cleanup EXIT
 trap 'echo -e "
 ${COLOR_WARN}Interrupted. Cleaning up...${COLOR_RESET}"; cleanup; exit 130' INT TERM
+
 # --- Helper Functions ---
 function print_usage() {
   echo -e ""
@@ -152,6 +156,7 @@ function print_usage() {
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 novita${COLOR_RESET}"
   echo -e "${COLOR_WARN}NOTE: Ensure API keys are set inside the script before running!${COLOR_RESET}"
 }
+
 # Validate session name - only allow alphanumeric, dash, underscore
 function validate_session_name() {
     local name="$1"
@@ -165,6 +170,7 @@ function validate_session_name() {
     fi
     return 0
 }
+
 # Checks if API key looks like a placeholder
 function check_placeholder_key() {
     local key_value="$1"
@@ -204,6 +210,7 @@ function check_placeholder_key() {
     fi
     return 0
 }
+
 # Truncates a string to a max length, adding ellipsis
 function truncate() {
     local s="$1"
@@ -214,6 +221,7 @@ function truncate() {
         echo "$s";
     fi
 }
+
 # Efficiently remove think tags from text
 function strip_think_tags() {
     local text="$1"
@@ -241,6 +249,7 @@ function strip_think_tags() {
     done
     echo "$result"
 }
+
 # --- Argument Parsing ---
 if [ "$#" -lt 1 ]; then
     echo -e "${COLOR_ERROR}Error: Invalid number of arguments.${COLOR_RESET}" >&2
@@ -249,6 +258,7 @@ if [ "$#" -lt 1 ]; then
 fi
 PROVIDER=$(echo "$1" | tr '[:upper:]' '[:lower:]')
 filters=("${@:2}") # Capture all arguments from the second one onwards as filters
+
 # --- Get API Key and Check Placeholders ---
 API_KEY=""
 case "$PROVIDER" in
@@ -269,6 +279,7 @@ if [[ "$key_check_status" -ne 0 ]]; then
     echo -e "${COLOR_INFO}Exiting due to placeholder API key. Please edit the script ($0) and add your actual key for '$PROVIDER'.${COLOR_RESET}" >&2
     exit 1
 fi
+
 # --- Fetch and Select Model ---
 echo -e "${COLOR_INFO}Fetching available models for ${PROVIDER^^}...${COLOR_RESET}"
 MODELS_URL=""
@@ -348,6 +359,7 @@ $jq_stderr_output" >&2
     echo "${model_list_json:0:500}" >&2
     exit 1
 fi
+
 # --- Filter models based on additional arguments with improved matching ---
 if [ ${#filters[@]} -gt 0 ]; then
     echo -e "${COLOR_INFO}Filtering models with terms: ${filters[*]}${COLOR_RESET}"
@@ -387,6 +399,7 @@ if [ ${#available_models[@]} -eq 0 ]; then
     exit 1
 fi
 MODEL_ID=""
+
 # --- Auto-select if only one model, otherwise prompt user ---
 if [ ${#available_models[@]} -eq 1 ]; then
     MODEL_ID="${available_models[0]}"
@@ -415,6 +428,7 @@ CHAT_AUTH_HEADER=""
 CHAT_EXTRA_HEADERS=()
 IS_OPENAI_COMPATIBLE=false # Determines payload structure and history role names
 ENABLE_TOOL_CALLING=false
+
 # --- Interactive prompt for tool calling for Gemini ---
 if [[ "$PROVIDER" == "gemini" ]]; then
     echo ""
@@ -551,7 +565,8 @@ while true; do
         echo "Exiting chat."
         break
     fi
-    ### --- Session Management Logic --- ###
+
+### --- Session Management Logic --- ###
     if [[ "$user_input" == /* ]]; then
         read -r cmd args <<< "$user_input"
         case "$cmd" in
@@ -715,7 +730,8 @@ User: ${user_input}"
             json_payload=$(echo "$json_payload" | jq '. + {tools: [{"urlContext": {}}, {"googleSearch": {}}]}')
         fi
     else # OpenAI-Compatible payload
-         ### --- Dynamic Payload Construction --- ###
+    
+    ### --- Dynamic Payload Construction --- ###
          # Start with a base payload common to all OpenAI-compatible providers
          base_payload=$(jq -n \
             --arg model "$MODEL_ID" \
