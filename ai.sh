@@ -262,13 +262,17 @@ PROVIDER=$(echo "$1" | tr '[:upper:]' '[:lower:]')
 filters=("${@:2}") # Capture all arguments from the second one onwards as filters
 
 # --- Dependency Check ---
-if ! command -v curl &> /dev/null || ! command -v jq &> /dev/null; then
-    echo -e "${COLOR_ERROR}Error: 'curl' and 'jq' are required. Please install them.${COLOR_RESET}" >&2
-    exit 1
-fi
+required_commands=("curl" "jq" "bc")
+missing_commands=()
 
-if ! command -v bc &> /dev/null; then
-    echo -e "${COLOR_ERROR}Error: 'bc' is required for numeric validation. Please install it.${COLOR_RESET}" >&2
+for cmd in "${required_commands[@]}"; do
+    if ! command -v "$cmd" &> /dev/null; then
+        missing_commands+=("$cmd")
+    fi
+done
+
+if [ ${#missing_commands[@]} -ne 0 ]; then
+    echo -e "${COLOR_ERROR}Error: Required command(s) not found: ${missing_commands[*]}. Please install them.${COLOR_RESET}" >&2
     exit 1
 fi
 
