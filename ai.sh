@@ -121,14 +121,13 @@ trap cleanup EXIT
 trap 'echo -e "\n${COLOR_WARN}Interrupted. Cleaning up...${COLOR_RESET}"; cleanup; exit 130' INT TERM
 
 # --- Helper Functions ---
-
 function print_usage() {
   echo -e ""
   echo -e "${COLOR_INFO}Usage: $0 <provider>${COLOR_RESET}"
   echo -e "${COLOR_INFO}Usage: $0 <provider> [filter]...${COLOR_RESET}"
   echo -e ""
   echo -e "${COLOR_INFO}Description:${COLOR_RESET}"
-  echo -e "  Starts an interactive chat session with the specified AI provider,"
+  echo -e "  🤖 Starts an interactive chat session with the specified AI provider,"
   echo -e "  maintaining conversation history, using a system prompt (if applicable),"
   echo -e "  and streaming responses token by token."
   echo -e "  It will fetch available models and let you choose one by number."
@@ -248,13 +247,12 @@ function strip_think_tags() {
             break
         fi
     done
-    
     echo "$result"
 }
 
 # --- Argument Parsing ---
 if [ "$#" -lt 1 ]; then
-    echo -e "${COLOR_ERROR}Error: Invalid number of arguments.${COLOR_RESET}" >&2
+    echo -e "${COLOR_ERROR}Error: Invalid number of arguments 🙁.${COLOR_RESET}" >&2
     print_usage
     exit 1
 fi
@@ -828,7 +826,7 @@ while true; do
         continue
     fi
 
-    echo -n -e "\r${COLOR_AI}AI:${COLOR_RESET} ${COLOR_INFO}(Waiting for stream...)${COLOR_RESET}"
+    echo -n -e "\r${COLOR_AI}AI:${COLOR_RESET} ${COLOR_INFO}(💬 Waiting for stream...)${COLOR_RESET}"
     
     # Base curl arguments for chat
     base_chat_curl_args=(-sS -L -N -X POST "$CHAT_API_URL" -H "Content-Type: application/json" -H "Accept: application/json")
@@ -920,7 +918,7 @@ while true; do
                             echo -ne "\r\033[K"; echo -n -e "${COLOR_AI}AI:${COLOR_RESET}  ${COLOR_AI}"
                             first_chunk_received=true
                         fi
-                        echo -e "\n${COLOR_WARN}AI requested tool call:${COLOR_RESET}" >&2
+                        echo -e "\n${COLOR_WARN}AI requested tool call 🌐:${COLOR_RESET}" >&2
                         echo "$tool_call_parts" | jq . >&2 
                         echo -e "${COLOR_WARN}(This script does not automatically execute tool calls or return tool output to the model.)\n${COLOR_RESET}" >&2
                         # Do not append tool call JSON to full_ai_response_text, as it's not "text"
@@ -1079,5 +1077,5 @@ while true; do
     echo "" # Ensure a blank line before next user prompt input
 done
 
-echo "Chat session ended."
+echo "👋 Chat session ended."
 exit 0
