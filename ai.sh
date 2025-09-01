@@ -246,7 +246,7 @@ function strip_think_tags() {
             result+="$remaining"
             break
         fi
-    done
+    done    
     echo "$result"
 }
 
