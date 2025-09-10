@@ -220,7 +220,7 @@ function truncate() {
     fi
 }
 
-# Efficiently remove think tags from text
+# Remove think tags from text
 function strip_think_tags() {
     local text="$1"
     local result=""
