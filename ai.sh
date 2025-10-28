@@ -158,7 +158,6 @@ function print_usage() {
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 cerebras${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 novita${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 ollama${COLOR_RESET}"
-  echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 ollama llama3${COLOR_RESET}  # Filter for llama3 models"
   echo -e "${COLOR_WARN}NOTE: Ensure API keys are set inside the script before running!${COLOR_RESET}"
 }
 
