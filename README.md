@@ -14,6 +14,7 @@ Run this from any macos or linux even from android with turmux.
     *   Together AI
     *   Cerebras AI
     *   Novita AI
+    *   ollama cloud
 *   **Dynamic Model Selection:** Fetches and lists available models from the chosen provider, allowing you to select one interactively.
 *   **Conversation History:** Remembers the last `N` messages (configurable) to maintain context. `/history` to recall conversation logs.
 *   **System Prompt:** Define a system-level instruction for the AI (configurable).
@@ -46,6 +47,7 @@ Run this from any macos or linux even from android with turmux.
     TOGETHER_API_KEY=""
     CEREBRAS_API_KEY=""
     NOVITA_API_KEY=""
+    OLLAMA_API_KEY=""
     ```
     
     
@@ -65,6 +67,7 @@ To start interacting with a specific AI provider, execute the script from your t
     ./ai.sh openrouter
     ./ai.sh cerebras
     ./ai.sh novita
+    ./ai.sh ollama
 
 Choose any model from any provider just by selecting the Number mentioned before the model name from the list of available models.
 
