@@ -5,6 +5,11 @@ It supports model selection, conversation history, system prompts, and
 real-time streaming of responses, filter from the models and off|on tool calling.
 Run this from any macos or linux even from android with turmux.
 
+## Demo
+[Screencast From 2025-10-28 19-49-35.webm](https://github.com/user-attachments/assets/1584ab69-ed1b-45d3-988e-3d907b457ad8)
+
+
+
 ## Features
 
 *   **Multi-Provider Support:** Chat with models from:
