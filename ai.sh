@@ -1,6 +1,6 @@
 #!/bin/bash
 # Universal Chat CLI (Bash/curl/jq/bc) - With Model Selection, HISTORY, SYSTEM PROMPT, STREAMING
-# REQUIREMENTS: bash, curl, jq, bc (must be pre-installed on the system)
+# REQUIREMENTS: bash, curl, jq, bc, grep, sed (must be pre-installed on the system)
 # Supports: Gemini, OpenRouter, Groq, Together AI, Cerebras AI, Novita AI, Ollama Cloud
 # To Run This Tool First Make It executable with $ chmod +x ai.sh
 # Run This $ ./ai.sh provider
@@ -332,8 +332,8 @@ case "$PROVIDER" in
     together)
         MODELS_URL="$TOGETHER_MODELS_URL"
         MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
-        # FIX: Together returns { data: [...] }
-        JQ_QUERY='.data | sort_by(.id) | .[].id'
+        # FIX: Reverted to raw array handling for Together AI
+        JQ_QUERY='. | sort_by(.id) | .[].id'
         ;;
     cerebras)
         MODELS_URL="$CEREBRAS_MODELS_URL"
