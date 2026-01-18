@@ -332,7 +332,6 @@ case "$PROVIDER" in
     together)
         MODELS_URL="$TOGETHER_MODELS_URL"
         MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
-        # FIX: Reverted to raw array handling for Together AI
         JQ_QUERY='. | sort_by(.id) | .[].id'
         ;;
     cerebras)
