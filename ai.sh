@@ -1,6 +1,6 @@
 #!/bin/bash
 # Universal Chat CLI (Bash/curl/jq/bc) - With Model Selection, HISTORY, SYSTEM PROMPT, STREAMING
-# REQUIREMENTS: bash, curl, jq, bc (must be pre-installed on the system)
+# REQUIREMENTS: bash, curl, jq, bc, grep, sed (must be pre-installed on the system)
 # Supports: Gemini, OpenRouter, Groq, Together AI, Cerebras AI, Novita AI, Ollama Cloud
 # To Run This Tool First Make It executable with $ chmod +x ai.sh
 # Run This $ ./ai.sh provider
@@ -9,7 +9,10 @@
 # /history for show conversation log and <think>...</think> in a different colour for better visual experience.
 # Session management commands: /save <name>, /load <name>, /clear
 
-set -e -E # Exit on error, inherit error traps
+# Error handling:
+# -E: inherit ERR traps in functions/subshells (where applicable)
+# -o pipefail: fail a pipeline if any command fails (not just the last)
+set -E -o pipefail
 
 # --- Configuration ---
 MAX_HISTORY_MESSAGES=20       # Keep the last N messages (user + ai). Adjust if needed.
@@ -25,12 +28,12 @@ validate_numeric() {
     local min="$2"
     local max="$3"
     local name="$4"
-    
+
     if ! [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
         echo "Error: $name must be a number, got: $value" >&2
         return 1
     fi
-    
+
     # Use bc for comparison but convert result to integer for bash
     if [ "$(echo "$value < $min" | bc)" = "1" ] || [ "$(echo "$value > $max" | bc)" = "1" ]; then
         echo "Error: $name must be between $min and $max, got: $value" >&2
@@ -83,7 +86,6 @@ CEREBRAS_API_KEY=""
 NOVITA_API_KEY=""
 
 # Ollama Cloud: https://ollama.com/
-# Get your API key from Ollama Cloud dashboard
 OLLAMA_API_KEY=""
 
 # --- API Endpoints ---
@@ -110,14 +112,13 @@ OLLAMA_MODELS_URL="https://ollama.com/api/tags"
 CURL_STDERR_TEMP=""
 STREAM_FD=""
 
-function cleanup() {
+cleanup() {
     # Close any open file descriptors
-    if [[ -n "$STREAM_FD" ]] && [[ -e /proc/$$/fd/$STREAM_FD ]]; then
+    if [[ -n "${STREAM_FD:-}" ]] && [[ -e /proc/$$/fd/$STREAM_FD ]]; then
         exec {STREAM_FD}<&-
     fi
-    
     # Remove temporary files
-    if [[ -n "$CURL_STDERR_TEMP" && -f "$CURL_STDERR_TEMP" ]]; then
+    if [[ -n "${CURL_STDERR_TEMP:-}" && -f "$CURL_STDERR_TEMP" ]]; then
         rm -f "$CURL_STDERR_TEMP"
     fi
 }
@@ -162,7 +163,7 @@ function print_usage() {
 }
 
 # Validate session name - only allow alphanumeric, dash, underscore
-function validate_session_name() {
+validate_session_name() {
     local name="$1"
     if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
         echo -e "${COLOR_ERROR}Error: Session name can only contain letters, numbers, dash and underscore.${COLOR_RESET}" >&2
@@ -176,7 +177,7 @@ function validate_session_name() {
 }
 
 # Checks if API key looks like a placeholder
-function check_placeholder_key() {
+check_placeholder_key() {
     local key_value="$1"
     local provider_name="$2"
     local placeholder_found=false
@@ -185,9 +186,7 @@ function check_placeholder_key() {
     if [[ -z "$key_value" ]]; then
         placeholder_found=true
         message="is empty"
-    elif [[ "$key_value" == "YOUR_"* ]] || \
-         [[ "$key_value" == *"-HERE" ]] || \
-         [[ "$key_value" == *"..." ]]; then
+    elif [[ "$key_value" == "YOUR_"* ]] || [[ "$key_value" == *"-HERE" ]] || [[ "$key_value" == *"..." ]]; then
         placeholder_found=true
         message="appears to be a generic placeholder"
     elif [[ "$provider_name" == "gemini" && "$key_value" == "-" ]]; then
@@ -221,65 +220,64 @@ function check_placeholder_key() {
 }
 
 # Truncates a string to a max length, adding ellipsis
-function truncate() {
+truncate() {
     local s="$1"
     local max_chars="$2"
     if [[ ${#s} -gt $max_chars ]]; then
-        echo "${s:0:$((max_chars-3))}...";
+        echo "${s:0:$((max_chars-3))}..."
     else
-        echo "$s";
+        echo "$s"
     fi
 }
 
 # Remove think tags from text
-function strip_think_tags() {
+strip_think_tags() {
     local text="$1"
     local result=""
     local remaining="$text"
-    
+
     while [[ -n "$remaining" ]]; do
         if [[ "$remaining" == *"<think>"* ]]; then
-            # Add everything before the <think> tag
             result+="${remaining%%<think>*}"
-            # Get everything after <think>
             remaining="${remaining#*<think>}"
-            
             if [[ "$remaining" == *"</think>"* ]]; then
-                # Skip to after </think>
                 remaining="${remaining#*</think>}"
             else
-                # Unclosed think tag - keep the rest as is (don't discard)
                 result+="<think>$remaining"
                 break
             fi
         else
-            # No more <think> tags
             result+="$remaining"
             break
         fi
-    done    
+    done
     echo "$result"
+}
+
+# Escape ERE (grep -E) metacharacters in user-provided filters
+regex_escape_ere() {
+    # Escapes: \ . ^ $ * + ? ( ) [ ] { } |
+    printf '%s' "$1" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g'
 }
 
 # --- Argument Parsing ---
 if [ "$#" -lt 1 ]; then
-    echo -e "${COLOR_ERROR}Error: Invalid number of arguments 🙁.${COLOR_RESET}" >&2
+    echo -e "${COLOR_ERROR}Error: Invalid number of arguments.${COLOR_RESET}" >&2
     print_usage
     exit 1
 fi
+
 PROVIDER=$(echo "$1" | tr '[:upper:]' '[:lower:]')
 filters=("${@:2}") # Capture all arguments from the second one onwards as filters
 
 # --- Dependency Check ---
-required_commands=("curl" "jq" "bc")
+required_commands=("curl" "jq" "bc" "grep" "sed")
 missing_commands=()
-
 for cmd in "${required_commands[@]}"; do
     if ! command -v "$cmd" &> /dev/null; then
         missing_commands+=("$cmd")
     fi
 done
-
 if [ ${#missing_commands[@]} -ne 0 ]; then
     echo -e "${COLOR_ERROR}Error: Required command(s) not found: ${missing_commands[*]}. Please install them.${COLOR_RESET}" >&2
     exit 1
@@ -287,21 +285,21 @@ fi
 
 # --- Get API Key and Check Placeholders ---
 API_KEY=""
+key_check_status=0
 case "$PROVIDER" in
-    gemini)     API_KEY="$GEMINI_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
-    openrouter) API_KEY="$OPENROUTER_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
-    groq)       API_KEY="$GROQ_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
-    together)   API_KEY="$TOGETHER_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
-    cerebras)   API_KEY="$CEREBRAS_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
-    novita)     API_KEY="$NOVITA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
-    ollama)     API_KEY="$OLLAMA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER" ;;
+    gemini)     API_KEY="$GEMINI_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
+    openrouter) API_KEY="$OPENROUTER_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
+    groq)       API_KEY="$GROQ_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
+    together)   API_KEY="$TOGETHER_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
+    cerebras)   API_KEY="$CEREBRAS_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
+    novita)     API_KEY="$NOVITA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
+    ollama)     API_KEY="$OLLAMA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
     *)
         echo -e "${COLOR_ERROR}Error: Unknown provider '$PROVIDER'. Choose from: gemini, openrouter, groq, together, cerebras, novita, ollama${COLOR_RESET}" >&2
         print_usage
         exit 1
         ;;
 esac
-key_check_status=$?
 
 if [[ "$key_check_status" -ne 0 ]]; then
     echo -e "${COLOR_INFO}Exiting due to placeholder API key. Please edit the script ($0) and add your actual key for '$PROVIDER'.${COLOR_RESET}" >&2
@@ -357,15 +355,14 @@ model_curl_args=(-sS -L -X GET "$MODELS_URL") # Added -S to show curl errors
 [ -n "$MODELS_AUTH_HEADER" ] && model_curl_args+=(-H "$MODELS_AUTH_HEADER")
 [ ${#MODELS_EXTRA_HEADERS[@]} -gt 0 ] && model_curl_args+=("${MODELS_EXTRA_HEADERS[@]}")
 
-model_list_json=$(curl "${model_curl_args[@]}")
-model_list_exit_code=$?
-
-if [ $model_list_exit_code -ne 0 ]; then
+model_list_json=""
+if ! model_list_json=$(curl "${model_curl_args[@]}"); then
+    model_list_exit_code=$?
     echo -e "${COLOR_ERROR}Error fetching models: curl command failed (Exit code: $model_list_exit_code).${COLOR_RESET}" >&2
     echo -e "${COLOR_INFO}Check network connection, API key validity/permissions, and endpoint ($MODELS_URL).${COLOR_RESET}" >&2
-    echo -e "${COLOR_INFO}Raw response/error (if any from curl): $(truncate "$model_list_json" 200)${COLOR_RESET}" >&2
     exit 1
 fi
+
 if ! echo "$model_list_json" | jq empty 2>/dev/null; then
     echo -e "${COLOR_ERROR}Error: API response for model list was not valid JSON.${COLOR_RESET}" >&2
     echo -e "${COLOR_INFO}Raw response (first 200 chars): $(truncate "$model_list_json" 200)${COLOR_RESET}" >&2
@@ -381,9 +378,13 @@ if [[ -n "$api_fetch_error" && "$api_fetch_error" != "null" ]]; then
      exit 1
 fi
 
+# FIX: properly capture jq stderr
 jq_stderr_output=""
-mapfile -t available_models < <(jq -r "$JQ_QUERY" <<< "$model_list_json" 2> >(jq_stderr_output=$(cat); cat >&2))
+jq_err_file=$(mktemp)
+mapfile -t available_models < <(jq -r "$JQ_QUERY" <<< "$model_list_json" 2>"$jq_err_file")
 jq_exit_code=$?
+jq_stderr_output=$(cat "$jq_err_file" 2>/dev/null || true)
+rm -f "$jq_err_file"
 
 if [ $jq_exit_code -ne 0 ] || [ ${#available_models[@]} -eq 0 ]; then
     echo -e "${COLOR_ERROR}Error: No models found or failed to parse successful API response for provider '$PROVIDER'.${COLOR_RESET}" >&2
@@ -409,18 +410,22 @@ if [ ${#filters[@]} -gt 0 ]; then
     for filter in "${filters[@]}"; do
         filters_lower+=("$(echo "$filter" | tr '[:upper:]' '[:lower:]')")
     done
+
     for model in "${available_models[@]}"; do
         is_match=true
         model_lower=$(echo "$model" | tr '[:upper:]' '[:lower:]')
+
         for filter_lower in "${filters_lower[@]}"; do
             # Use word boundary matching for better precision
             # This will match "3" in "gpt-3" but not in "13b"
-            if ! echo "$model_lower" | grep -E "(^|[^[:alnum:]])${filter_lower}([^[:alnum:]]|$)" >/dev/null 2>&1; then
+            # FIX: escape regex metacharacters in filter
+            esc_filter=$(regex_escape_ere "$filter_lower")
+            if ! echo "$model_lower" | grep -E "(^|[^[:alnum:]])${esc_filter}([^[:alnum:]]|$)" >/dev/null 2>&1; then
                 is_match=false
                 break
             fi
         done
-        
+
         if [[ "$is_match" == true ]]; then
             filtered_models+=("$model")
         fi
@@ -430,7 +435,7 @@ fi
 
 # After potential filtering, check if any models are left
 if [ ${#available_models[@]} -eq 0 ]; then
-    echo -e "${COLOR_ERROR}No models available." >&2
+    echo -e "${COLOR_ERROR}No models available.${COLOR_RESET}" >&2
     if [ ${#filters[@]} -gt 0 ]; then
         echo -e "${COLOR_WARN}Your filter criteria (${filters[*]}) did not match any models from provider '${PROVIDER^^}'.${COLOR_RESET}" >&2
         echo -e "${COLOR_INFO}Filters use word boundary matching (e.g., '3' matches 'gpt-3' but not '13b')${COLOR_RESET}" >&2
@@ -477,7 +482,7 @@ if [[ "$PROVIDER" == "gemini" ]]; then
     echo ""
     tool_choice_input=""
     while true; do
-        read -r -p "$(echo -e "${COLOR_INFO}Do you want to enable online tool calling (web search, URL context) for Gemini? (y/n, 1/0): ${COLOR_RESET}")" tool_choice_input
+        read -r -p "$(echo -e "${COLOR_INFO}Enable online tool calling (web search, URL context) for Gemini? (y/n, 1/0): ${COLOR_RESET}")" tool_choice_input
         tool_choice_input=$(echo "$tool_choice_input" | tr '[:upper:]' '[:lower:]') # Convert to lowercase
         if [[ "$tool_choice_input" == "y" || "$tool_choice_input" == "1" ]]; then
             ENABLE_TOOL_CALLING=true
@@ -520,57 +525,60 @@ esac
 
 declare -a chat_history=()
 
-function initialize_history() {
+initialize_history() {
     chat_history=() # Clear the array
     if [[ -n "$SYSTEM_PROMPT" ]]; then
-        local system_message_json=""
         if [[ "$IS_OPENAI_COMPATIBLE" == true ]]; then # OpenAI compatible system prompt
             system_message_json=$(jq -n --arg content "$SYSTEM_PROMPT" '{role: "system", content: $content}')
+            if [[ -n "$system_message_json" ]]; then
+                chat_history+=("$system_message_json")
+            fi
         fi
-        if [[ -n "$system_message_json" ]]; then
-            chat_history+=("$system_message_json")
-        elif [[ "$IS_OPENAI_COMPATIBLE" == false && -n "$SYSTEM_PROMPT" ]]; then
-            # For Gemini, system prompt is handled by prepending to first user message.
-            : # No object added to chat_history for Gemini's system prompt here.
-        elif [[ -n "$SYSTEM_PROMPT" ]]; then # Failed to create JSON for OAI
-            echo -e "${COLOR_WARN}Warning: Failed to create system prompt JSON (jq error?). System prompt may not be active.${COLOR_RESET}" >&2
-        fi
+        # For Gemini, system prompt is handled by prepending to first user message.
     fi
 }
 
 # Validate a loaded session file
-function validate_session() {
+# FIX: validate_session now accepts either OpenAI-style (content) OR Gemini-style (parts)
+validate_session() {
     local session_file="$1"
-    
+
     # Check if it's valid JSON array
     if ! jq -e 'type == "array"' "$session_file" >/dev/null 2>&1; then
         echo -e "${COLOR_ERROR}Error: Session file is not a valid JSON array.${COLOR_RESET}" >&2
         return 1
     fi
-    
+
     # Check each message has required fields
     local validation_result
-    validation_result=$(jq -r 'map(
-        if type != "object" then 
-            "Item is not an object"
-        elif .role == null then 
-            "Missing role field"
-        elif (.role == "user" or .role == "assistant" or .role == "system") and .content == null then 
-            "Missing content field for OpenAI format"
-        elif .role == "user" and .parts == null then 
-            "Missing parts field for Gemini user format"
-        elif .role == "model" and .parts == null then 
-            "Missing parts field for Gemini model format"
-        else 
-            null
-        end
-    ) | map(select(. != null)) | if length > 0 then .[0] else null end' "$session_file")
-    
+    validation_result=$(
+        jq -r '
+          map(
+            if type != "object" then
+              "Item is not an object"
+            elif .role == null then
+              "Missing role field"
+            elif .role == "system" then
+              if (.content? | type) != "string" then "System message missing string .content" else null end
+            elif (.role == "user" or .role == "assistant" or .role == "model") then
+              if ((.content? | type) == "string") then null
+              elif (.parts? | type) == "array" then null
+              else "Message missing .content (OpenAI) or .parts (Gemini)"
+              end
+            else
+              "Unknown role"
+            end
+          )
+          | map(select(. != null))
+          | if length > 0 then .[0] else null end
+        ' "$session_file"
+    )
+
     if [[ -n "$validation_result" && "$validation_result" != "null" ]]; then
         echo -e "${COLOR_ERROR}Error: Invalid session format - $validation_result${COLOR_RESET}" >&2
         return 1
     fi
-    
+
     return 0
 }
 
@@ -585,15 +593,16 @@ echo -e "${COLOR_INFO}Temp/Tokens/TopP (Defaults):${COLOR_RESET} $DEFAULT_OAI_TE
 
 if [[ -n "$SYSTEM_PROMPT" ]]; then
      if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then
-        echo -e "${COLOR_INFO}System Prompt:${COLOR_RESET}   Set (will be prepended to first user message for Gemini)"
+        echo -e "${COLOR_INFO}System Prompt:${COLOR_RESET}   Set (prepended to first user message for Gemini)"
      elif [[ ${#chat_history[@]} -gt 0 && "$(echo "${chat_history[0]}" | jq -r .role 2>/dev/null)" == "system" ]]; then
         echo -e "${COLOR_INFO}System Prompt:${COLOR_RESET}   Active (OpenAI-compatible format)"
      else
-         echo -e "${COLOR_WARN}System Prompt:${COLOR_RESET}   Set but seems inactive in history array (OpenAI specific).${COLOR_RESET}"
+         echo -e "${COLOR_WARN}System Prompt:${COLOR_RESET}   Set but seems inactive.${COLOR_RESET}"
      fi
 else
     echo -e "${COLOR_INFO}System Prompt:${COLOR_RESET}   Inactive (set to empty string)"
 fi
+
 # Display tool calling status if it's Gemini
 if [[ "$PROVIDER" == "gemini" ]]; then
     if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
@@ -606,26 +615,26 @@ fi
 # Updated help text to include new session commands
 echo -e "Enter prompt. Type ${COLOR_BOLD}'quit'/'exit'${COLOR_RESET}. Commands: ${COLOR_BOLD}/history, /save <name>, /load <name>, /clear${COLOR_RESET}"
 echo -e "---------------------------------------------------------------------------------------"
+
 first_user_message=true
 
 while true; do
-    if [[ -t 0 && $- == *i* ]] && builtin command -v read -e &> /dev/null; then
-         # Interactive mode with readline support
+    # Readline support when interactive
+    if [[ -t 0 ]]; then
          read -r -e -p "$(echo -e "${COLOR_BOLD}${COLOR_USER}You:${COLOR_RESET} ")" user_input
          # Add to shell history if input is not empty
-         [[ -n "$user_input" ]] && history -s "$user_input"
+         [[ -n "${user_input:-}" ]] && history -s "$user_input" 2>/dev/null || true
     else
-         # Non-interactive or no readline support
          read -r -p "$(echo -e "${COLOR_BOLD}${COLOR_USER}You:${COLOR_RESET} ")" user_input
     fi
 
-    if [[ "$user_input" == "quit" || "$user_input" == "exit" ]]; then
+    if [[ "${user_input:-}" == "quit" || "${user_input:-}" == "exit" ]]; then
         echo "Exiting chat."
         break
     fi
 
     ### --- Session Management Logic --- ###
-    if [[ "$user_input" == /* ]]; then
+    if [[ "${user_input:-}" == /* ]]; then
         read -r cmd args <<< "$user_input"
         case "$cmd" in
             "/history")
@@ -636,7 +645,7 @@ while true; do
                     printf '%s\n' "${chat_history[@]}" | jq -s -c '.[]' | while IFS= read -r msg; do
                         role=$(echo "$msg" | jq -r '.role')
                         content=$(echo "$msg" | jq -r '.content // .parts[0].text')
-                        
+
                         if [[ "$role" == "user" ]]; then
                             echo -e "${COLOR_USER}[$role]${COLOR_RESET} $(truncate "$content" 500)"
                         elif [[ "$role" == "assistant" || "$role" == "model" ]]; then
@@ -650,7 +659,7 @@ while true; do
                 continue
                 ;;
             "/save")
-                if [[ -z "$args" ]]; then
+                if [[ -z "${args:-}" ]]; then
                     echo -e "${COLOR_WARN}Usage: /save <session_name>${COLOR_RESET}" >&2
                     continue
                 fi
@@ -665,34 +674,29 @@ while true; do
                 continue
                 ;;
             "/load")
-                if [[ -z "$args" ]]; then
+                if [[ -z "${args:-}" ]]; then
                     echo -e "${COLOR_WARN}Usage: /load <session_name>${COLOR_RESET}" >&2
                     continue
                 fi
                 if ! validate_session_name "$args"; then
                     continue
                 fi
-                
+
                 # Create session directory if it doesn't exist
                 mkdir -p "$SESSION_DIR"
-                
+
                 session_file="${SESSION_DIR}/${args}.json"
                 if [[ ! -f "$session_file" ]]; then
                     echo -e "${COLOR_ERROR}Error: Session file not found: $session_file${COLOR_RESET}" >&2
-                    # List available sessions if any exist
-                    if compgen -G "${SESSION_DIR}/*.json" > /dev/null; then
-                        echo -e "${COLOR_INFO}Available sessions:${COLOR_RESET}" >&2
-                        ls -1 "${SESSION_DIR}"/*.json 2>/dev/null | xargs -n1 basename | sed 's/.json$//' >&2
-                    fi
                     continue
                 fi
-                
+
                 # Validate session file before loading
                 if ! validate_session "$session_file"; then
                     echo -e "${COLOR_ERROR}Session file is corrupted or invalid. Cannot load.${COLOR_RESET}" >&2
                     continue
                 fi
-                
+
                 # Load JSON array from file into the chat_history bash array
                 mapfile -t chat_history < <(jq -c '.[]' "$session_file")
                 first_user_message=false # A loaded session is not a "first message"
@@ -721,10 +725,10 @@ while true; do
         esac
     fi
 
-    if [[ -z "$user_input" ]]; then
+    if [[ -z "${user_input:-}" ]]; then
         continue
     fi
-    
+
     # Check message length limit
     if [[ ${#user_input} -gt $MAX_MESSAGE_LENGTH ]]; then
         echo -e "${COLOR_ERROR}Error: Message too long (${#user_input} chars). Maximum is $MAX_MESSAGE_LENGTH characters.${COLOR_RESET}" >&2
@@ -739,14 +743,11 @@ while true; do
     fi
     first_user_message=false # Mark that the first user message (potential system prompt carrier) has passed
 
-
     user_message_json=""
     if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then # Gemini
-        user_message_json=$(jq -n --arg text "$user_prompt_text" \
-            '{role: "user", parts: [{text: $text}]}')
+        user_message_json=$(jq -n --arg text "$user_prompt_text" '{role: "user", parts: [{text: $text}]}')
     else # OpenAI-Compatible
-        user_message_json=$(jq -n --arg content "$user_prompt_text" \
-            '{role: "user", content: $content}')
+        user_message_json=$(jq -n --arg content "$user_prompt_text" '{role: "user", content: $content}')
     fi
 
     if [[ -z "$user_message_json" ]]; then
@@ -766,13 +767,20 @@ while true; do
 
     if [[ $current_history_size -gt $effective_max_history_entries ]]; then
         elements_to_remove=$((current_history_size - effective_max_history_entries))
+
+        # FIX: Gemini needs user/model alternation; remove an even number to keep alignment
+        if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then
+            if (( elements_to_remove % 2 == 1 )); then
+                elements_to_remove=$((elements_to_remove + 1))
+            fi
+        fi
+
         if [[ $system_offset -eq 1 ]]; then # Keep system prompt, remove from user/AI messages
             chat_history=("${chat_history[0]}" "${chat_history[@]:(1 + ${elements_to_remove})}")
         else # No system prompt, remove from the beginning
             chat_history=("${chat_history[@]:${elements_to_remove}}")
         fi
     fi
-
 
     history_json_array=$(printf '%s\n' "${chat_history[@]}" | jq -sc 'map(select(. != null))')
     if [[ -z "$history_json_array" || "$history_json_array" == "null" || "$history_json_array" == "[]" ]]; then
@@ -826,6 +834,7 @@ while true; do
                     }
                 }'
             )
+            
          # Conditionally add parameters for providers that support them.
          # TogetherAI, for example, can be sensitive to extra parameters on some models.
          elif [[ "$PROVIDER" != "together" ]]; then
@@ -843,21 +852,21 @@ while true; do
          fi
     fi
 
-    if [ -z "$json_payload" ]; then
+    if [[ -z "$json_payload" ]]; then
         echo -e "${COLOR_ERROR}Error: Failed to create final JSON payload using jq. Rolling back last user message.${COLOR_RESET}" >&2
-         if [ ${#chat_history[@]} -gt 0 ]; then
-             last_idx=$(( ${#chat_history[@]} - 1 ))
-             last_role_raw=$(echo "${chat_history[$last_idx]}" | jq -r .role 2>/dev/null)
-             if [[ "$last_role_raw" == "user" ]]; then
-                 unset 'chat_history[$last_idx]'
-                 chat_history=("${chat_history[@]}")
-             fi
-         fi
+        if [ ${#chat_history[@]} -gt 0 ]; then
+            last_idx=$(( ${#chat_history[@]} - 1 ))
+            last_role_raw=$(echo "${chat_history[$last_idx]}" | jq -r .role 2>/dev/null)
+            if [[ "$last_role_raw" == "user" ]]; then
+                unset 'chat_history[$last_idx]'
+                chat_history=("${chat_history[@]}")
+            fi
+        fi
         continue
     fi
 
     echo -n -e "\r${COLOR_AI}AI:${COLOR_RESET} ${COLOR_INFO}(💬 Waiting for stream...)${COLOR_RESET}"
-    
+
     # Base curl arguments for chat
     base_chat_curl_args=(-sS -L -N -X POST "$CHAT_API_URL" -H "Content-Type: application/json" -H "Accept: application/json")
     [ -n "$CHAT_AUTH_HEADER" ] && base_chat_curl_args+=(-H "$CHAT_AUTH_HEADER")
@@ -870,40 +879,37 @@ while true; do
     stream_error_message=""
     stream_finish_reason=""
     first_chunk_received=false
-    
+
     # State variable for tracking if we are inside <think> tags. Reset for each turn.
     is_thinking=false
-    
-    CURL_STDERR_TEMP=$(mktemp)
 
+    CURL_STDERR_TEMP=$(mktemp)
     # Process substitution with proper file descriptor management
     exec {STREAM_FD}< <(curl "${base_chat_curl_args[@]}" 2>"$CURL_STDERR_TEMP")
 
     while IFS= read -r line <&${STREAM_FD}; do
         # Handle both standard SSE format and Ollama's newline-delimited JSON
         json_chunk=""
-        
+
         # Check if this is SSE format (starts with "data: ")
         if [[ "$line" == "data: "* ]]; then
             json_chunk="${line#data: }"
-            
+
             # OpenAI/standard stream end marker
             if [[ "$json_chunk" == "[DONE]" ]]; then
-                break 
+                break
             fi
         elif [[ "$line" == "{"* ]]; then
             # Ollama format - direct JSON without "data: " prefix
             json_chunk="$line"
         fi
-        
+
         # Skip empty lines
-        if [[ -z "$json_chunk" ]]; then 
-            continue
-        fi
-        
+        [[ -z "$json_chunk" ]] && continue
+
         # Validate JSON
         if ! echo "$json_chunk" | jq empty 2>/dev/null ; then
-            continue 
+            continue
         fi
 
         # Universal error check
@@ -935,7 +941,7 @@ while true; do
         # Extract text chunk and finish reason
         text_chunk=""
         current_sfr=""
-        
+
         if [[ "$IS_OPENAI_COMPATIBLE" == true ]]; then
             if [[ "$PROVIDER" == "ollama" ]]; then
                 # Ollama specific format
@@ -952,17 +958,18 @@ while true; do
                 text_chunk=$(echo "$json_chunk" | jq -r '.choices[0].delta.content // .choices[0].text // empty')
                 current_sfr=$(echo "$json_chunk" | jq -r '.choices[0].finish_reason // empty')
             fi
-        else # Gemini
+        else
+            # Gemini
             text_chunk=$(echo "$json_chunk" | jq -r '.candidates[0].content.parts[0].text // empty')
             current_sfr=$(echo "$json_chunk" | jq -r '.candidates[0].finishReason // empty')
-            
+
             if [[ -z "$current_sfr" || "$current_sfr" == "null" ]]; then
                  current_sfr=$(echo "$json_chunk" | jq -r '.candidates[0].safetyRatings[]? | select(.blocked == true) | .category // empty' | head -n 1)
-                 if [[ -n "$current_sfr" && "$current_sfr" != "null" ]]; then 
+                 if [[ -n "$current_sfr" && "$current_sfr" != "null" ]]; then
                      current_sfr="SAFETY"
                  fi
             fi
-            
+
             # Check for tool calls if enabled
             if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
                 tool_call_parts=$(echo "$json_chunk" | jq -c '.candidates[0].content.parts[] | select(.functionCall != null) // empty')
@@ -972,7 +979,7 @@ while true; do
                         first_chunk_received=true
                     fi
                     echo -e "\n${COLOR_WARN}AI requested tool call 🌐:${COLOR_RESET}" >&2
-                    echo "$tool_call_parts" | jq . >&2 
+                    echo "$tool_call_parts" | jq . >&2
                     echo -e "${COLOR_WARN}(This script does not automatically execute tool calls or return tool output to the model.)\n${COLOR_RESET}" >&2
                 fi
             fi
@@ -988,11 +995,11 @@ while true; do
             echo -ne "\r\033[K"; echo -n -e "${COLOR_AI}AI:${COLOR_RESET}  "
             first_chunk_received=true
         fi
-        
+
         # Print and accumulate text with <think> tag handling
         if [[ -n "$text_chunk" ]]; then
             full_ai_response_text+="$text_chunk"
-            
+
             processing_chunk="$text_chunk"
             while [[ -n "$processing_chunk" ]]; do
                 if [[ "$is_thinking" == true ]]; then
@@ -1022,7 +1029,7 @@ while true; do
                 fi
             done
         fi
-        
+
         # Check if stream is done
         if [[ "$IS_OPENAI_COMPATIBLE" == false && -n "$stream_finish_reason" && "$stream_finish_reason" != "null" ]]; then
             if [[ "$stream_finish_reason" == "SAFETY" || "$stream_finish_reason" == "RECITATION" || "$stream_finish_reason" == "OTHER" ]]; then
@@ -1035,70 +1042,59 @@ while true; do
             fi
             break
         fi
-        
+
         # For Ollama, check if done
         if [[ "$PROVIDER" == "ollama" && "$stream_finish_reason" == "stop" ]]; then
             break
         fi
     done
-    
+
     exec {STREAM_FD}<&-
     STREAM_FD=""
 
-    curl_stderr_content=$(cat "$CURL_STDERR_TEMP" 2>/dev/null)
+    curl_stderr_content=$(cat "$CURL_STDERR_TEMP" 2>/dev/null || true)
     rm -f "$CURL_STDERR_TEMP"
     CURL_STDERR_TEMP=""
 
     # Post-stream processing
     if [[ "$first_chunk_received" == false && -z "$stream_error_message" ]]; then
-        echo -ne "\r\033[K" 
-        if [[ -n "$curl_stderr_content" ]]; then 
+        echo -ne "\r\033[K"
+        if [[ -n "$curl_stderr_content" ]]; then
             stream_error_message="API call failed. $(truncate "$curl_stderr_content" 150)"
             api_error_occurred=true
             echo -e "${COLOR_AI}AI:${COLOR_RESET} ${COLOR_ERROR}$stream_error_message${COLOR_RESET}"
         else
             echo -e "${COLOR_AI}AI:${COLOR_RESET} ${COLOR_INFO}(No content in response or empty stream ended prematurely)${COLOR_RESET}"
         fi
-    elif [[ "$first_chunk_received" == true ]]; then
-        echo -e "${COLOR_RESET}" 
+    else
+        echo -e "${COLOR_RESET}"
         if [[ "$api_error_occurred" == true && -n "$stream_error_message" ]]; then
             echo -e "${COLOR_ERROR}$stream_error_message${COLOR_RESET}"
-        else
-            declare -A normal_finish_reasons=(
-                ["stop"]=1 ["done"]=1 ["length"]=1
-                ["STOP"]=1 ["MAX_TOKENS"]=1 ["MODEL_LENGTH"]=1
-            )
-            if [[ -n "$stream_finish_reason" && "$stream_finish_reason" != "null" && -z "${normal_finish_reasons[$stream_finish_reason]}" ]]; then
-                echo -e "${COLOR_WARN}(Finish Reason: $stream_finish_reason)${COLOR_RESET}"
-            fi
         fi
-    elif [[ "$api_error_occurred" == true && -n "$stream_error_message" ]]; then 
-        echo -ne "\r\033[K"
-        echo -e "${COLOR_AI}AI:${COLOR_RESET} ${COLOR_ERROR}$stream_error_message${COLOR_RESET}"
     fi
-    
+
     # Check response length
     if [[ ${#full_ai_response_text} -gt $MAX_MESSAGE_LENGTH ]]; then
         echo -e "${COLOR_WARN}Warning: AI response was truncated (exceeded $MAX_MESSAGE_LENGTH characters)${COLOR_RESET}" >&2
         full_ai_response_text="${full_ai_response_text:0:$MAX_MESSAGE_LENGTH}"
     fi
-    
+
     # Strip think tags
     ai_text=$(strip_think_tags "$full_ai_response_text")
 
     # Create AI message for history
-    if [[ "$api_error_occurred" == false && -n "$ai_text" ]]; then 
-        if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then 
+    if [[ "$api_error_occurred" == false && -n "$ai_text" ]]; then
+        if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then
             local_ai_message_json=$(jq -n --arg text "$ai_text" '{role: "model", parts: [{text: $text}]}')
-        else 
+        else
             local_ai_message_json=$(jq -n --arg content "$ai_text" '{role: "assistant", content: $content}')
         fi
-        if ! echo "$local_ai_message_json" | jq empty 2>/dev/null; then 
+        if ! echo "$local_ai_message_json" | jq empty 2>/dev/null; then
             echo -e "${COLOR_WARN}Warning: Internal error creating AI message JSON for history. AI response not added to history.${COLOR_RESET}" >&2
             local_ai_message_json=""
         fi
     else
-        local_ai_message_json="" 
+        local_ai_message_json=""
     fi
 
     # Add to history or rollback
@@ -1108,7 +1104,6 @@ while true; do
         if [[ ${#chat_history[@]} -gt 0 && "$full_ai_response_text" != *"Content blocked by API"* ]]; then
             last_idx_before_ai_response=$(( ${#chat_history[@]} - 1 ))
             last_role_check=$(echo "${chat_history[$last_idx_before_ai_response]}" | jq -r .role 2>/dev/null)
-
             if [[ "$last_role_check" == "user" ]]; then
                  echo -e "${COLOR_WARN}(Rolling back last user message from history due to error or no AI response text)${COLOR_RESET}" >&2
                  unset 'chat_history[$last_idx_before_ai_response]'
@@ -1116,6 +1111,7 @@ while true; do
             fi
         fi
     fi
+    
     echo ""
 done
 
