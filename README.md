@@ -2,7 +2,7 @@
 A versatile script that provides a command-line interface (CLI) for 
 interacting with various Large Language Models (LLMs) from multiple inference providers. 
 It supports model selection, conversation history, system prompts, and 
-real-time streaming of responses, filter from the models and off|on tool calling.
+real-time streaming of responses, filter from the models and off|on tool calling and now with vision support.
 Run this from any macos or linux even from android with turmux.
 
 ## Demo
@@ -30,6 +30,7 @@ Run this from any macos or linux even from android with turmux.
 *   **Tool Calling:** Tool Calling added into gemini with prompt to enable.
 *   **search filter:** Filter support added [filter] ... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
 *   **Session management commands:** /save <name>, /load <name>, /clear .
+*   **Image commands:** /upload <path>, /image, /clearimage.
 
 1.  **Download the Script:**
     Clone the repository or download `ai.sh` to your local machine.
