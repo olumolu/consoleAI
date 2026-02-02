@@ -1,6 +1,6 @@
 #!/bin/bash
-# Universal Chat CLI (Bash/curl/jq/bc) - With Model Selection, HISTORY, SYSTEM PROMPT, STREAMING
-# REQUIREMENTS: bash, curl, jq, bc, grep, sed (must be pre-installed on the system)
+# Universal Chat CLI (Bash/curl/jq/bc) - With Model Selection, HISTORY, SYSTEM PROMPT, STREAMING, IMAGE SUPPORT
+# REQUIREMENTS: bash, curl, jq, bc, grep, sed, file, base64 (must be pre-installed on the system)
 # Supports: Gemini, OpenRouter, Groq, Together AI, Cerebras AI, Novita AI, Ollama Cloud
 # To Run This Tool First Make It executable with $ chmod +x ai.sh
 # Run This $ ./ai.sh provider
@@ -21,6 +21,13 @@ DEFAULT_OAI_TEMPERATURE=0.7   # t = randomness: Higher = more creative, Lower = 
 DEFAULT_OAI_MAX_TOKENS=3000   # Default max_tokens for OpenAI-compatible APIs
 DEFAULT_OAI_TOP_P=0.9         # p = diversity: Higher = wider vocabulary, Lower = safer word choices | allowed value 0-1
 SESSION_DIR="${HOME}/.chat_sessions"    # Directory for storing chat session history files.
+
+# --- Image Support Configuration ---
+CURRENT_IMAGE_PATH=""
+CURRENT_IMAGE_BASE64=""
+CURRENT_IMAGE_MIME=""
+MAX_IMAGE_SIZE_MB=20
+SUPPORTED_IMAGE_TYPES=("image/jpeg" "image/png" "image/webp" "image/gif")
 
 # --- Validate Configuration ---
 validate_numeric() {
@@ -61,6 +68,7 @@ COLOR_ERROR='\033[38;5;203m'    # Vivid red
 COLOR_WARN='\033[38;5;221m'     # Soft yellow
 COLOR_INFO='\033[38;5;75m'      # Darker cyan-blue
 COLOR_BOLD='\033[1m'
+COLOR_IMAGE='\033[38;5;208m'    # Orange - for image attachments and indicators
 
 ##########################################################################
 #                    !!! EDIT YOUR API KEYS HERE !!!                     #
@@ -138,9 +146,20 @@ function print_usage() {
   echo -e "  maintaining conversation history, using a system prompt (if applicable),"
   echo -e "  and streaming responses token by token."
   echo -e "  It will fetch available models and let you choose one by number."
+  echo -e "  Now with image/multimodal support for vision-capable models!"
   echo -e ""
   echo -e "${COLOR_INFO}Supported Providers:${COLOR_RESET}"
   echo -e "  gemini, openrouter, groq, together, cerebras, novita, ollama"
+  echo -e ""
+  echo -e "${COLOR_INFO}Chat Commands:${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}/history${COLOR_RESET}         - Show conversation history"
+  echo -e "  ${COLOR_BOLD}/save <name>${COLOR_RESET}     - Save current session to file"
+  echo -e "  ${COLOR_BOLD}/load <name>${COLOR_RESET}     - Load saved session from file"
+  echo -e "  ${COLOR_BOLD}/clear${COLOR_RESET}           - Clear all saved sessions"
+  echo -e "  ${COLOR_BOLD}/upload <path>${COLOR_RESET}   - Attach image to next message ${COLOR_IMAGE}(New!)${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}/image${COLOR_RESET}           - Show currently attached image ${COLOR_IMAGE}(New!)${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}/clearimage${COLOR_RESET}      - Remove attached image ${COLOR_IMAGE}(New!)${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}quit${COLOR_RESET} or ${COLOR_BOLD}exit${COLOR_RESET}   - Exit chat"
   echo -e ""
   echo -e "${COLOR_INFO}Finding Model Identifiers (if needed manually):${COLOR_RESET}"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Gemini:${COLOR_RESET}     https://ai.google.dev/models/gemini"
@@ -159,6 +178,10 @@ function print_usage() {
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 cerebras${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 novita${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 ollama${COLOR_RESET}"
+  echo -e ""
+  echo -e "${COLOR_IMAGE}Image Support:${COLOR_RESET}"
+  echo -e "  Supports JPEG, PNG, GIF, WebP, BMP. Max ${MAX_IMAGE_SIZE_MB}MB per image."
+  echo -e "  Usage: ${COLOR_BOLD}/upload ~/photo.jpg${COLOR_RESET}, then type your question."
   echo -e "${COLOR_WARN}NOTE: Ensure API keys are set inside the script before running!${COLOR_RESET}"
 }
 
@@ -260,6 +283,58 @@ regex_escape_ere() {
     printf '%s' "$1" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g'
 }
 
+# --- Image Helper Functions ---
+validate_image_file() {
+    local file_path="$1"
+    # Remove quotes if present
+    file_path="${file_path//\'/}"
+    file_path="${file_path//\"/}"
+    
+    if [[ ! -f "$file_path" ]]; then
+        echo -e "${COLOR_ERROR}Error: File not found: $file_path${COLOR_RESET}" >&2
+        return 1
+    fi
+    
+    local file_size_bytes=$(stat -c%s "$file_path" 2>/dev/null || stat -f%z "$file_path" 2>/dev/null)
+    local max_size_bytes=$((MAX_IMAGE_SIZE_MB * 1024 * 1024))
+    
+    if [[ $file_size_bytes -gt $max_size_bytes ]]; then
+        echo -e "${COLOR_ERROR}Error: Image too large ($(($file_size_bytes / 1024 / 1024))MB). Max: ${MAX_IMAGE_SIZE_MB}MB${COLOR_RESET}" >&2
+        return 1
+    fi
+    
+    local mime_type=$(file -b --mime-type "$file_path" 2>/dev/null || file -I "$file_path" 2>/dev/null | cut -d';' -f1)
+    
+    local is_valid=false
+    for valid_type in "${SUPPORTED_IMAGE_TYPES[@]}"; do
+        if [[ "$mime_type" == "$valid_type" ]]; then
+            is_valid=true
+            break
+        fi
+    done
+    
+    if [[ "$is_valid" == false ]]; then
+        echo -e "${COLOR_ERROR}Error: Unsupported image type: $mime_type${COLOR_RESET}" >&2
+        return 1
+    fi
+    
+    echo "$file_path|$mime_type"
+    return 0
+}
+
+encode_image_to_base64() {
+    local file_path="$1"
+    file_path="${file_path//\'/}"
+    file_path="${file_path//\"/}"
+    base64 -w 0 "$file_path" 2>/dev/null || base64 "$file_path" 2>/dev/null
+}
+
+clear_current_image() {
+    CURRENT_IMAGE_PATH=""
+    CURRENT_IMAGE_BASE64=""
+    CURRENT_IMAGE_MIME=""
+}
+
 # --- Argument Parsing ---
 if [ "$#" -lt 1 ]; then
     echo -e "${COLOR_ERROR}Error: Invalid number of arguments.${COLOR_RESET}" >&2
@@ -271,7 +346,7 @@ PROVIDER=$(echo "$1" | tr '[:upper:]' '[:lower:]')
 filters=("${@:2}") # Capture all arguments from the second one onwards as filters
 
 # --- Dependency Check ---
-required_commands=("curl" "jq" "bc" "grep" "sed")
+required_commands=("curl" "jq" "bc" "grep" "sed" "file" "base64")
 missing_commands=()
 for cmd in "${required_commands[@]}"; do
     if ! command -v "$cmd" &> /dev/null; then
@@ -619,13 +694,19 @@ echo -e "-----------------------------------------------------------------------
 first_user_message=true
 
 while true; do
+    # Build prompt with image indicator
+    prompt_prefix=""
+    if [[ -n "$CURRENT_IMAGE_PATH" ]]; then
+        prompt_prefix="[${COLOR_INFO}📎 $(basename "$CURRENT_IMAGE_PATH")${COLOR_RESET}] "
+    fi
+    
     # Readline support when interactive
     if [[ -t 0 ]]; then
-         read -r -e -p "$(echo -e "${COLOR_BOLD}${COLOR_USER}You:${COLOR_RESET} ")" user_input
+         read -r -e -p "$(echo -e "${prompt_prefix}${COLOR_BOLD}${COLOR_USER}You:${COLOR_RESET} ")" user_input
          # Add to shell history if input is not empty
          [[ -n "${user_input:-}" ]] && history -s "$user_input" 2>/dev/null || true
     else
-         read -r -p "$(echo -e "${COLOR_BOLD}${COLOR_USER}You:${COLOR_RESET} ")" user_input
+         read -r -p "$(echo -e "${prompt_prefix}${COLOR_BOLD}${COLOR_USER}You:${COLOR_RESET} ")" user_input
     fi
 
     if [[ "${user_input:-}" == "quit" || "${user_input:-}" == "exit" ]]; then
@@ -637,6 +718,52 @@ while true; do
     if [[ "${user_input:-}" == /* ]]; then
         read -r cmd args <<< "$user_input"
         case "$cmd" in
+            "/upload")
+                if [[ -z "${args:-}" ]]; then
+                    echo -e "${COLOR_IMAGE}Usage: /upload <image_path>${COLOR_RESET}" >&2
+                    continue
+                fi
+                # Remove quotes
+                args="${args//\'/}"
+                args="${args//\"/}"
+                
+                echo -e "${COLOR_IMAGE}Validating image...${COLOR_RESET}" >&2
+                validation_result=$(validate_image_file "$args")
+                if [[ $? -ne 0 ]]; then
+                    continue
+                fi
+                
+                file_path=$(echo "$validation_result" | cut -d'|' -f1)
+                mime_type=$(echo "$validation_result" | cut -d'|' -f2)
+                
+                echo -e "${COLOR_IMAGE}Encoding image...${COLOR_RESET}" >&2
+                base64_data=$(encode_image_to_base64 "$file_path")
+                if [[ $? -ne 0 ]] || [[ -z "$base64_data" ]]; then
+                    echo -e "${COLOR_ERROR}Error: Failed to encode image${COLOR_RESET}" >&2
+                    continue
+                fi
+                
+                CURRENT_IMAGE_PATH="$file_path"
+                CURRENT_IMAGE_BASE64="$base64_data"
+                CURRENT_IMAGE_MIME="$mime_type"
+                
+                file_size_kb=$(($(stat -c%s "$file_path" 2>/dev/null || stat -f%z "$file_path" 2>/dev/null) / 1024))
+                echo -e "${COLOR_IMAGE}✓ Attached: $(basename "$file_path") (${mime_type}, ${file_size_kb}KB)${COLOR_RESET}" >&2
+                continue
+                ;;
+            "/image")
+                if [[ -n "$CURRENT_IMAGE_PATH" ]]; then
+                    echo -e "${COLOR_IMAGE}Current image: $(basename "$CURRENT_IMAGE_PATH") (${CURRENT_IMAGE_MIME})${COLOR_RESET}" >&2
+                else
+                    echo -e "${COLOR_IMAGE}No image attached.${COLOR_RESET}" >&2
+                fi
+                continue
+                ;;
+            "/clearimage")
+                clear_current_image
+                echo -e "${COLOR_IMAGE}Image cleared.${COLOR_RESET}" >&2
+                continue
+                ;;
             "/history")
                 echo -e "${COLOR_INFO}--- Current Conversation History (${#chat_history[@]} messages) ---${COLOR_RESET}"
                 if [ ${#chat_history[@]} -eq 0 ]; then
@@ -725,8 +852,13 @@ while true; do
         esac
     fi
 
-    if [[ -z "${user_input:-}" ]]; then
+    if [[ -z "${user_input:-}" && -z "$CURRENT_IMAGE_BASE64" ]]; then
         continue
+    fi
+
+    # Default prompt if only image attached
+    if [[ -z "${user_input:-}" && -n "$CURRENT_IMAGE_BASE64" ]]; then
+        user_input="Describe this image in detail."
     fi
 
     # Check message length limit
@@ -736,19 +868,54 @@ while true; do
         continue
     fi
 
-    user_prompt_text="$user_input"
-    # For Gemini, prepend system prompt to the first user message if set
-    if [[ "$IS_OPENAI_COMPATIBLE" == false && -n "$SYSTEM_PROMPT" && "$first_user_message" == true ]]; then
-        user_prompt_text="${SYSTEM_PROMPT}\n\nUser: ${user_input}"
-    fi
-    first_user_message=false # Mark that the first user message (potential system prompt carrier) has passed
+    echo -e "${COLOR_INFO}[Sending...]${COLOR_RESET}" >&2
 
+    user_prompt_text="$user_input"
     user_message_json=""
-    if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then # Gemini
-        user_message_json=$(jq -n --arg text "$user_prompt_text" '{role: "user", parts: [{text: $text}]}')
-    else # OpenAI-Compatible
-        user_message_json=$(jq -n --arg content "$user_prompt_text" '{role: "user", content: $content}')
+    
+    # --- Construct message with image support ---
+    if [[ -n "$CURRENT_IMAGE_BASE64" ]]; then
+        if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then
+            # Gemini format
+            if [[ "$first_user_message" == true && -n "$SYSTEM_PROMPT" ]]; then
+                user_prompt_text="${SYSTEM_PROMPT}\n\n${user_input}"
+            fi
+            user_message_json=$(jq -n \
+                --arg text "$user_prompt_text" \
+                --arg mime "$CURRENT_IMAGE_MIME" \
+                --arg data "$CURRENT_IMAGE_BASE64" \
+                '{role: "user", parts: [{text: $text}, {inlineData: {mimeType: $mime, data: $data}}]}'
+            )
+        elif [[ "$PROVIDER" == "ollama" ]]; then
+            # OLLAMA CLOUD: Native API format with images array
+            user_message_json=$(jq -n \
+                --arg content "$user_prompt_text" \
+                --arg image_data "$CURRENT_IMAGE_BASE64" \
+                '{role: "user", content: $content, images: [$image_data]}'
+            )
+        else
+            # OpenAI compatible format
+            user_message_json=$(jq -n \
+                --arg text "$user_input" \
+                --arg mime "$CURRENT_IMAGE_MIME" \
+                --arg data "$CURRENT_IMAGE_BASE64" \
+                '{role: "user", content: [{type: "text", text: $text}, {type: "image_url", image_url: {url: ("data:" + $mime + ";base64," + $data)}}]}'
+            )
+        fi
+        clear_current_image
+    else
+        # Text only
+        if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then
+            if [[ "$first_user_message" == true && -n "$SYSTEM_PROMPT" ]]; then
+                user_prompt_text="${SYSTEM_PROMPT}\n\nUser: ${user_input}"
+            fi
+            user_message_json=$(jq -n --arg text "$user_prompt_text" '{role: "user", parts: [{text: $text}]}')
+        else
+            user_message_json=$(jq -n --arg content "$user_prompt_text" '{role: "user", content: $content}')
+        fi
     fi
+    
+    first_user_message=false # Mark that the first user message has passed
 
     if [[ -z "$user_message_json" ]]; then
         echo -e "${COLOR_ERROR}Error: Failed to create user message JSON using jq. Skipping this turn.${COLOR_RESET}" >&2
