@@ -6,8 +6,6 @@ real-time streaming of responses, filter from the models and off|on tool calling
 Run this from any macos or linux even from android with turmux.
 
 ## Demo
-[demo.webm](https://github.com/user-attachments/assets/1584ab69-ed1b-45d3-988e-3d907b457ad8)
-
 [Screencast From 2026-02-03 23-47-45.webm](https://github.com/user-attachments/assets/937a8a68-5407-4242-a42b-718252e59a93)
 
 
