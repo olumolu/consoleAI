@@ -1,12 +1,12 @@
 #!/bin/bash
-# Universal Chat CLI (Bash/curl/jq/bc) - With Model Selection, HISTORY, SYSTEM PROMPT, STREAMING, IMAGE SUPPORT
+# Universal Chat CLI (Bash/curl/jq/bc) - With Model Selection, HISTORY, SYSTEM PROMPT, STREAMING, IMAGE SUPPORT, THINKING OUTPUT
 # REQUIREMENTS: bash, curl, jq, bc, grep, sed, file, base64 (must be pre-installed on the system)
 # Supports: Gemini, OpenRouter, Groq, Together AI, Cerebras AI, Novita AI, Ollama Cloud
 # To Run This Tool First Make It executable with $ chmod +x ai.sh
 # Run This $ ./ai.sh provider
-# filter support added [filter] ... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
+# filter support added [filter]... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
 # History, system prompt, and streaming are supported.
-# /history for show conversation log and <think>...</think> in a different colour for better visual experience.
+# /history for show conversation log and <think... in a different colour for better visual experience.
 # Session management commands: /save <name>, /load <name>, /clear
 
 # Error handling:
@@ -28,6 +28,9 @@ CURRENT_IMAGE_BASE64=""
 CURRENT_IMAGE_MIME=""
 MAX_IMAGE_SIZE_MB=20
 SUPPORTED_IMAGE_TYPES=("image/jpeg" "image/png" "image/webp" "image/gif")
+
+# --- Thinking Output Configuration ---
+ENABLE_THINKING_OUTPUT=true   # Set to false to disable thinking output display
 
 # --- Validate Configuration ---
 validate_numeric() {
@@ -105,6 +108,8 @@ TOGETHER_CHAT_URL="https://api.together.ai/v1/chat/completions"
 CEREBRAS_CHAT_URL="https://api.cerebras.ai/v1/chat/completions"
 NOVITA_CHAT_URL="https://api.novita.ai/v3/openai/chat/completions"
 OLLAMA_CHAT_URL="https://ollama.com/api/chat"
+# Ollama to localhost. If using Ollama Cloud, uncomment the next line to use local.
+# OLLAMA_CHAT_URL="http://localhost:11434/api/chat"
 
 # Model Listing Endpoints
 GEMINI_MODELS_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models"
@@ -114,6 +119,8 @@ TOGETHER_MODELS_URL="https://api.together.ai/v1/models"
 CEREBRAS_MODELS_URL="https://api.cerebras.ai/v1/models"
 NOVITA_MODELS_URL="https://api.novita.ai/v3/openai/models"
 OLLAMA_MODELS_URL="https://ollama.com/api/tags"
+# Ollama to localhost. If using Ollama Cloud, uncomment the next line to use local.
+#OLLAMA_MODELS_URL="http://localhost:11434/api/tags"
 
 # --- Cleanup Trap ---
 # Ensures temporary files are removed on script exit/interruption.
@@ -147,6 +154,7 @@ function print_usage() {
   echo -e "  and streaming responses token by token."
   echo -e "  It will fetch available models and let you choose one by number."
   echo -e "  Now with image/multimodal support for vision-capable models!"
+  echo -e "  Now with thinking output support for reasoning models!"
   echo -e ""
   echo -e "${COLOR_INFO}Supported Providers:${COLOR_RESET}"
   echo -e "  gemini, openrouter, groq, together, cerebras, novita, ollama"
@@ -159,6 +167,7 @@ function print_usage() {
   echo -e "  ${COLOR_BOLD}/upload <path>${COLOR_RESET}   - Attach image to next message ${COLOR_IMAGE}(New!)${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}/image${COLOR_RESET}           - Show currently attached image ${COLOR_IMAGE}(New!)${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}/clearimage${COLOR_RESET}      - Remove attached image ${COLOR_IMAGE}(New!)${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}/togglethinking${COLOR_RESET}  - Toggle thinking output display ${COLOR_THINK}(New!)${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}quit${COLOR_RESET} or ${COLOR_BOLD}exit${COLOR_RESET}   - Exit chat"
   echo -e ""
   echo -e "${COLOR_INFO}Finding Model Identifiers (if needed manually):${COLOR_RESET}"
@@ -182,6 +191,10 @@ function print_usage() {
   echo -e "${COLOR_IMAGE}Image Support:${COLOR_RESET}"
   echo -e "  Supports JPEG, PNG, GIF, WebP, BMP. Max ${MAX_IMAGE_SIZE_MB}MB per image."
   echo -e "  Usage: ${COLOR_BOLD}/upload ~/photo.jpg${COLOR_RESET}, then type your question."
+  echo -e ""
+  echo -e "${COLOR_THINK}Thinking Output:${COLOR_RESET}"
+  echo -e "  Displays reasoning/thinking content from supported models in orange."
+  echo -e "  Toggle with ${COLOR_BOLD}/togglethinking${COLOR_RESET} during chat."
   echo -e "${COLOR_WARN}NOTE: Ensure API keys are set inside the script before running!${COLOR_RESET}"
 }
 
@@ -260,13 +273,23 @@ strip_think_tags() {
     local remaining="$text"
 
     while [[ -n "$remaining" ]]; do
-        if [[ "$remaining" == *"<think>"* ]]; then
-            result+="${remaining%%<think>*}"
-            remaining="${remaining#*<think>}"
-            if [[ "$remaining" == *"</think>"* ]]; then
-                remaining="${remaining#*</think>}"
+        # Correctly handle <think...> and </think...>
+        if [[ "$remaining" == *"<think"* ]]; then
+            result+="${remaining%%<think*}"
+            remaining="${remaining#*<think}"
+            # Handle attributes or just >
+            if [[ "$remaining" == *">"* ]]; then
+                remaining="${remaining#*>}"
+            fi
+            
+            if [[ "$remaining" == *"</think"* ]]; then
+                # Remove content up to </think...>
+                remaining="${remaining#*</think}"
+                if [[ "$remaining" == *">"* ]]; then
+                    remaining="${remaining#*>}"
+                fi
             else
-                result+="<think>$remaining"
+                # No closing tag, assume rest is thinking. Drop it for history.
                 break
             fi
         else
@@ -421,7 +444,10 @@ case "$PROVIDER" in
         ;;
     ollama)
         MODELS_URL="$OLLAMA_MODELS_URL"
-        MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
+        # Ollama Cloud needs auth, local doesn't. We send it if key exists.
+        if [[ -n "$API_KEY" ]]; then
+            MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
+        fi
         JQ_QUERY='.models[] | .name'
         ;;
 esac
@@ -551,6 +577,7 @@ CHAT_AUTH_HEADER=""
 CHAT_EXTRA_HEADERS=()
 IS_OPENAI_COMPATIBLE=false # Determines payload structure and history role names
 ENABLE_TOOL_CALLING=false
+PROVIDER_SUPPORTS_THINKING=false # Track if provider supports native thinking
 
 # --- Interactive prompt for tool calling for Gemini ---
 if [[ "$PROVIDER" == "gemini" ]]; then
@@ -593,7 +620,10 @@ case "$PROVIDER" in
             together)   CHAT_API_URL="$TOGETHER_CHAT_URL" ;;
             cerebras)   CHAT_API_URL="$CEREBRAS_CHAT_URL" ;;
             novita)     CHAT_API_URL="$NOVITA_CHAT_URL" ;;
-            ollama)     CHAT_API_URL="$OLLAMA_CHAT_URL" ;;
+            ollama)     
+                CHAT_API_URL="$OLLAMA_CHAT_URL"
+                PROVIDER_SUPPORTS_THINKING=true # Ollama supports native thinking field
+                ;;
         esac
         ;;
 esac
@@ -687,8 +717,15 @@ if [[ "$PROVIDER" == "gemini" ]]; then
     fi
 fi
 
+# Display thinking output status
+if [[ "$ENABLE_THINKING_OUTPUT" == true ]]; then
+    echo -e "${COLOR_INFO}Thinking Output:${COLOR_RESET} ${COLOR_BOLD}${COLOR_THINK}Enabled${COLOR_RESET} (toggle with /togglethinking)"
+else
+    echo -e "${COLOR_INFO}Thinking Output:${COLOR_RESET} Disabled (toggle with /togglethinking)"
+fi
+
 # Updated help text to include new session commands
-echo -e "Enter prompt. Type ${COLOR_BOLD}'quit'/'exit'${COLOR_RESET}. Commands: ${COLOR_BOLD}/history, /save <name>, /load <name>, /clear${COLOR_RESET}"
+echo -e "Enter prompt. Type ${COLOR_BOLD}'quit'/'exit'${COLOR_RESET}. Commands: ${COLOR_BOLD}/history, /save <name>, /load <name>, /clear, /upload, /togglethinking${COLOR_RESET}"
 echo -e "---------------------------------------------------------------------------------------"
 
 first_user_message=true
@@ -762,6 +799,16 @@ while true; do
             "/clearimage")
                 clear_current_image
                 echo -e "${COLOR_IMAGE}Image cleared.${COLOR_RESET}" >&2
+                continue
+                ;;
+            "/togglethinking")
+                if [[ "$ENABLE_THINKING_OUTPUT" == true ]]; then
+                    ENABLE_THINKING_OUTPUT=false
+                    echo -e "${COLOR_INFO}Thinking output ${COLOR_BOLD}disabled${COLOR_RESET}." >&2
+                else
+                    ENABLE_THINKING_OUTPUT=true
+                    echo -e "${COLOR_INFO}Thinking output ${COLOR_BOLD}${COLOR_THINK}enabled${COLOR_RESET}." >&2
+                fi
                 continue
                 ;;
             "/history")
@@ -949,6 +996,7 @@ while true; do
         fi
     fi
 
+    # FIX: Serialize history to file to avoid "Argument list too long" error when passing to jq
     history_json_array=$(printf '%s\n' "${chat_history[@]}" | jq -sc 'map(select(. != null))')
     if [[ -z "$history_json_array" || "$history_json_array" == "null" || "$history_json_array" == "[]" ]]; then
         echo -e "${COLOR_ERROR}Error: Failed to create valid JSON array from history. Rolling back last user message.${COLOR_RESET}" >&2
@@ -963,25 +1011,28 @@ while true; do
         continue
     fi
 
+    # Create a temporary file for the history to pass to jq via stdin if needed,
+    # but here we use the variable in a pipe.
+    
     json_payload=""
     if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then # Gemini payload
-        json_payload=$(jq -n --argjson contents "$history_json_array" \
+        # FIX: Pipe history_json_array to jq to avoid ARG_MAX limit
+        json_payload=$(echo "$history_json_array" | jq -c -n \
             --arg temperature_str "$DEFAULT_OAI_TEMPERATURE" \
             --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
             --arg top_p_str "$DEFAULT_OAI_TOP_P" \
-            '{contents: $contents, generationConfig: {temperature: ($temperature_str | tonumber), maxOutputTokens: ($max_tokens_str | tonumber), topP: ($top_p_str | tonumber)}}'
+            'input as $contents | {contents: $contents, generationConfig: {temperature: ($temperature_str | tonumber), maxOutputTokens: ($max_tokens_str | tonumber), topP: ($top_p_str | tonumber)}}'
         )
         if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
             json_payload=$(echo "$json_payload" | jq '. + {tools: [{"urlContext": {}}, {"googleSearch": {}}]}')
         fi
     else # OpenAI-Compatible payload
          ### --- Dynamic Payload Construction --- ###
-         # Start with a base payload common to all OpenAI-compatible providers
-         base_payload=$(jq -n \
+         # FIX: Pipe history_json_array to jq to avoid ARG_MAX limit
+         base_payload=$(echo "$history_json_array" | jq -c -n \
             --arg model "$MODEL_ID" \
-            --argjson messages "$history_json_array" \
             --arg temperature_str "$DEFAULT_OAI_TEMPERATURE" \
-            '{
+            'input as $messages | {
                 model: $model,
                 messages: $messages,
                 temperature: ($temperature_str | tonumber),
@@ -991,7 +1042,7 @@ while true; do
 
          # Ollama uses a specific format with options
          if [[ "$PROVIDER" == "ollama" ]]; then
-            json_payload=$(echo "$base_payload" | jq \
+            json_payload=$(echo "$base_payload" | jq -c \
                 --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
                 --arg top_p_str "$DEFAULT_OAI_TOP_P" \
                 '. + {
@@ -1005,7 +1056,7 @@ while true; do
          # Conditionally add parameters for providers that support them.
          # TogetherAI, for example, can be sensitive to extra parameters on some models.
          elif [[ "$PROVIDER" != "together" ]]; then
-            json_payload=$(echo "$base_payload" | jq \
+            json_payload=$(echo "$base_payload" | jq -c \
                 --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
                 --arg top_p_str "$DEFAULT_OAI_TOP_P" \
                 '. + {
@@ -1035,24 +1086,28 @@ while true; do
     echo -n -e "\r${COLOR_AI}AI:${COLOR_RESET} ${COLOR_INFO}(💬 Waiting for stream...)${COLOR_RESET}"
 
     # Base curl arguments for chat
+    # FIX: Do not put -d in the array, use stdin redirection to avoid ARG_MAX
     base_chat_curl_args=(-sS -L -N -X POST "$CHAT_API_URL" -H "Content-Type: application/json" -H "Accept: application/json")
     [ -n "$CHAT_AUTH_HEADER" ] && base_chat_curl_args+=(-H "$CHAT_AUTH_HEADER")
     [ ${#CHAT_EXTRA_HEADERS[@]} -gt 0 ] && base_chat_curl_args+=("${CHAT_EXTRA_HEADERS[@]}")
-    base_chat_curl_args+=(-d "$json_payload")
 
     full_ai_response_text=""
+    full_ai_thinking_text=""  # Store thinking content separately
     local_ai_message_json="" # For this turn's AI response
     api_error_occurred=false
     stream_error_message=""
     stream_finish_reason=""
     first_chunk_received=false
 
-    # State variable for tracking if we are inside <think> tags. Reset for each turn.
+    # State variable for tracking if we are inside <think tags. Reset for each turn.
     is_thinking=false
+    # State variable for tracking if we are displaying thinking content
+    in_thinking_display=false
 
     CURL_STDERR_TEMP=$(mktemp)
     # Process substitution with proper file descriptor management
-    exec {STREAM_FD}< <(curl "${base_chat_curl_args[@]}" 2>"$CURL_STDERR_TEMP")
+    # FIX: Pass json_payload via stdin using <<< (Here String)
+    exec {STREAM_FD}< <(curl "${base_chat_curl_args[@]}" -d @- <<< "$json_payload" 2>"$CURL_STDERR_TEMP")
 
     while IFS= read -r line <&${STREAM_FD}; do
         # Handle both standard SSE format and Ollama's newline-delimited JSON
@@ -1107,12 +1162,14 @@ while true; do
 
         # Extract text chunk and finish reason
         text_chunk=""
+        thinking_chunk=""
         current_sfr=""
 
         if [[ "$IS_OPENAI_COMPATIBLE" == true ]]; then
             if [[ "$PROVIDER" == "ollama" ]]; then
-                # Ollama specific format
+                # Ollama specific format - supports native thinking field
                 text_chunk=$(echo "$json_chunk" | jq -r '.message.content // empty')
+                thinking_chunk=$(echo "$json_chunk" | jq -r '.message.thinking // empty')
                 current_sfr=$(echo "$json_chunk" | jq -r '.done // empty')
                 # Check if done is true
                 if [[ "$current_sfr" == "true" ]]; then
@@ -1123,6 +1180,8 @@ while true; do
             else
                 # Standard OpenAI format
                 text_chunk=$(echo "$json_chunk" | jq -r '.choices[0].delta.content // .choices[0].text // empty')
+                # FIX: Extract reasoning field for providers like Cerebras, Groq, OpenRouter
+                thinking_chunk=$(echo "$json_chunk" | jq -r '.choices[0].delta.reasoning // empty')
                 current_sfr=$(echo "$json_chunk" | jq -r '.choices[0].finish_reason // empty')
             fi
         else
@@ -1158,38 +1217,77 @@ while true; do
         fi
 
         # UI update for first chunk
-        if [[ "$first_chunk_received" == false && -n "$text_chunk" ]]; then
+        if [[ "$first_chunk_received" == false && ( -n "$text_chunk" || -n "$thinking_chunk" ) ]]; then
             echo -ne "\r\033[K"; echo -n -e "${COLOR_AI}AI:${COLOR_RESET}  "
             first_chunk_received=true
         fi
 
-        # Print and accumulate text with <think> tag handling
+        # Handle native thinking output (Ollama format OR OpenAI reasoning)
+        if [[ -n "$thinking_chunk" && "$ENABLE_THINKING_OUTPUT" == true ]]; then
+            full_ai_thinking_text+="$thinking_chunk"
+            
+            # Start thinking display if not already started
+            if [[ "$in_thinking_display" == false ]]; then
+                echo -n -e "${COLOR_THINK}[Thinking] "
+                in_thinking_display=true
+            fi
+            
+            echo -n -e "${COLOR_THINK}${thinking_chunk}${COLOR_RESET}"
+        fi
+
+        # Print and accumulate text with <think tag handling
         if [[ -n "$text_chunk" ]]; then
             full_ai_response_text+="$text_chunk"
 
             processing_chunk="$text_chunk"
             while [[ -n "$processing_chunk" ]]; do
                 if [[ "$is_thinking" == true ]]; then
-                    if [[ "$processing_chunk" == *"</think>"* ]]; then
-                        before_tag="${processing_chunk%%</think>*}"
-                        after_tag="${processing_chunk#*</think>}"
-                        echo -n "${before_tag}"
-                        echo -n -e "</think>${COLOR_AI}"
+                    if [[ "$processing_chunk" == *"</think"* ]]; then
+                        before_tag="${processing_chunk%%</think*}"
+                        after_tag="${processing_chunk#*</think}"
+                        # Handle closing bracket
+                        if [[ "$after_tag" == *">"* ]]; then
+                            after_tag="${after_tag#*>}"
+                        fi
+                        
+                        if [[ "$ENABLE_THINKING_OUTPUT" == true ]]; then
+                            echo -n "${before_tag}"
+                        fi
+                        if [[ "$ENABLE_THINKING_OUTPUT" == true ]]; then
+                            echo -n -e "${COLOR_RESET}\n" # End thinking block
+                            echo -n -e "${COLOR_AI}" # Switch to Green
+                        fi
                         is_thinking=false
+                        in_thinking_display=false
                         processing_chunk="$after_tag"
                     else
-                        echo -n "${processing_chunk}"
+                        if [[ "$ENABLE_THINKING_OUTPUT" == true ]]; then
+                            echo -n "${processing_chunk}"
+                        fi
                         processing_chunk=""
                     fi
                 else
-                    if [[ "$processing_chunk" == *"<think>"* ]]; then
-                        before_tag="${processing_chunk%%<think>*}"
-                        after_tag="${processing_chunk#*<think>}"
-                        echo -n "${before_tag}"
-                        echo -n -e "${COLOR_THINK}<think>"
+                    if [[ "$processing_chunk" == *"<think"* ]]; then
+                        before_tag="${processing_chunk%%<think*}"
+                        after_tag="${processing_chunk#*<think}"
+                        # Handle opening bracket
+                        if [[ "$after_tag" == *">"* ]]; then
+                            after_tag="${after_tag#*>}"
+                        fi
+                        
+                        echo -n -e "${COLOR_AI}${before_tag}"
+                        if [[ "$ENABLE_THINKING_OUTPUT" == true ]]; then
+                            echo -n -e "${COLOR_THINK}<think" # Switch to Orange
+                            in_thinking_display=true
+                        fi
                         is_thinking=true
                         processing_chunk="$after_tag"
                     else
+                        # End thinking display if we were in one and now getting regular content
+                        if [[ "$in_thinking_display" == true ]]; then
+                            echo -n -e "${COLOR_RESET}"
+                            in_thinking_display=false
+                        fi
                         echo -n -e "${COLOR_AI}${processing_chunk}"
                         processing_chunk=""
                     fi
@@ -1249,7 +1347,7 @@ while true; do
     # Strip think tags
     ai_text=$(strip_think_tags "$full_ai_response_text")
 
-    # Create AI message for history
+    # Create AI message for history (only store the actual response, not thinking)
     if [[ "$api_error_occurred" == false && -n "$ai_text" ]]; then
         if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then
             local_ai_message_json=$(jq -n --arg text "$ai_text" '{role: "model", parts: [{text: $text}]}')
