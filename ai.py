@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Universal Chat CLI – Python Edition
+Universal Chat CLI
 Pure stdlib, Python 3.8+. Zero pip installs required.
 
 Usage:
