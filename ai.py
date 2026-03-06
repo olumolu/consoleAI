@@ -85,6 +85,9 @@ ENABLE_THINKING_OUTPUT = True
 REQUEST_TIMEOUT     = 300   # Streaming chat timeout
 MODEL_FETCH_TIMEOUT = 30    # Model listing timeout
 
+# User-Agent sent with all HTTP requests (avoids Cloudflare 403 blocks)
+USER_AGENT = "PythonChatCLI/1.0"
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  ANSI COLOURS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -420,7 +423,11 @@ def truncate_history(history: list[dict], is_openai_compat: bool) -> list[dict]:
 
 def _build_request(url: str, api_key: str, provider: str,
                    data: Optional[bytes] = None) -> urllib.request.Request:
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if provider == "openrouter":
@@ -434,7 +441,8 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
     ep = ENDPOINTS[provider]
     if provider == "gemini":
         url = f"{ep['models']}?key={api_key}"
-        req = urllib.request.Request(url, method="GET")
+        req = urllib.request.Request(url, method="GET",
+                                     headers={"User-Agent": USER_AGENT})
     else:
         req = _build_request(ep["models"], api_key, provider)
 
@@ -582,7 +590,9 @@ def stream_response(provider: str, model_id: str,
     if not is_openai_compat:  # Gemini SSE endpoint
         url = f"{ep['chat_base']}{model_id}:streamGenerateContent?key={api_key}&alt=sse"
         req = urllib.request.Request(url, data=payload_bytes,
-                                     headers={"Content-Type": "application/json"}, method="POST")
+                                     headers={"Content-Type": "application/json",
+                                              "User-Agent": USER_AGENT},
+                                     method="POST")
     else:
         req = _build_request(ep["chat"], api_key, provider, data=payload_bytes)
 
