@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
 Universal Chat CLI
-Pure stdlib, Python 3.10+. Zero pip installs required.
+Pure stdlib, Python 3.9+. Zero pip installs required.
+
+Notes:
+  - Python 3.9 is the real minimum because this script uses built-in generic
+    types such as list[str] and dict[str, str].
+  - Ollama defaults to local mode at http://localhost:11434 and does not need
+    an API key unless your Ollama server is behind auth.
 
 Features:
   - Markdown rendering (Bold, Italic, Code, Fenced code blocks)
   - LaTeX rendering (Greek letters, superscripts, fractions → Unicode)
   - Image attachment support (Vision models)
+  - Multi-line input (backslash continuation + /paste mode)
   - Multi-provider support (Gemini, OpenRouter, Groq, Together, etc.)
 
 Usage:
@@ -14,6 +21,7 @@ Usage:
     ./ai.py gemini
     ./ai.py openrouter claude
     ./ai.py groq llama
+    ./ai.py ollama
 
 Providers: gemini, openrouter, groq, together, cerebras, novita, ollama
 
@@ -25,12 +33,18 @@ Chat commands:
     /upload <path>      Attach an image to your next message
     /image              Show currently attached image
     /clearimage         Remove the attached image
+    /paste [text]       Multi-line paste mode (end with ---)
     /togglethinking     Toggle reasoning/thinking output display
     /help               Show available commands
     quit / exit         End the session
+
+Multi-line input:
+    End any line with \\ to continue on the next line.
+    Use /paste for bulk paste mode.
 """
 
 import sys
+import os
 import json
 import re
 import base64
@@ -40,6 +54,13 @@ import urllib.error
 import mimetypes
 import atexit
 from pathlib import Path
+from typing import Any, Optional
+
+if sys.version_info < (3, 9):
+    sys.exit("This script requires Python 3.9 or newer.")
+
+Message = dict[str, Any]
+History = list[Message]
 
 # Try readline (not available on Windows without pyreadline3)
 try:
@@ -90,7 +111,7 @@ MODEL_FETCH_TIMEOUT = 30    # Model listing timeout
 
 # Important for Together / Cloudflare — requests without a User-Agent
 # are commonly blocked or throttled by Cloudflare's bot detection.
-USER_AGENT = "PythonChatCLI/1.0"
+USER_AGENT = "PythonChatCLI/1.1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ANSI COLOURS
@@ -130,7 +151,7 @@ def eprint(msg: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LatexRenderer:
-    """Converts simple LaTeX commands to Unicode for terminal display."""
+    """Convert a small, useful subset of LaTeX into terminal-friendly Unicode."""
 
     def __init__(self) -> None:
         self.greek = {
@@ -153,7 +174,7 @@ class LatexRenderer:
             "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐᵒᵖʳˢᵗᵘᵛʷˣ"
         )
 
-        # ── Subscript map (32 chars each) ───────────────────────────────────
+        # ── Subscript map (31 chars each) ───────────────────────────────────
         #  source: 0123456789+-=()aehijklmnoprstuvx
         #  target: ₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ
         self.sub_map = str.maketrans(
@@ -196,21 +217,25 @@ class LatexRenderer:
         # Superscripts: ^{...} or ^x
         tex = re.sub(
             r'\^\{([^}]+)\}',
-            lambda m: m.group(1).translate(self.sup_map), tex,
+            lambda m: m.group(1).translate(self.sup_map),
+            tex,
         )
         tex = re.sub(
             r'\^([a-zA-Z0-9])',
-            lambda m: m.group(1).translate(self.sup_map), tex,
+            lambda m: m.group(1).translate(self.sup_map),
+            tex,
         )
 
         # Subscripts: _{...} or _x
         tex = re.sub(
             r'_\{([^}]+)\}',
-            lambda m: m.group(1).translate(self.sub_map), tex,
+            lambda m: m.group(1).translate(self.sub_map),
+            tex,
         )
         tex = re.sub(
             r'_([a-zA-Z0-9])',
-            lambda m: m.group(1).translate(self.sub_map), tex,
+            lambda m: m.group(1).translate(self.sub_map),
+            tex,
         )
 
         # Common symbols
@@ -228,7 +253,6 @@ class LatexRenderer:
 
 
 LATEX_RENDERER = LatexRenderer()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  MARKDOWN RENDERER (With LaTeX + fenced code block support)
@@ -289,7 +313,6 @@ class MarkdownRenderer:
 
 MD_RENDERER = MarkdownRenderer()
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  PROVIDER ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -328,7 +351,6 @@ ENDPOINTS: dict[str, dict[str, str]] = {
 
 VALID_PROVIDERS = list(ENDPOINTS.keys())
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -343,8 +365,10 @@ def truncate(s: str, n: int) -> str:
 def validate_session_name(name: str) -> bool:
     """Return True if *name* is safe for use as a filename stem."""
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
-        eprint(f"{C.ERROR}Error: Session name may only contain "
-               f"letters, numbers, dash, underscore.{C.RESET}")
+        eprint(
+            f"{C.ERROR}Error: Session name may only contain "
+            f"letters, numbers, dash, underscore.{C.RESET}"
+        )
         return False
     if len(name) > 100:
         eprint(f"{C.ERROR}Error: Session name too long (max 100 chars).{C.RESET}")
@@ -353,7 +377,13 @@ def validate_session_name(name: str) -> bool:
 
 
 def check_placeholder_key(key: str, provider: str) -> bool:
-    """Return True if *key* looks valid, False (with warning) otherwise."""
+    """Return True if *key* looks valid, False (with warning) otherwise.
+
+    Ollama is special: local Ollama usually has no auth, so a blank key is valid.
+    """
+    if provider == "ollama":
+        return True
+
     msg = ""
     if not key:
         msg = "is empty"
@@ -367,13 +397,13 @@ def check_placeholder_key(key: str, provider: str) -> bool:
         msg = "looks like an incomplete Groq key"
     elif provider == "cerebras" and key == "csk-":
         msg = "is the bare Cerebras prefix"
-    elif provider in ("novita", "ollama") and len(key) < 10:
+    elif provider == "novita" and len(key) < 10:
         msg = "is too short to be valid"
 
     if msg:
         eprint(f"{C.WARN}{'!' * 68}{C.RESET}")
         eprint(f"{C.WARN}!! WARNING: API key for '{provider.upper()}' {msg}.{C.RESET}")
-        eprint(f"{C.WARN}!! Edit this script and set your real key in API_KEYS.{C.RESET}")
+        eprint(f"{C.WARN}!! Set the env var or edit API_KEYS in this script.{C.RESET}")
         eprint(f"{C.WARN}{'!' * 68}{C.RESET}")
         return False
     return True
@@ -419,12 +449,31 @@ def filter_models(models: list[str], filters: list[str]) -> list[str]:
     return result
 
 
-def _read_chunk(resp: object, size: int = 8192) -> bytes:
-    """Read from response using read1() for instant delivery, with fallback."""
+def _read_chunk(resp: Any, size: int = 8192) -> bytes:
+    """Read from response using read1() for instant delivery, with fallback.
+
+    read1() returns whatever is available immediately (up to *size* bytes)
+    without waiting for the buffer to fill — essential for streaming.
+    If read1() is unavailable (gzip-wrapped responses, proxies, etc.)
+    we fall back to read(1) which returns a single byte at a time.
+    Using read(size) here would block until *size* bytes accumulate,
+    causing output to stall or get cut mid-response.
+    """
     try:
-        return resp.read1(size)  # type: ignore[attr-defined]
+        return resp.read1(size)
     except AttributeError:
-        return resp.read(1)      # type: ignore[arg-type]
+        # Fallback for environments where read1 is not available
+        return resp.read(1)
+
+
+def _save_readline_history() -> None:
+    """Best-effort save of shell history on exit."""
+    if not _READLINE_AVAILABLE:
+        return
+    try:
+        readline.write_history_file(str(HISTORY_FILE))
+    except OSError:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -449,7 +498,8 @@ class ImageAttachment:
         return bool(self.base64)
 
     def load(self, raw_path: str) -> bool:
-        """Validate, encode and store an image.  Returns True on success."""
+        """Validate, encode, and store one image for the next user message.
+        Returns True on success."""
         path = Path(raw_path.strip("'\""))
 
         if not path.is_file():
@@ -458,11 +508,14 @@ class ImageAttachment:
 
         size_mb = path.stat().st_size / (1024 * 1024)
         if size_mb > MAX_IMAGE_SIZE_MB:
-            eprint(f"{C.ERROR}Error: Image too large "
-                   f"({size_mb:.1f} MB). Max {MAX_IMAGE_SIZE_MB} MB.{C.RESET}")
+            eprint(
+                f"{C.ERROR}Error: Image too large "
+                f"({size_mb:.1f} MB). Max {MAX_IMAGE_SIZE_MB} MB.{C.RESET}"
+            )
             return False
 
         mime, _ = mimetypes.guess_type(str(path))
+        # Fallback map for common extensions mimetypes might miss
         if not mime:
             ext_map = {
                 ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -472,8 +525,10 @@ class ImageAttachment:
             mime = ext_map.get(path.suffix.lower(), "")
 
         if mime not in SUPPORTED_MIME_TYPES:
-            eprint(f"{C.ERROR}Error: Unsupported image type '{mime}'. "
-                   f"Supported: {', '.join(sorted(SUPPORTED_MIME_TYPES))}{C.RESET}")
+            eprint(
+                f"{C.ERROR}Error: Unsupported image type '{mime}'. "
+                f"Supported: {', '.join(sorted(SUPPORTED_MIME_TYPES))}{C.RESET}"
+            )
             return False
 
         eprint(f"{C.IMAGE}Encoding image…{C.RESET}")
@@ -483,8 +538,10 @@ class ImageAttachment:
             self.mime   = mime
             self.path   = str(path)
             size_kb = len(raw) // 1024
-            eprint(f"{C.IMAGE}✓ Attached: {path.name} "
-                   f"({mime}, {size_kb} KB){C.RESET}")
+            eprint(
+                f"{C.IMAGE}✓ Attached: {path.name} "
+                f"({mime}, {size_kb} KB){C.RESET}"
+            )
             return True
         except OSError as exc:
             eprint(f"{C.ERROR}Error reading image: {exc}{C.RESET}")
@@ -500,20 +557,21 @@ def _session_path(name: str) -> Path:
     return SESSION_DIR / f"{name}.json"
 
 
-def save_session(name: str, history: list[dict]) -> None:
+def save_session(name: str, history: History) -> None:
     """Persist conversation history to a JSON file."""
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     path = _session_path(name)
     try:
         path.write_text(
-            json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(history, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
         cprint(f"{C.INFO}Session saved → {path}{C.RESET}")
     except OSError as exc:
         eprint(f"{C.ERROR}Error saving session: {exc}{C.RESET}")
 
 
-def _validate_session_data(data: object) -> str:
+def _validate_session_data(data: Any) -> str:
     """Return '' if *data* is a valid session, or an error description."""
     if not isinstance(data, list):
         return "not a JSON array"
@@ -530,13 +588,13 @@ def _validate_session_data(data: object) -> str:
             has_content = isinstance(msg.get("content"), (str, list))
             has_parts   = isinstance(msg.get("parts"), list)
             if not has_content and not has_parts:
-                return f"message role='{role}' has no content or parts"
+                return "message role='%s' has no content or parts" % role
         else:
-            return f"unknown role '{role}'"
+            return "unknown role '%s'" % role
     return ""
 
 
-def load_session(name: str) -> list[dict] | None:
+def load_session(name: str) -> Optional[History]:
     """Load a saved session by name.  Returns None on any error."""
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     path = _session_path(name)
@@ -548,10 +606,12 @@ def load_session(name: str) -> list[dict] | None:
     except (OSError, json.JSONDecodeError) as exc:
         eprint(f"{C.ERROR}Error reading session: {exc}{C.RESET}")
         return None
+
     err = _validate_session_data(data)
     if err:
         eprint(f"{C.ERROR}Session is corrupt ({err}). Cannot load.{C.RESET}")
         return None
+
     cprint(f"{C.INFO}Session loaded ← {path}  ({len(data)} messages){C.RESET}")
     return data
 
@@ -561,19 +621,25 @@ def clear_sessions() -> None:
     if not SESSION_DIR.exists():
         cprint(f"{C.INFO}No saved sessions to clear.{C.RESET}")
         return
+
     files = sorted(SESSION_DIR.glob("*.json"))
     if not files:
         cprint(f"{C.INFO}No saved sessions to clear.{C.RESET}")
         return
-    cprint(f"{C.WARN}This will permanently delete all sessions "
-           f"in {SESSION_DIR}:{C.RESET}")
+
+    cprint(
+        f"{C.WARN}This will permanently delete all sessions "
+        f"in {SESSION_DIR}:{C.RESET}"
+    )
     for f in files:
         cprint(f"  {f.stem}")
+
     try:
         answer = input(f"{C.WARN}Continue? (y/N): {C.RESET}").strip().lower()
     except (EOFError, KeyboardInterrupt):
         cprint(f"\n{C.INFO}Cancelled.{C.RESET}")
         return
+
     if answer == "y":
         for f in files:
             f.unlink(missing_ok=True)
@@ -586,18 +652,22 @@ def clear_sessions() -> None:
 #  HISTORY MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def init_history(is_openai_compat: bool) -> list[dict]:
+def init_history(is_openai_compat: bool) -> History:
     """Create a fresh history list, optionally seeded with a system prompt."""
     if SYSTEM_PROMPT and is_openai_compat:
         return [{"role": "system", "content": SYSTEM_PROMPT}]
     return []
 
 
-def truncate_history(history: list[dict], is_openai_compat: bool) -> list[dict]:
-    """Trim history to MAX_HISTORY_MESSAGES conversational turns."""
+def truncate_history(history: History, is_openai_compat: bool) -> History:
+    """Trim context to the configured history size.
+
+    Gemini expects a clean user/model alternation, so when trimming Gemini
+    history we remove turns in pairs.
+    """
     system_offset = (
         1
-        if (is_openai_compat and history and history[0].get("role") == "system")
+        if is_openai_compat and history and history[0].get("role") == "system"
         else 0
     )
     max_total = MAX_HISTORY_MESSAGES + system_offset
@@ -623,7 +693,7 @@ def _build_request(
     url: str,
     api_key: str,
     provider: str,
-    data: bytes | None = None,
+    data: Optional[bytes] = None,
 ) -> urllib.request.Request:
     """Build an HTTP request with auth, User-Agent, and provider headers."""
     headers: dict[str, str] = {
@@ -641,7 +711,7 @@ def _build_request(
     return urllib.request.Request(url, data=data, headers=headers, method=method)
 
 
-def fetch_models(provider: str, api_key: str) -> list[str] | None:
+def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
     """Fetch available model IDs from the provider.  Returns None on error."""
     ep = ENDPOINTS[provider]
     if provider == "gemini":
@@ -659,8 +729,10 @@ def fetch_models(provider: str, api_key: str) -> list[str] | None:
             body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        eprint(f"{C.ERROR}HTTP {exc.code} fetching models: "
-               f"{truncate(body, 200)}{C.RESET}")
+        eprint(
+            f"{C.ERROR}HTTP {exc.code} fetching models: "
+            f"{truncate(body, 200)}{C.RESET}"
+        )
         return None
     except OSError as exc:
         eprint(f"{C.ERROR}Network error fetching models: {exc}{C.RESET}")
@@ -723,9 +795,13 @@ def build_user_message(
     provider: str,
     is_openai_compat: bool,
     is_first: bool,
-) -> dict:
+) -> Message:
     """Construct the user turn dict, injecting system prompt for Gemini on
-    turn 1."""
+    turn 1.
+
+    Gemini uses `parts`, while OpenAI-compatible APIs use `content`.
+    For Gemini, the system prompt is folded into the first user turn.
+    """
     prompt = text
 
     if image.attached:
@@ -758,26 +834,28 @@ def build_user_message(
                     }},
                 ],
             }
-    else:
-        if not is_openai_compat:          # Gemini text-only
-            if is_first and SYSTEM_PROMPT:
-                prompt = f"{SYSTEM_PROMPT}\n\nUser: {text}"
-            return {"role": "user", "parts": [{"text": prompt}]}
-        else:
-            return {"role": "user", "content": prompt}
+
+    # Text-only messages
+    if not is_openai_compat:              # Gemini text-only
+        if is_first and SYSTEM_PROMPT:
+            prompt = f"{SYSTEM_PROMPT}\n\nUser: {text}"
+        return {"role": "user", "parts": [{"text": prompt}]}
+
+    return {"role": "user", "content": prompt}
 
 
 def build_payload(
     provider: str,
     model_id: str,
-    history: list[dict],
+    history: History,
     is_openai_compat: bool,
     enable_tools: bool,
-) -> dict:
+) -> dict[str, Any]:
     """Build the full API request payload for the given provider."""
     if not is_openai_compat:              # Gemini
+        # Gemini doesn't use a "system" role entry
         contents = [m for m in history if m.get("role") != "system"]
-        payload: dict = {
+        payload: dict[str, Any] = {
             "contents": contents,
             "generationConfig": {
                 "temperature":     DEFAULT_TEMPERATURE,
@@ -790,21 +868,23 @@ def build_payload(
         return payload
 
     # OpenAI-compatible base
-    payload = {
+    oai_payload: dict[str, Any] = {
         "model":       model_id,
         "messages":    history,
         "temperature": DEFAULT_TEMPERATURE,
         "stream":      True,
     }
+
     if provider == "ollama":
-        payload["options"] = {
+        oai_payload["options"] = {
             "num_predict": DEFAULT_MAX_TOKENS,
             "top_p":       DEFAULT_TOP_P,
         }
-    elif provider != "together":
-        payload["max_tokens"] = DEFAULT_MAX_TOKENS
-        payload["top_p"]      = DEFAULT_TOP_P
-    return payload
+    elif provider != "together":          # Together is sensitive to extra params
+        oai_payload["max_tokens"] = DEFAULT_MAX_TOKENS
+        oai_payload["top_p"]      = DEFAULT_TOP_P
+
+    return oai_payload
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -814,19 +894,24 @@ def build_payload(
 def stream_response(
     provider: str,
     model_id: str,
-    history: list[dict],
+    history: History,
     is_openai_compat: bool,
     api_key: str,
     enable_tools: bool,
     enable_thinking: bool,
-) -> str | None:
-    """
-    Send the current history to the API and stream the reply to the terminal.
+) -> Optional[str]:
+    """Send the current history to the API and stream the reply to the terminal.
     Returns the assistant reply text (think-tags stripped) on success, or None.
 
     Text is streamed through a line buffer so complete lines can be rendered
     with Markdown/LaTeX formatting.  <think> tags are handled with a state
     machine that optionally displays reasoning in orange.
+
+    The outer loop uses a plain ``while True`` and breaks only when the
+    connection returns empty bytes (EOF).  Inner breaks (on [DONE], errors,
+    finish reasons) exit the inner line-parsing loop; the outer loop then
+    reads one more empty chunk and exits naturally.  This avoids a flag-based
+    early exit that could skip unprocessed lines still sitting in the buffer.
     """
     payload = build_payload(
         provider, model_id, history, is_openai_compat, enable_tools
@@ -834,7 +919,7 @@ def stream_response(
     payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     ep = ENDPOINTS[provider]
-    if not is_openai_compat:  # Gemini SSE endpoint
+    if not is_openai_compat:              # Gemini SSE endpoint
         url = (
             f"{ep['chat_base']}{model_id}:streamGenerateContent"
             f"?key={api_key}&alt=sse"
@@ -855,16 +940,15 @@ def stream_response(
     sys.stdout.flush()
 
     # ── State ────────────────────────────────────────────────────────────────
-    full_text       = ""
-    full_thinking   = ""
-    first_chunk     = True
-    is_thinking     = False
-    in_think_disp   = False
-    finish_reason   = ""
-    error_msg       = ""
-    interrupted     = False
-    line_buffer     = ""
-    stream_done     = False
+    full_text     = ""     # accumulates everything (including think tags)
+    full_thinking = ""     # native thinking field
+    first_chunk   = True
+    is_thinking   = False
+    in_think_disp = False
+    finish_reason = ""
+    error_msg     = ""
+    interrupted   = False
+    line_buffer   = ""     # partial line waiting for a newline
 
     # Reset markdown renderer state (in case previous response was interrupted
     # mid-code-block)
@@ -872,6 +956,7 @@ def stream_response(
 
     # ── Helper: flush normal text through the markdown line buffer ───────────
     def _flush_text(text: str) -> None:
+        """Render complete lines immediately; keep the last partial line buffered."""
         nonlocal line_buffer
         to_process = text
         while to_process:
@@ -891,16 +976,18 @@ def stream_response(
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             buffer = ""
-            while not stream_done:
-                # Read with instant delivery
+            while True:
+                # Read with instant delivery — read1() or read(1) fallback
                 try:
                     raw = _read_chunk(resp)
                 except KeyboardInterrupt:
                     interrupted = True
                     cprint(f"\n{C.WARN}(Stream interrupted by user){C.RESET}")
                     break
+
                 if not raw:
                     break
+
                 buffer += raw.decode("utf-8", errors="replace")
 
                 # Split on newlines, keep incomplete tail in buffer
@@ -913,7 +1000,6 @@ def stream_response(
                     if line.startswith("data: "):
                         json_chunk = line[6:].strip()
                         if json_chunk == "[DONE]":
-                            stream_done = True
                             break
                     elif line.startswith("{"):
                         json_chunk = line
@@ -938,7 +1024,6 @@ def stream_response(
                         chunk_err = obj["detail"]
                     if chunk_err:
                         error_msg = f"API error: {chunk_err}"
-                        stream_done = True
                         break
 
                     # ── Extract text / thinking / finish_reason ─────────
@@ -978,7 +1063,6 @@ def stream_response(
                                 f"Content blocked "
                                 f"(reason: {pf['blockReason']})"
                             )
-                            stream_done = True
                             break
 
                         content_obj = candidate.get("content", {})
@@ -1000,7 +1084,7 @@ def stream_response(
                             if blocked:
                                 cur_finish = "SAFETY"
 
-                        # Tool calls (informational only)
+                        # Tool calls (informational only — not auto-executed)
                         if enable_tools and part_list:
                             tool_parts = [
                                 p for p in part_list if "functionCall" in p
@@ -1032,7 +1116,7 @@ def stream_response(
                         sys.stdout.write(f"{C.AI}AI:{C.RESET}  ")
                         first_chunk = False
 
-                    # ── Native thinking field (Ollama / OpenAI reasoning)
+                    # ── Native thinking field (Ollama / OpenAI reasoning) ──
                     if think_tok:
                         full_thinking += think_tok
                         if enable_thinking:
@@ -1045,12 +1129,16 @@ def stream_response(
                             sys.stdout.flush()
 
                     # ── Text token with <think> state machine ───────────
+                    # Some models send hidden reasoning inside <think> tags
+                    # mixed into the normal text stream, so we peel those
+                    # out with a small state machine.
                     if text_tok:
                         full_text += text_tok
                         remaining = text_tok
 
                         while remaining:
                             if is_thinking:
+                                # Currently inside a <think> block
                                 close = remaining.find("</think")
                                 if close != -1:
                                     think_before = remaining[:close]
@@ -1067,13 +1155,13 @@ def stream_response(
                                             f"{think_before}"
                                             f"{C.RESET}"
                                         )
-                                    sys.stdout.write(f"{C.RESET}\n")
+                                    sys.stdout.write(f"{C.RESET}\n\n")
                                     sys.stdout.flush()
                                     is_thinking   = False
                                     in_think_disp = False
                                     remaining     = after
                                 else:
-                                    # Still inside thinking
+                                    # Still inside thinking — no close yet
                                     if enable_thinking:
                                         sys.stdout.write(
                                             f"{C.THINK}"
@@ -1083,6 +1171,7 @@ def stream_response(
                                         sys.stdout.flush()
                                     remaining = ""
                             else:
+                                # Normal text — look for opening <think>
                                 open_idx = remaining.find("<think")
                                 if open_idx != -1:
                                     before = remaining[:open_idx]
@@ -1135,12 +1224,10 @@ def stream_response(
                                 f"Stream ended by API "
                                 f"(reason: {finish_reason})"
                             )
-                        stream_done = True
                         break
 
                     # ── Ollama stop ─────────────────────────────────────
                     if provider == "ollama" and finish_reason == "stop":
-                        stream_done = True
                         break
 
     except KeyboardInterrupt:
@@ -1164,7 +1251,7 @@ def stream_response(
 
     # ── Post-stream ─────────────────────────────────────────────────────────
 
-    # Flush remaining line buffer
+    # Flush remaining line buffer (partial line that never got a newline)
     if line_buffer:
         rendered = MD_RENDERER.render_line(line_buffer)
         sys.stdout.write(f"{C.AI}{rendered}{C.RESET}\n")
@@ -1205,7 +1292,7 @@ def stream_response(
 #  HISTORY DISPLAY HELPER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_display_text(msg: dict) -> str:
+def _extract_display_text(msg: Message) -> str:
     """Extract readable text from any message format for /history display."""
     raw = msg.get("content") or msg.get("parts", [{}])
 
@@ -1240,6 +1327,66 @@ def _extract_display_text(msg: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  MULTI-LINE INPUT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def read_multiline_input(
+    initial_prompt: str, cont_prompt: str = "  .. "
+) -> Optional[str]:
+    """Read user input with backslash line-continuation.
+
+    If a line ends with '\\', reading continues on the next line.
+    Lines are joined with newlines.  Returns None on EOF/interrupt.
+    """
+    try:
+        line = input(initial_prompt)
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+    lines: list[str] = []
+    while line.endswith("\\"):
+        lines.append(line[:-1])
+        try:
+            line = input(cont_prompt)
+        except (EOFError, KeyboardInterrupt):
+            lines.append("")
+            return "\n".join(lines).strip()
+
+    lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def read_paste_input(prefix: str = "") -> Optional[str]:
+    """Paste mode: read lines until '---' appears on its own line.
+
+    *prefix* (from ``/paste some text``) is prepended to the result.
+    Returns None if cancelled with no content.
+    """
+    cprint(
+        f"{C.INFO}Paste mode — type or paste lines, "
+        f"then {C.BOLD}---{C.RESET}{C.INFO} on its own line to send:{C.RESET}"
+    )
+    lines: list[str] = []
+    while True:
+        try:
+            line = input(f"  {C.DIM}│{C.RESET} ")
+        except (EOFError, KeyboardInterrupt):
+            cprint(f"\n{C.INFO}(Paste cancelled){C.RESET}")
+            return "\n".join(lines).strip() if lines else None
+        if line.strip() == "---":
+            break
+        lines.append(line)
+
+    body = "\n".join(lines).strip()
+    if not body:
+        return None
+    cprint(f"{C.INFO}({len(lines)} lines captured){C.RESET}")
+    if prefix:
+        return f"{prefix}\n\n{body}"
+    return body
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  USAGE / HELP
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1261,9 +1408,14 @@ def print_usage() -> None:
   {C.BOLD}/upload <path>{C.RESET}      Attach an image {C.IMAGE}(vision models){C.RESET}
   {C.BOLD}/image{C.RESET}              Show attached image info
   {C.BOLD}/clearimage{C.RESET}         Remove attached image
+  {C.BOLD}/paste [text]{C.RESET}       Multi-line paste mode (end with ---)
   {C.BOLD}/togglethinking{C.RESET}     Toggle reasoning display {C.THINK}(reasoning models){C.RESET}
   {C.BOLD}/help{C.RESET}               Show this help
   {C.BOLD}quit{C.RESET} / {C.BOLD}exit{C.RESET}          End session
+
+{C.INFO}Multi-line input:{C.RESET}
+  End any line with {C.BOLD}\\{C.RESET} to continue on the next line.
+  Use {C.BOLD}/paste{C.RESET} for bulk paste mode (terminated by {C.BOLD}---{C.RESET}).
 
 {C.INFO}Features:{C.RESET}
   • Markdown rendering (Bold, Italic, Inline code, Fenced code blocks)
@@ -1286,7 +1438,13 @@ def print_usage() -> None:
   Displays reasoning/thinking content from supported models in orange.
   Toggle with {C.BOLD}/togglethinking{C.RESET} during chat.
 
-{C.WARN}Set your API keys in the API_KEYS dict at the top of this script.{C.RESET}""")
+{C.INFO}Ollama:{C.RESET}
+  Blank API key is valid for local Ollama.
+  Edit ENDPOINTS["ollama"] at the top of this script to change the URL.
+
+{C.WARN}Set your API keys via environment variables or in the API_KEYS dict.{C.RESET}
+{C.INFO}Env vars:{C.RESET} GEMINI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY,
+         TOGETHER_API_KEY, CEREBRAS_API_KEY, NOVITA_API_KEY, OLLAMA_API_KEY""")
 
 
 def print_chat_help() -> None:
@@ -1299,9 +1457,12 @@ def print_chat_help() -> None:
   {C.BOLD}/upload <path>{C.RESET}      Attach image
   {C.BOLD}/image{C.RESET}              Show attached image
   {C.BOLD}/clearimage{C.RESET}         Remove image
+  {C.BOLD}/paste [text]{C.RESET}       Multi-line paste mode (end with ---)
   {C.BOLD}/togglethinking{C.RESET}     Toggle reasoning display
   {C.BOLD}/help{C.RESET}               Show this help
-  {C.BOLD}quit{C.RESET} / {C.BOLD}exit{C.RESET}          End session""")
+  {C.BOLD}quit{C.RESET} / {C.BOLD}exit{C.RESET}          End session
+{C.INFO}Multi-line:{C.RESET}
+  End any line with {C.BOLD}\\{C.RESET} to continue on the next line.""")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1325,25 +1486,27 @@ def chat_loop(
                 readline.read_history_file(str(HISTORY_FILE))
             except OSError:
                 pass
-        atexit.register(
-            lambda: readline.write_history_file(str(HISTORY_FILE))
-        )
+        atexit.register(_save_readline_history)
 
     # ── state ────────────────────────────────────────────────────────────────
-    history:      list[dict]      = init_history(is_openai_compat)
-    image:        ImageAttachment = ImageAttachment()
-    first_msg:    bool            = True
-    thinking_on:  bool            = ENABLE_THINKING_OUTPUT
+    history:     History          = init_history(is_openai_compat)
+    image:       ImageAttachment  = ImageAttachment()
+    first_msg:   bool             = True
+    thinking_on: bool             = ENABLE_THINKING_OUTPUT
 
     # ── startup banner ───────────────────────────────────────────────────────
     sep = "─" * 85
     cprint(f"\n{sep}")
-    cprint(f"  {C.INFO}Provider:{C.RESET}  {provider.upper()}   "
-           f"{C.INFO}Model:{C.RESET}  {model_id}")
-    cprint(f"  {C.INFO}History:{C.RESET}   last {MAX_HISTORY_MESSAGES} turns  │  "
-           f"{C.INFO}Temp:{C.RESET} {DEFAULT_TEMPERATURE}  │  "
-           f"{C.INFO}Tokens:{C.RESET} {DEFAULT_MAX_TOKENS}  │  "
-           f"{C.INFO}TopP:{C.RESET} {DEFAULT_TOP_P}")
+    cprint(
+        f"  {C.INFO}Provider:{C.RESET}  {provider.upper()}   "
+        f"{C.INFO}Model:{C.RESET}  {model_id}"
+    )
+    cprint(
+        f"  {C.INFO}History:{C.RESET}   last {MAX_HISTORY_MESSAGES} turns  │  "
+        f"{C.INFO}Temp:{C.RESET} {DEFAULT_TEMPERATURE}  │  "
+        f"{C.INFO}Tokens:{C.RESET} {DEFAULT_MAX_TOKENS}  │  "
+        f"{C.INFO}TopP:{C.RESET} {DEFAULT_TOP_P}"
+    )
     cprint(f"  {C.INFO}Max message:{C.RESET}  {MAX_MESSAGE_LENGTH:,} characters")
     if SYSTEM_PROMPT:
         label = (
@@ -1359,16 +1522,28 @@ def chat_loop(
             f"{C.BOLD}enabled{C.RESET}" if enable_tools else "disabled"
         )
         cprint(f"  {C.INFO}Tool calling:{C.RESET}  {status}")
+    if provider == "ollama":
+        # Derive display URL from the configured endpoint
+        ollama_url = ENDPOINTS["ollama"]["chat"].rsplit("/api/", 1)[0]
+        cprint(f"  {C.INFO}Ollama URL:{C.RESET}  {ollama_url}")
     cprint(f"  {C.INFO}Rendering:{C.RESET}   Markdown + LaTeX → Unicode")
     think_status = (
         f"{C.BOLD}{C.THINK}enabled{C.RESET}"
         if thinking_on
         else "disabled"
     )
-    cprint(f"  {C.INFO}Thinking output:{C.RESET}  {think_status}  "
-           f"(toggle: /togglethinking)")
-    cprint(f"  Type {C.BOLD}quit{C.RESET} or {C.BOLD}exit{C.RESET} to end  │  "
-           f"{C.BOLD}/help{C.RESET} for all commands")
+    cprint(
+        f"  {C.INFO}Thinking output:{C.RESET}  {think_status}  "
+        f"(toggle: /togglethinking)"
+    )
+    cprint(
+        f"  {C.INFO}Input:{C.RESET}   end line with {C.BOLD}\\{C.RESET} "
+        f"to continue  │  {C.BOLD}/paste{C.RESET} for multi-line"
+    )
+    cprint(
+        f"  Type {C.BOLD}quit{C.RESET} or {C.BOLD}exit{C.RESET} to end  │  "
+        f"{C.BOLD}/help{C.RESET} for all commands"
+    )
     cprint(sep + "\n")
 
     # ── REPL ─────────────────────────────────────────────────────────────────
@@ -1381,11 +1556,11 @@ def chat_loop(
         )
         prompt = f"{img_tag}{C.BOLD}{C.USER}You:{C.RESET} "
 
-        try:
-            user_input = input(prompt).strip()
-        except (EOFError, KeyboardInterrupt):
+        raw = read_multiline_input(prompt)
+        if raw is None:
             cprint(f"\n{C.INFO}Ending session.{C.RESET}")
             break
+        user_input = raw
 
         # ── Exit ─────────────────────────────────────────────────────────
         if user_input.lower() in ("quit", "exit"):
@@ -1397,7 +1572,17 @@ def chat_loop(
             cmd   = parts[0].lower()
             args  = parts[1].strip() if len(parts) > 1 else ""
 
-            if cmd == "/help":
+            handled = True   # assume it's a command that doesn't send
+
+            if cmd == "/paste":
+                pasted = read_paste_input(prefix=args)
+                if pasted:
+                    user_input = pasted
+                    handled = False   # fall through to send logic
+                else:
+                    cprint(f"{C.INFO}Nothing to send.{C.RESET}")
+
+            elif cmd == "/help":
                 print_chat_help()
 
             elif cmd == "/upload":
@@ -1408,8 +1593,10 @@ def chat_loop(
 
             elif cmd == "/image":
                 if image.attached:
-                    cprint(f"{C.IMAGE}Attached: {image.path}  "
-                           f"({image.mime}){C.RESET}")
+                    cprint(
+                        f"{C.IMAGE}Attached: {image.path}  "
+                        f"({image.mime}){C.RESET}"
+                    )
                 else:
                     cprint(f"{C.IMAGE}No image attached.{C.RESET}")
 
@@ -1427,8 +1614,10 @@ def chat_loop(
                 cprint(f"{C.INFO}Thinking output {state}.{C.RESET}")
 
             elif cmd == "/history":
-                cprint(f"{C.INFO}── History ({len(history)} messages) "
-                       f"─────────────────────{C.RESET}")
+                cprint(
+                    f"{C.INFO}── History ({len(history)} messages) "
+                    f"─────────────────────{C.RESET}"
+                )
                 if not history:
                     cprint("  (empty)")
                 for msg in history:
@@ -1439,10 +1628,14 @@ def chat_loop(
                         else C.AI if role in ("assistant", "model")
                         else C.WARN
                     )
-                    cprint(f"  {colour}[{role}]{C.RESET}  "
-                           f"{truncate(text, 500)}")
-                cprint(f"{C.INFO}──────────────────────────────"
-                       f"─────────────────────{C.RESET}")
+                    cprint(
+                        f"  {colour}[{role}]{C.RESET}  "
+                        f"{truncate(text, 500)}"
+                    )
+                cprint(
+                    f"{C.INFO}──────────────────────────────"
+                    f"─────────────────────{C.RESET}"
+                )
 
             elif cmd == "/save":
                 if not args:
@@ -1463,10 +1656,13 @@ def chat_loop(
                 clear_sessions()
 
             else:
-                eprint(f"{C.WARN}Unknown command '{cmd}'. "
-                       f"Type /help for a list.{C.RESET}")
+                eprint(
+                    f"{C.WARN}Unknown command '{cmd}'. "
+                    f"Type /help for a list.{C.RESET}"
+                )
 
-            continue   # all slash commands skip to next prompt
+            if handled:
+                continue   # command handled, skip to next prompt
 
         # ── Guard: empty input ───────────────────────────────────────────
         if not user_input and not image.attached:
@@ -1478,9 +1674,11 @@ def chat_loop(
 
         # Length guard
         if len(user_input) > MAX_MESSAGE_LENGTH:
-            eprint(f"{C.ERROR}Message too long "
-                   f"({len(user_input):,} chars, "
-                   f"max {MAX_MESSAGE_LENGTH:,}).{C.RESET}")
+            eprint(
+                f"{C.ERROR}Message too long "
+                f"({len(user_input):,} chars, "
+                f"max {MAX_MESSAGE_LENGTH:,}).{C.RESET}"
+            )
             continue
 
         eprint(f"{C.INFO}[Sending…]{C.RESET}")
@@ -1512,8 +1710,10 @@ def chat_loop(
             # Rollback the user message on failure
             if history and history[-1].get("role") == "user":
                 history.pop()
-                eprint(f"{C.WARN}(User message rolled back "
-                       f"due to error){C.RESET}")
+                eprint(
+                    f"{C.WARN}(User message rolled back "
+                    f"due to error){C.RESET}"
+                )
 
         cprint("")   # blank line between turns
 
@@ -1545,8 +1745,10 @@ def main() -> None:
     filters  = argv[1:]
 
     if provider not in VALID_PROVIDERS:
-        cprint(f"{C.ERROR}Unknown provider '{provider}'. "
-               f"Choose from: {', '.join(VALID_PROVIDERS)}{C.RESET}")
+        cprint(
+            f"{C.ERROR}Unknown provider '{provider}'. "
+            f"Choose from: {', '.join(VALID_PROVIDERS)}{C.RESET}"
+        )
         sys.exit(1)
 
     api_key = API_KEYS.get(provider, "")
@@ -1588,10 +1790,14 @@ def main() -> None:
         models = filter_models(models, filters)
 
     if not models:
-        cprint(f"{C.ERROR}No models matched filter: "
-               f"{' '.join(filters)}{C.RESET}")
-        cprint(f"{C.INFO}Tip: filters use word-boundary matching "
-               f"('3' matches 'gpt-3' but not '13b').{C.RESET}")
+        cprint(
+            f"{C.ERROR}No models matched filter: "
+            f"{' '.join(filters)}{C.RESET}"
+        )
+        cprint(
+            f"{C.INFO}Tip: filters use word-boundary matching "
+            f"('3' matches 'gpt-3' but not '13b').{C.RESET}"
+        )
         sys.exit(1)
 
     # ── Model selection ──────────────────────────────────────────────────
@@ -1612,13 +1818,15 @@ def main() -> None:
             if choice.isdigit() and 1 <= int(choice) <= len(models):
                 model_id = models[int(choice) - 1]
                 break
-            eprint(f"{C.WARN}Enter a number between 1 "
-                   f"and {len(models)}.{C.RESET}")
+            eprint(
+                f"{C.WARN}Enter a number between 1 "
+                f"and {len(models)}.{C.RESET}"
+            )
 
     cprint(f"{C.INFO}Using model:{C.RESET} {model_id}\n")
 
     # ── Graceful Ctrl-C outside of streaming ─────────────────────────────
-    def _sigint_handler(sig: int, frame: object) -> None:
+    def _sigint_handler(sig: int, frame: Any) -> None:
         cprint(f"\n{C.WARN}Interrupted.{C.RESET}")
         sys.exit(130)
 
