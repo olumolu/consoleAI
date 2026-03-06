@@ -1240,7 +1240,9 @@ def print_usage() -> None:
   {C.AI}python {me} gemini{C.RESET}
   {C.AI}python {me} openrouter claude{C.RESET}
   {C.AI}python {me} groq llama{C.RESET}
-  {C.AI}python {me} ollama{C.RESET}
+  {C.AI}python {me} together{C.RESET}
+  {C.AI}python {me} novita{C.RESET}
+  {C.AI}python {me} cerebras{C.RESET}
 
 {C.IMAGE}Image support:{C.RESET}
   Supports JPEG, PNG, GIF, WebP. Max {MAX_IMAGE_SIZE_MB} MB per image.
