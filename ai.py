@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Universal Chat CLI
-Pure stdlib, Python 3.8+. Zero pip installs required.
+Pure stdlib, Python 3.10+. Zero pip installs required.
 
 Features:
   - Markdown rendering (Bold, Italic, Code, Fenced code blocks)
   - LaTeX rendering (Greek letters, superscripts, fractions → Unicode)
   - Image attachment support (Vision models)
-  - Multi-provider support (Gemini, OpenRouter, Groq, etc.)
+  - Multi-provider support (Gemini, OpenRouter, Groq, Together, etc.)
 
 Usage:
     python ai.py <provider> [filter]...
@@ -40,7 +40,6 @@ import urllib.error
 import mimetypes
 import atexit
 from pathlib import Path
-from typing import Optional
 
 # Try readline (not available on Windows without pyreadline3)
 try:
@@ -89,11 +88,16 @@ ENABLE_THINKING_OUTPUT = True
 REQUEST_TIMEOUT     = 300   # Streaming chat timeout
 MODEL_FETCH_TIMEOUT = 30    # Model listing timeout
 
+# Important for Together / Cloudflare — requests without a User-Agent
+# are commonly blocked or throttled by Cloudflare's bot detection.
+USER_AGENT = "PythonChatCLI/1.0"
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  ANSI COLOURS
 # ─────────────────────────────────────────────────────────────────────────────
 
 class C:
+    """ANSI escape codes for coloured terminal output."""
     RESET  = "\033[0m"
     USER   = "\033[38;5;199m"   # bright magenta
     AI     = "\033[38;5;40m"    # bright green
@@ -128,7 +132,7 @@ def eprint(msg: str) -> None:
 class LatexRenderer:
     """Converts simple LaTeX commands to Unicode for terminal display."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.greek = {
             "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ",
             "epsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ",
@@ -177,6 +181,7 @@ class LatexRenderer:
         return text
 
     def _convert(self, tex: str) -> str:
+        """Convert a single LaTeX expression to Unicode."""
         if not tex:
             return ""
         tex = tex.strip()
@@ -232,7 +237,7 @@ LATEX_RENDERER = LatexRenderer()
 class MarkdownRenderer:
     """Line-by-line Markdown → ANSI renderer with code-block awareness."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.bold_pat   = re.compile(r'\*\*(.+?)\*\*')
         self.italic_pat = re.compile(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)')
         self.code_pat   = re.compile(r'`([^`]+)`')
@@ -315,7 +320,7 @@ ENDPOINTS: dict[str, dict[str, str]] = {
         "models": "https://api.novita.ai/v3/openai/models",
     },
     "ollama": {
-        # Swap to http://localhost:11434 for local Ollama.com
+        # Swap to http://localhost:11434 for local Ollama
         "chat":   "https://ollama.com/api/chat",
         "models": "https://ollama.com/api/tags",
     },
@@ -323,17 +328,20 @@ ENDPOINTS: dict[str, dict[str, str]] = {
 
 VALID_PROVIDERS = list(ENDPOINTS.keys())
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def truncate(s: str, n: int) -> str:
+    """Shorten string *s* to at most *n* characters, adding '…' if cut."""
     if not s:
         return ""
     return s[:n - 3] + "..." if len(s) > n else s
 
 
 def validate_session_name(name: str) -> bool:
+    """Return True if *name* is safe for use as a filename stem."""
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
         eprint(f"{C.ERROR}Error: Session name may only contain "
                f"letters, numbers, dash, underscore.{C.RESET}")
@@ -345,7 +353,7 @@ def validate_session_name(name: str) -> bool:
 
 
 def check_placeholder_key(key: str, provider: str) -> bool:
-    """Returns True if key looks valid, False (with warning) otherwise."""
+    """Return True if *key* looks valid, False (with warning) otherwise."""
     msg = ""
     if not key:
         msg = "is empty"
@@ -397,7 +405,7 @@ def filter_models(models: list[str], filters: list[str]) -> list[str]:
     if not filters:
         return models
     eprint(f"{C.INFO}Filtering with: {' '.join(filters)}  (word-boundary){C.RESET}")
-    result = []
+    result: list[str] = []
     for model in models:
         ml = model.lower()
         if all(
@@ -411,12 +419,12 @@ def filter_models(models: list[str], filters: list[str]) -> list[str]:
     return result
 
 
-def _read_chunk(resp, size: int = 8192) -> bytes:
+def _read_chunk(resp: object, size: int = 8192) -> bytes:
     """Read from response using read1() for instant delivery, with fallback."""
     try:
-        return resp.read1(size)
+        return resp.read1(size)  # type: ignore[attr-defined]
     except AttributeError:
-        return resp.read(1)
+        return resp.read(1)      # type: ignore[arg-type]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -424,16 +432,20 @@ def _read_chunk(resp, size: int = 8192) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ImageAttachment:
-    def __init__(self):
+    """Holds a base64-encoded image for attachment to the next message."""
+
+    def __init__(self) -> None:
         self.path   = ""
         self.base64 = ""
         self.mime   = ""
 
-    def clear(self):
+    def clear(self) -> None:
+        """Remove the currently attached image."""
         self.path = self.base64 = self.mime = ""
 
     @property
     def attached(self) -> bool:
+        """True when an image is loaded and ready to send."""
         return bool(self.base64)
 
     def load(self, raw_path: str) -> bool:
@@ -484,10 +496,12 @@ class ImageAttachment:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _session_path(name: str) -> Path:
+    """Return the filesystem path for a named session."""
     return SESSION_DIR / f"{name}.json"
 
 
 def save_session(name: str, history: list[dict]) -> None:
+    """Persist conversation history to a JSON file."""
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     path = _session_path(name)
     try:
@@ -500,7 +514,7 @@ def save_session(name: str, history: list[dict]) -> None:
 
 
 def _validate_session_data(data: object) -> str:
-    """Return '' if valid, or an error description."""
+    """Return '' if *data* is a valid session, or an error description."""
     if not isinstance(data, list):
         return "not a JSON array"
     for msg in data:
@@ -522,7 +536,8 @@ def _validate_session_data(data: object) -> str:
     return ""
 
 
-def load_session(name: str) -> Optional[list[dict]]:
+def load_session(name: str) -> list[dict] | None:
+    """Load a saved session by name.  Returns None on any error."""
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     path = _session_path(name)
     if not path.exists():
@@ -542,6 +557,7 @@ def load_session(name: str) -> Optional[list[dict]]:
 
 
 def clear_sessions() -> None:
+    """Interactively delete all saved sessions."""
     if not SESSION_DIR.exists():
         cprint(f"{C.INFO}No saved sessions to clear.{C.RESET}")
         return
@@ -571,6 +587,7 @@ def clear_sessions() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def init_history(is_openai_compat: bool) -> list[dict]:
+    """Create a fresh history list, optionally seeded with a system prompt."""
     if SYSTEM_PROMPT and is_openai_compat:
         return [{"role": "system", "content": SYSTEM_PROMPT}]
     return []
@@ -606,23 +623,34 @@ def _build_request(
     url: str,
     api_key: str,
     provider: str,
-    data: Optional[bytes] = None,
+    data: bytes | None = None,
 ) -> urllib.request.Request:
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    """Build an HTTP request with auth, User-Agent, and provider headers."""
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if provider == "openrouter":
         headers["HTTP-Referer"] = "urn:chatcli:python"
         headers["X-Title"]      = "PythonChatCLI"
-    method = "POST" if data else "GET"
+    # `is not None` correctly distinguishes "no body" from "empty body"
+    method = "POST" if data is not None else "GET"
     return urllib.request.Request(url, data=data, headers=headers, method=method)
 
 
-def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
+def fetch_models(provider: str, api_key: str) -> list[str] | None:
+    """Fetch available model IDs from the provider.  Returns None on error."""
     ep = ENDPOINTS[provider]
     if provider == "gemini":
         url = f"{ep['models']}?key={api_key}"
-        req = urllib.request.Request(url, method="GET")
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={"User-Agent": USER_AGENT},
+        )
     else:
         req = _build_request(ep["models"], api_key, provider)
 
@@ -746,6 +774,7 @@ def build_payload(
     is_openai_compat: bool,
     enable_tools: bool,
 ) -> dict:
+    """Build the full API request payload for the given provider."""
     if not is_openai_compat:              # Gemini
         contents = [m for m in history if m.get("role") != "system"]
         payload: dict = {
@@ -790,14 +819,14 @@ def stream_response(
     api_key: str,
     enable_tools: bool,
     enable_thinking: bool,
-) -> Optional[str]:
+) -> str | None:
     """
     Send the current history to the API and stream the reply to the terminal.
     Returns the assistant reply text (think-tags stripped) on success, or None.
 
     Text is streamed through a line buffer so complete lines can be rendered
     with Markdown/LaTeX formatting.  <think> tags are handled with a state
-    machine identical to the original.
+    machine that optionally displays reasoning in orange.
     """
     payload = build_payload(
         provider, model_id, history, is_openai_compat, enable_tools
@@ -813,7 +842,10 @@ def stream_response(
         req = urllib.request.Request(
             url,
             data=payload_bytes,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+            },
             method="POST",
         )
     else:
@@ -1212,6 +1244,7 @@ def _extract_display_text(msg: dict) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_usage() -> None:
+    """Print full usage information (shown with --help or no arguments)."""
     me = Path(sys.argv[0]).name
     cprint(f"""
 {C.INFO}Usage:{C.RESET}
@@ -1243,6 +1276,7 @@ def print_usage() -> None:
   {C.AI}python {me} together{C.RESET}
   {C.AI}python {me} novita{C.RESET}
   {C.AI}python {me} cerebras{C.RESET}
+  {C.AI}python {me} ollama{C.RESET}
 
 {C.IMAGE}Image support:{C.RESET}
   Supports JPEG, PNG, GIF, WebP. Max {MAX_IMAGE_SIZE_MB} MB per image.
@@ -1281,6 +1315,7 @@ def chat_loop(
     api_key: str,
     enable_tools: bool,
 ) -> None:
+    """Run the interactive chat REPL until the user exits."""
 
     # ── readline setup ───────────────────────────────────────────────────────
     if _READLINE_AVAILABLE:
@@ -1295,10 +1330,10 @@ def chat_loop(
         )
 
     # ── state ────────────────────────────────────────────────────────────────
-    history:      list[dict]     = init_history(is_openai_compat)
+    history:      list[dict]      = init_history(is_openai_compat)
     image:        ImageAttachment = ImageAttachment()
-    first_msg:    bool           = True
-    thinking_on:  bool           = ENABLE_THINKING_OUTPUT
+    first_msg:    bool            = True
+    thinking_on:  bool            = ENABLE_THINKING_OUTPUT
 
     # ── startup banner ───────────────────────────────────────────────────────
     sep = "─" * 85
@@ -1364,14 +1399,12 @@ def chat_loop(
 
             if cmd == "/help":
                 print_chat_help()
-                continue
 
             elif cmd == "/upload":
                 if not args:
                     eprint(f"{C.IMAGE}Usage: /upload <image_path>{C.RESET}")
                 else:
                     image.load(args)
-                continue
 
             elif cmd == "/image":
                 if image.attached:
@@ -1379,12 +1412,10 @@ def chat_loop(
                            f"({image.mime}){C.RESET}")
                 else:
                     cprint(f"{C.IMAGE}No image attached.{C.RESET}")
-                continue
 
             elif cmd == "/clearimage":
                 image.clear()
                 cprint(f"{C.IMAGE}Image cleared.{C.RESET}")
-                continue
 
             elif cmd == "/togglethinking":
                 thinking_on = not thinking_on
@@ -1394,7 +1425,6 @@ def chat_loop(
                     else f"{C.BOLD}disabled{C.RESET}"
                 )
                 cprint(f"{C.INFO}Thinking output {state}.{C.RESET}")
-                continue
 
             elif cmd == "/history":
                 cprint(f"{C.INFO}── History ({len(history)} messages) "
@@ -1413,14 +1443,12 @@ def chat_loop(
                            f"{truncate(text, 500)}")
                 cprint(f"{C.INFO}──────────────────────────────"
                        f"─────────────────────{C.RESET}")
-                continue
 
             elif cmd == "/save":
                 if not args:
                     eprint(f"{C.WARN}Usage: /save <name>{C.RESET}")
                 elif validate_session_name(args):
                     save_session(args, history)
-                continue
 
             elif cmd == "/load":
                 if not args:
@@ -1430,16 +1458,15 @@ def chat_loop(
                     if loaded is not None:
                         history   = loaded
                         first_msg = False
-                continue
 
             elif cmd == "/clear":
                 clear_sessions()
-                continue
 
             else:
                 eprint(f"{C.WARN}Unknown command '{cmd}'. "
                        f"Type /help for a list.{C.RESET}")
-                continue
+
+            continue   # all slash commands skip to next prompt
 
         # ── Guard: empty input ───────────────────────────────────────────
         if not user_input and not image.attached:
@@ -1496,6 +1523,7 @@ def chat_loop(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    """Parse arguments, select provider/model, and start the chat loop."""
     # Validate config
     for name, val, lo, hi in [
         ("DEFAULT_TEMPERATURE", DEFAULT_TEMPERATURE, 0, 2),
@@ -1590,7 +1618,7 @@ def main() -> None:
     cprint(f"{C.INFO}Using model:{C.RESET} {model_id}\n")
 
     # ── Graceful Ctrl-C outside of streaming ─────────────────────────────
-    def _sigint_handler(sig, frame):
+    def _sigint_handler(sig: int, frame: object) -> None:
         cprint(f"\n{C.WARN}Interrupted.{C.RESET}")
         sys.exit(130)
 
