@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Universal Chat CLI
-Pure stdlib, Python 3.9+. Zero pip installs required.
+Pure stdlib, Python 3.8+. Zero pip installs required.
 
 Usage:
     python ai.py <provider> [filter]...
@@ -85,7 +85,7 @@ ENABLE_THINKING_OUTPUT = True
 REQUEST_TIMEOUT     = 300   # Streaming chat timeout
 MODEL_FETCH_TIMEOUT = 30    # Model listing timeout
 
-# User-Agent sent with all HTTP requests (avoids Cloudflare 403 blocks)
+# User-Agent sent with all HTTP requests
 USER_AGENT = "PythonChatCLI/1.0"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -177,6 +177,9 @@ def validate_session_name(name: str) -> bool:
 
 def check_placeholder_key(key: str, provider: str) -> bool:
     """Returns True if key looks valid, False (with warning) otherwise."""
+    if provider == "ollama":
+        return True  # Ollama doesn't need a key
+        
     msg = ""
     if not key:
         msg = "is empty"
@@ -190,7 +193,7 @@ def check_placeholder_key(key: str, provider: str) -> bool:
         msg = "looks like an incomplete Groq key"
     elif provider == "cerebras" and key == "csk-":
         msg = "is the bare Cerebras prefix"
-    elif provider in ("novita", "ollama") and len(key) < 10:
+    elif provider == "novita" and len(key) < 10:
         msg = "is too short to be valid"
 
     if msg:
@@ -431,7 +434,7 @@ def _build_request(url: str, api_key: str, provider: str,
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if provider == "openrouter":
-        headers["HTTP-Referer"] = "urn:chatcli:python"
+        headers["HTTP-Referer"] = "https://github.com/python-chat-cli"
         headers["X-Title"]      = "PythonChatCLI"
     method = "POST" if data else "GET"
     return urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -501,15 +504,12 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_user_message(text: str, image: ImageAttachment,
-                       provider: str, is_openai_compat: bool,
-                       is_first: bool) -> dict:
-    """Construct the user turn dict, injecting system prompt for Gemini on turn 1."""
+                       provider: str, is_openai_compat: bool) -> dict:
+    """Construct the user turn dict."""
     prompt = text
 
     if image.attached:
         if not is_openai_compat:          # Gemini multimodal
-            if is_first and SYSTEM_PROMPT:
-                prompt = f"{SYSTEM_PROMPT}\n\n{text}"
             return {
                 "role": "user",
                 "parts": [
@@ -530,18 +530,15 @@ def build_user_message(text: str, image: ImageAttachment,
             }
     else:
         if not is_openai_compat:          # Gemini text-only
-            if is_first and SYSTEM_PROMPT:
-                prompt = f"{SYSTEM_PROMPT}\n\nUser: {text}"
             return {"role": "user", "parts": [{"text": prompt}]}
         else:
             return {"role": "user", "content": prompt}
 
 
 def build_payload(provider: str, model_id: str,
-                  history: list[dict], is_openai_compat: bool,
-                  enable_tools: bool) -> dict:
+                  history: list[dict], is_openai_compat: bool) -> dict:
     if not is_openai_compat:              # Gemini
-        # Gemini doesn't use a "system" role entry
+        # Gemini doesn't use a "system" role entry in contents
         contents = [m for m in history if m.get("role") != "system"]
         payload: dict = {
             "contents": contents,
@@ -551,8 +548,11 @@ def build_payload(provider: str, model_id: str,
                 "topP":           DEFAULT_TOP_P,
             },
         }
-        if enable_tools:
-            payload["tools"] = [{"urlContext": {}}, {"googleSearch": {}}]
+        # Inject Gemini's native System Instruction
+        if SYSTEM_PROMPT:
+            payload["systemInstruction"] = {
+                "parts": [{"text": SYSTEM_PROMPT}]
+            }
         return payload
 
     # OpenAI-compatible base
@@ -576,14 +576,13 @@ def build_payload(provider: str, model_id: str,
 
 def stream_response(provider: str, model_id: str,
                     history: list[dict], is_openai_compat: bool,
-                    api_key: str, enable_tools: bool,
-                    enable_thinking: bool) -> Optional[str]:
+                    api_key: str, enable_thinking: bool) -> Optional[str]:
     """
     Send the current history to the API and stream the reply to the terminal.
     Returns the assistant reply text (think-tags stripped) on success, or None.
     Handles Ctrl+C gracefully — interrupts the stream, returns partial text.
     """
-    payload = build_payload(provider, model_id, history, is_openai_compat, enable_tools)
+    payload = build_payload(provider, model_id, history, is_openai_compat)
     payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     ep = ENDPOINTS[provider]
@@ -693,20 +692,6 @@ def stream_response(provider: str, model_id: str,
                             blocked_rating = next((r for r in safety_ratings if r.get("blocked")), None)
                             if blocked_rating:
                                 cur_finish = "SAFETY"
-
-                        # Tool calls (informational only)
-                        if enable_tools:
-                            tool_parts = [p for p in parts if "functionCall" in p]
-                            if tool_parts:
-                                if first_chunk:
-                                    sys.stdout.write(C.CLR)
-                                    sys.stdout.write(f"{C.AI}AI:{C.RESET}  ")
-                                    first_chunk = False
-                                cprint(f"\n{C.WARN}Tool call requested 🌐:{C.RESET}")
-                                for tp in tool_parts:
-                                    cprint(json.dumps(tp, indent=2))
-                                cprint(f"{C.WARN}(This script does not automatically execute "
-                                       f"tool calls or return tool output to the model.){C.RESET}")
 
                     if cur_finish and not finish_reason:
                         finish_reason = cur_finish
@@ -925,8 +910,7 @@ def print_chat_help() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def chat_loop(provider: str, model_id: str,
-              is_openai_compat: bool, api_key: str,
-              enable_tools: bool) -> None:
+              is_openai_compat: bool, api_key: str) -> None:
 
     # ── readline setup ───────────────────────────────────────────────────────
     if _READLINE_AVAILABLE:
@@ -941,7 +925,6 @@ def chat_loop(provider: str, model_id: str,
     # ── state ────────────────────────────────────────────────────────────────
     history     : list[dict]      = init_history(is_openai_compat)
     image       : ImageAttachment = ImageAttachment()
-    first_msg   : bool            = True
     thinking_on : bool            = ENABLE_THINKING_OUTPUT
 
     # ── startup banner ───────────────────────────────────────────────────────
@@ -954,14 +937,10 @@ def chat_loop(provider: str, model_id: str,
            f"{C.INFO}Tokens:{C.RESET} {DEFAULT_MAX_TOKENS}  │  "
            f"{C.INFO}TopP:{C.RESET} {DEFAULT_TOP_P}")
     cprint(f"  {C.INFO}Max message:{C.RESET}  {MAX_MESSAGE_LENGTH:,} characters")
-    if SYSTEM_PROMPT:
-        label = "prepended to first message" if not is_openai_compat else "active"
-        cprint(f"  {C.INFO}System prompt:{C.RESET}  {label}")
-    else:
-        cprint(f"  {C.INFO}System prompt:{C.RESET}  inactive (empty)")
-    if provider == "gemini":
-        status = f"{C.BOLD}enabled{C.RESET}" if enable_tools else "disabled"
-        cprint(f"  {C.INFO}Tool calling:{C.RESET}  {status}")
+    
+    status = "active" if SYSTEM_PROMPT else "inactive (empty)"
+    cprint(f"  {C.INFO}System prompt:{C.RESET}  {status}")
+    
     think_status = f"{C.BOLD}{C.THINK}enabled{C.RESET}" if thinking_on else "disabled"
     cprint(f"  {C.INFO}Thinking output:{C.RESET}  {think_status}  (toggle: /togglethinking)")
     cprint(f"  Type {C.BOLD}quit{C.RESET} or {C.BOLD}exit{C.RESET} to end  │  "
@@ -1048,7 +1027,6 @@ def chat_loop(provider: str, model_id: str,
                     loaded = load_session(args)
                     if loaded is not None:
                         history   = loaded
-                        first_msg = False
                 continue
 
             elif cmd == "/clear":
@@ -1076,18 +1054,15 @@ def chat_loop(provider: str, model_id: str,
         eprint(f"{C.INFO}[Sending…]{C.RESET}")
 
         # ── Build user message ───────────────────────────────────────────────
-        user_msg = build_user_message(user_input, image,
-                                      provider, is_openai_compat, first_msg)
+        user_msg = build_user_message(user_input, image, provider, is_openai_compat)
         image.clear()
-        first_msg = False
 
         history.append(user_msg)
         history = truncate_history(history, is_openai_compat)
 
         # ── Call API ─────────────────────────────────────────────────────────
         ai_text = stream_response(provider, model_id, history,
-                                  is_openai_compat, api_key,
-                                  enable_tools, thinking_on)
+                                  is_openai_compat, api_key, thinking_on)
 
         if ai_text:
             if not is_openai_compat:
@@ -1138,25 +1113,6 @@ def main() -> None:
     # Determine compatibility mode
     is_openai_compat = (provider != "gemini")
 
-    # ── Optional: Gemini tool-calling prompt ────────────────────────────────
-    enable_tools = False
-    if provider == "gemini":
-        while True:
-            try:
-                ans = input(f"{C.INFO}Enable Gemini tool calling "
-                            f"(web search, URL context)? (y/n): {C.RESET}").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                sys.exit(0)
-            if ans in ("y", "1", "yes"):
-                enable_tools = True
-                cprint(f"{C.INFO}Tool calling enabled.{C.RESET}")
-                break
-            elif ans in ("n", "0", "no"):
-                cprint(f"{C.INFO}Tool calling disabled.{C.RESET}")
-                break
-            else:
-                eprint(f"{C.WARN}Please enter y or n.{C.RESET}")
-
     # ── Fetch models ─────────────────────────────────────────────────────────
     cprint(f"{C.INFO}Fetching models for {provider.upper()}…{C.RESET}")
     models = fetch_models(provider, api_key)
@@ -1203,7 +1159,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sigint_handler)
 
     # ── Start chat ───────────────────────────────────────────────────────────
-    chat_loop(provider, model_id, is_openai_compat, api_key, enable_tools)
+    chat_loop(provider, model_id, is_openai_compat, api_key)
     cprint("👋 Session ended.")
 
 
