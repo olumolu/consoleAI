@@ -3,20 +3,17 @@
 Universal Chat CLI
 Pure stdlib, Python 3.9+. Zero pip installs required.
 
-Notes:
-  - Python 3.9 is the real minimum because this script uses built-in generic
-    types such as list[str] and dict[str, str].
-  - Ollama defaults to local mode at http://localhost:11434 and does not need
-    an API key unless your Ollama server is behind auth.
-
 Features:
   - Markdown rendering (Bold, Italic, Code, Fenced code blocks)
   - LaTeX rendering (Greek letters, superscripts, fractions → Unicode)
   - Image attachment support (Vision models)
   - Multi-line input (backslash continuation + /paste mode)
   - Multi-provider support (Gemini, OpenRouter, Groq, Together, etc.)
-  - Tool/Function calling (Web fetch, Calculator, Local time, Wikipedia)
+  - Tool/Function calling (Web search, fetch, Calculator, Time, Wikipedia)
+  - Web search via Startpage
   - Live model switching (/model command)
+  - History compaction (tool messages auto-collapsed after each exchange)
+  - SSRF protection with DNS-over-HTTPS support
 
 Usage:
     python ai.py <provider> [filter]...
@@ -55,7 +52,12 @@ import ast
 import operator
 import base64
 import signal
+import socket
+import ipaddress
 import datetime
+import gzip
+import zlib
+import http.cookiejar
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -81,17 +83,14 @@ except ImportError:
 #  CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-##############################################################################
-#                   !!! EDIT YOUR API KEYS HERE !!!                          #
-##############################################################################
 API_KEYS: dict[str, str] = {
-    "gemini":     "",   # https://aistudio.google.com/app/apikey
-    "openrouter": "",   # https://openrouter.ai/keys
-    "groq":       "",   # https://console.groq.com/keys
-    "together":   "",   # https://api.together.ai/settings/api-keys
-    "cerebras":   "",   # https://cloud.cerebras.ai/
-    "novita":     "",   # https://novita.ai/
-    "ollama":     "",   # https://ollama.com/ (leave blank for local)
+    "gemini":     "",
+    "openrouter": "",
+    "groq":       "",
+    "together":   "",
+    "cerebras":   "",
+    "novita":     "",
+    "ollama":     "",
 }
 
 MAX_HISTORY_MESSAGES  = 20
@@ -113,9 +112,18 @@ MAX_TOOL_ITERATIONS    = 10
 REQUEST_TIMEOUT     = 300
 MODEL_FETCH_TIMEOUT = 30
 
-FETCH_MAX_CHARS = 8000
+FETCH_MAX_CHARS     = 8000
+FETCH_MAX_BYTES     = 5 * 1024 * 1024
+SEARCH_MAX_RESULTS  = 6
 
-USER_AGENT = "PythonChatCLI/1.2"
+USER_AGENT = "PythonChatCLI/1.3"
+
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+DOH_URL = "" # add your own dns
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ANSI COLOURS
@@ -149,6 +157,115 @@ def eprint(msg: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  DNS-over-HTTPS RESOLVER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_doh(hostname: str) -> list[str]:
+    if not DOH_URL:
+        return []
+    ips: list[str] = []
+    for qtype in ("A", "AAAA"):
+        params = urllib.parse.urlencode({"name": hostname, "type": qtype})
+        url = f"{DOH_URL}?{params}"
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/dns-json", "User-Agent": USER_AGENT},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                for answer in data.get("Answer", []):
+                    if answer.get("type") in (1, 28):
+                        ip_str = answer.get("data", "").strip()
+                        if ip_str:
+                            ips.append(ip_str)
+        except Exception:
+            continue
+    return ips
+
+
+def _resolve_system(hostname: str) -> list[str]:
+    ips: list[str] = []
+    try:
+        infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for family, _, _, _, sockaddr in infos:
+            ips.append(sockaddr[0])
+    except (socket.gaierror, socket.herror, OSError):
+        pass
+    return ips
+
+
+def _resolve_hostname(hostname: str) -> list[str]:
+    if DOH_URL:
+        ips = _resolve_doh(hostname)
+        if ips:
+            return ips
+    return _resolve_system(hostname)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SSRF PROTECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_private_ip(hostname: str) -> bool:
+    ips = _resolve_hostname(hostname)
+    if not ips:
+        return True
+    for ip_str in ips:
+        try:
+            addr = ipaddress.ip_address(ip_str)
+            if (
+                addr.is_private or addr.is_loopback or addr.is_reserved
+                or addr.is_link_local or addr.is_multicast
+                or (isinstance(addr, ipaddress.IPv4Address) and (
+                    ip_str.startswith("169.254.") or ip_str == "0.0.0.0"
+                ))
+                or (isinstance(addr, ipaddress.IPv6Address) and addr.is_site_local)
+            ):
+                return True
+        except ValueError:
+            return True
+    return False
+
+
+def _validate_url(url: str) -> tuple[bool, str]:
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False, "Invalid URL format"
+    if parsed.scheme not in ("http", "https"):
+        return False, f"Blocked protocol: {parsed.scheme}:// (only http/https allowed)"
+    hostname = parsed.hostname
+    if not hostname:
+        return False, "No hostname in URL"
+    blocked_hosts = {
+        "localhost", "127.0.0.1", "0.0.0.0", "::1",
+        "metadata.google.internal", "metadata.google.com",
+    }
+    if hostname.lower() in blocked_hosts:
+        return False, f"Blocked hostname: {hostname}"
+    if hostname.startswith("169.254."):
+        return False, "Blocked: cloud metadata endpoint"
+    if _is_private_ip(hostname):
+        return False, f"Blocked: {hostname} resolves to private/internal IP"
+    return True, ""
+
+
+class _SSRFSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int,
+                         msg: str, headers: Any, newurl: str) -> Any:
+        ok, err = _validate_url(newurl)
+        if not ok:
+            raise urllib.error.URLError(f"Redirect blocked: {err}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_COOKIE_JAR = http.cookiejar.CookieJar()
+_URL_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(_COOKIE_JAR),
+    _SSRFSafeRedirectHandler(),
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  LATEX RENDERER
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -180,11 +297,7 @@ class LatexRenderer:
             lambda m: self._convert(m.group(1) or m.group(2)),
             text, flags=re.DOTALL,
         )
-        text = re.sub(
-            r'\$(.+?)\$',
-            lambda m: self._convert(m.group(1)),
-            text,
-        )
+        text = re.sub(r'\$(.+?)\$', lambda m: self._convert(m.group(1)), text)
         return text
 
     def _convert(self, tex: str) -> str:
@@ -381,7 +494,6 @@ def _save_readline_history() -> None:
 
 
 def _args_to_obj(arguments: str) -> dict[str, Any]:
-    """Parse a JSON-string of arguments into a dict, tolerating junk."""
     if not arguments or arguments.isspace():
         return {}
     try:
@@ -392,7 +504,6 @@ def _args_to_obj(arguments: str) -> dict[str, Any]:
 
 
 def _args_display(arguments: str) -> str:
-    """Compact single-line display of tool arguments."""
     obj = _args_to_obj(arguments)
     obj = {k: v for k, v in obj.items() if k}
     if not obj:
@@ -401,29 +512,124 @@ def _args_display(arguments: str) -> str:
 
 
 def _clean_html(raw: str) -> str:
-    """Strip scripts, styles, tags, and entities from raw HTML."""
-    text = re.sub(
-        r"<script[^>]*>.*?</script>", " ", raw,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    text = re.sub(
-        r"<style[^>]*>.*?</style>", " ", text,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    text = re.sub(
-        r"<noscript[^>]*>.*?</noscript>", " ", text,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<noscript[^>]*>.*?</noscript>", " ", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<!--.*?-->", " ", text, flags=re.DOTALL)
-    text = re.sub(
-        r"<svg[^>]*>.*?</svg>", " ", text,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
+    text = re.sub(r"<svg[^>]*>.*?</svg>", " ", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
     text = _html.unescape(text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n[ \t]*\n[\n ]*", "\n\n", text)
     return text.strip()
+
+
+def _strip_css(text: str) -> str:
+    text = re.sub(r'\.css-[a-zA-Z0-9_-]+\{[^}]*\}', '', text)
+    text = re.sub(r'\.[a-zA-Z_][\w-]*\{[^}]*\}', '', text)
+    text = re.sub(r'@media\s*\([^)]*\)\s*\{[^}]*(?:\{[^}]*\}[^}]*)?\}', '', text)
+    text = re.sub(r'@[a-zA-Z-]+\s*[^{]*\{[^}]*(?:\{[^}]*\}[^}]*)?\}', '', text)
+    text = re.sub(r'\{[^}]{0,500}\}', '', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n\s*\n', '\n', text)
+    return text.strip()
+
+
+def _clean_search_text(text: str) -> str:
+    text = re.sub(r"<[^>]+>", "", text)
+    text = _html.unescape(text)
+    text = _strip_css(text)
+    return text.strip()
+
+
+def _dns_label() -> str:
+    if DOH_URL:
+        try:
+            host = urllib.parse.urlparse(DOH_URL).hostname or DOH_URL
+        except Exception:
+            host = DOH_URL
+        return f"DoH ({host})"
+    return "System DNS"
+
+
+def _decompress(data: bytes, encoding: str) -> bytes:
+    enc = (encoding or "").lower()
+    try:
+        if "gzip" in enc:
+            return gzip.decompress(data)
+        if "deflate" in enc:
+            try:
+                return zlib.decompress(data)
+            except zlib.error:
+                return zlib.decompress(data, -zlib.MAX_WBITS)
+    except Exception:
+        pass
+    return data
+
+
+def _make_opener() -> urllib.request.OpenerDirector:
+    jar = http.cookiejar.CookieJar()
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  WEB FETCHER
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FETCH_HEADERS_PRIMARY: dict[str, str] = {
+    "User-Agent": BROWSER_USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, identity",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": "https://www.google.com/",
+}
+
+_FETCH_HEADERS_FALLBACK: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+}
+
+
+def _fetch_page(url: str, timeout: int = 20) -> str:
+    ok, err = _validate_url(url)
+    if not ok:
+        raise ValueError(f"Blocked: {err}")
+    last_error: Optional[Exception] = None
+    for headers in (_FETCH_HEADERS_PRIMARY, _FETCH_HEADERS_FALLBACK):
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with _URL_OPENER.open(req, timeout=timeout) as resp:
+                content_length = resp.headers.get("Content-Length")
+                if content_length and int(content_length) > FETCH_MAX_BYTES:
+                    raise ValueError(
+                        f"Response too large: {int(content_length) // (1024*1024)} MB "
+                        f"(max {FETCH_MAX_BYTES // (1024*1024)} MB)"
+                    )
+                raw_bytes = resp.read(FETCH_MAX_BYTES + 1)
+                if len(raw_bytes) > FETCH_MAX_BYTES:
+                    raw_bytes = raw_bytes[:FETCH_MAX_BYTES]
+                raw_bytes = _decompress(raw_bytes, resp.headers.get("Content-Encoding", ""))
+                return raw_bytes.decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code in (401, 403, 429):
+                continue
+            raise
+        except ValueError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Failed to fetch URL")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -478,12 +684,10 @@ class ImageAttachment:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def tool_get_time(**kwargs: Any) -> str:
-    """Return the current local date and time."""
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def tool_calculator(expression: str = "", **kwargs: Any) -> str:
-    """Safely evaluate a mathematical expression using the AST."""
     _OPS: dict[type, Any] = {
         ast.Add: operator.add, ast.Sub: operator.sub,
         ast.Mult: operator.mul, ast.Div: operator.truediv,
@@ -516,37 +720,159 @@ def tool_calculator(expression: str = "", **kwargs: Any) -> str:
         return f"Error: {exc}"
 
 
-def tool_fetch_url(url: str = "", **kwargs: Any) -> str:
-    """Fetch a web page and return clean text (≤ FETCH_MAX_CHARS chars).
+# ── Startpage search ────────────────────────────────────────────────────────
 
-    Automatically uses the Wikipedia API for wikipedia.org URLs
-    to get clean plaintext instead of scraping HTML.
-    """
+def _startpage_search(query: str, limit: int) -> Optional[str]:
+    opener = _make_opener()
+    home_headers = {
+        "User-Agent": BROWSER_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, identity",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    try:
+        home_req = urllib.request.Request("https://www.startpage.com/", headers=home_headers)
+        with opener.open(home_req, timeout=10) as resp:
+            resp.read(500_000)
+    except Exception:
+        pass
+
+    post_data = urllib.parse.urlencode({
+        "q": query, "cat": "web", "cmd": "process_search",
+        "language": "english", "engine0": "v1all",
+    }).encode()
+    post_headers = {
+        "User-Agent": BROWSER_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, identity",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://www.startpage.com",
+        "Referer": "https://www.startpage.com/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    try:
+        search_req = urllib.request.Request(
+            "https://www.startpage.com/do/search",
+            data=post_data, headers=post_headers, method="POST",
+        )
+        with opener.open(search_req, timeout=15) as resp:
+            raw_bytes = resp.read(FETCH_MAX_BYTES)
+            raw_bytes = _decompress(raw_bytes, resp.headers.get("Content-Encoding", ""))
+            html_text = raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    if "captcha" in html_text.lower():
+        return None
+
+    entries:      list[str] = []
+    seen_domains: set[str]  = set()
+    results_data: list[tuple[str, str, str]] = []
+
+    for m in re.finditer(
+        r'<a[^>]+class="[^"]*result-title[^"]*"[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        html_text, re.DOTALL,
+    ):
+        url = m.group(1)
+        title = _clean_search_text(m.group(2))
+        snippet = ""
+        after = html_text[m.end():m.end() + 2000]
+        snip_m = re.search(
+            r'class="[^"]*(?:result-description|w-gl__description)[^"]*"[^>]*>(.*?)</(?:p|div|span)>',
+            after, re.DOTALL,
+        )
+        if snip_m:
+            snippet = _clean_search_text(snip_m.group(1))
+        results_data.append((url, title, snippet))
+
+    if not results_data:
+        for m in re.finditer(
+            r'href=["\']([^"\']+)["\'][^>]*class="[^"]*result-title[^"]*"[^>]*>(.*?)</a>',
+            html_text, re.DOTALL,
+        ):
+            results_data.append((m.group(1), _clean_search_text(m.group(2)), ""))
+
+    if not results_data:
+        for m in re.finditer(
+            r'<h3[^>]*>\s*<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+            html_text, re.DOTALL,
+        ):
+            url = m.group(1)
+            title = _clean_search_text(m.group(2))
+            if "startpage.com" not in url and len(title) > 3:
+                results_data.append((url, title, ""))
+
+    for r_url, r_title, r_snip in results_data:
+        if len(entries) >= limit:
+            break
+        if not r_url.startswith("http") or "startpage.com" in r_url:
+            continue
+        if not r_title or len(r_title) < 3:
+            continue
+        try:
+            domain = urllib.parse.urlparse(r_url).netloc
+        except Exception:
+            domain = r_url
+        if domain in seen_domains:
+            continue
+        seen_domains.add(domain)
+        entry = f"{len(entries) + 1}. {r_title}\n   URL: {r_url}"
+        if r_snip:
+            entry += f"\n   {r_snip}"
+        entries.append(entry)
+
+    if not entries:
+        return None
+
+    header = f"Web search results for: {query}\n"
+    header += f"({len(entries)} results via Startpage — use fetch_url on any URL for full content)\n"
+    return header + "\n" + "\n\n".join(entries)
+
+
+def tool_web_search(query: str = "", num_results: int = 0, **kwargs: Any) -> str:
+    if not query:
+        return "Error: No query provided."
+    limit = num_results if 1 <= num_results <= 10 else SEARCH_MAX_RESULTS
+    result = _startpage_search(query, limit)
+    if result:
+        return result
+    return f"No results found for: {query}"
+
+
+def tool_fetch_url(url: str = "", **kwargs: Any) -> str:
     if not url:
         return "Error: No URL provided."
     if not url.startswith("http"):
         url = "https://" + url
+    ok, err = _validate_url(url)
+    if not ok:
+        return f"Error: {err}"
 
-    # ── Wikipedia fast-path: use the MediaWiki API for clean text ──
-    wiki_match = re.match(
-        r"https?://(\w+)\.wikipedia\.org/wiki/([^#?]+)", url
-    )
+    wiki_match = re.match(r"https?://(\w+)\.wikipedia\.org/wiki/([^#?]+)", url)
     if wiki_match:
         lang, title = wiki_match.group(1), wiki_match.group(2)
         api_url = (
             f"https://{lang}.wikipedia.org/w/api.php?"
-            f"action=query"
-            f"&titles={urllib.parse.quote(title, safe='')}"
-            f"&prop=extracts"
-            f"&explaintext=1"
-            f"&exlimit=1"
-            f"&exchars={FETCH_MAX_CHARS}"
-            f"&format=json"
+            f"action=query&titles={urllib.parse.quote(title, safe='')}"
+            f"&prop=extracts&explaintext=1&exlimit=1"
+            f"&exchars={FETCH_MAX_CHARS}&format=json"
         )
         try:
-            req = urllib.request.Request(
-                api_url, headers={"User-Agent": USER_AGENT}
-            )
+            req = urllib.request.Request(api_url, headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
                 pages = data.get("query", {}).get("pages", {})
@@ -560,21 +886,45 @@ def tool_fetch_url(url: str = "", **kwargs: Any) -> str:
         except Exception:
             pass
 
-    # ── Generic fetch with proper HTML cleaning ───────────────────
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            text = _clean_html(raw)
-            return text[:FETCH_MAX_CHARS]
+        raw = _fetch_page(url)
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, flags=re.DOTALL | re.IGNORECASE)
+        page_title = ""
+        if title_match:
+            page_title = re.sub(r"\s+", " ", _html.unescape(
+                re.sub(r"<[^>]+>", "", title_match.group(1))
+            )).strip()
+        article_text = ""
+        for tag in (
+            "article", "main",
+            r'div[^>]+class="[^"]*(?:article|story|content|post|body|entry)[^"]*"',
+            r'div[^>]+id="[^"]*(?:article|story|content|main|body)[^"]*"',
+        ):
+            article_match = re.search(
+                rf"<{tag}[^>]*>(.*?)</{tag.split('[')[0]}>",
+                raw, flags=re.DOTALL | re.IGNORECASE,
+            )
+            if article_match:
+                candidate = _clean_html(article_match.group(1))
+                if len(candidate) > 200:
+                    article_text = candidate
+                    break
+        text = article_text if article_text else _clean_html(raw)
+        header = f"Page: {page_title}\nURL: {url}\n\n" if page_title else ""
+        return (header + text)[:FETCH_MAX_CHARS]
+    except urllib.error.HTTPError as exc:
+        return f"Error fetching URL: HTTP {exc.code} ({exc.reason})"
+    except ValueError as exc:
+        return f"Error: {exc}"
     except Exception as exc:
         return f"Error fetching URL: {exc}"
 
 
 def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
-    """Search Wikipedia and return the top article's plaintext."""
     if not query:
         return "Error: No query provided."
+    if not re.fullmatch(r"[a-z]{2,5}", lang):
+        lang = "en"
     search_url = (
         f"https://{lang}.wikipedia.org/w/api.php?"
         f"action=query&list=search"
@@ -597,10 +947,11 @@ def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
 
 
 TOOLS_REGISTRY: dict[str, Any] = {
-    "get_time":   tool_get_time,
-    "calculator": tool_calculator,
-    "fetch_url":  tool_fetch_url,
-    "wikipedia":  tool_wikipedia,
+    "get_time":    tool_get_time,
+    "calculator":  tool_calculator,
+    "web_search":  tool_web_search,
+    "fetch_url":   tool_fetch_url,
+    "wikipedia":   tool_wikipedia,
 }
 
 OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
@@ -632,8 +983,36 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web for current information via Startpage. "
+                "Returns results with titles, URLs, and snippets. "
+                "Use fetch_url on any returned URL to read the full article content."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query, e.g. 'latest news today'",
+                    },
+                    "num_results": {
+                        "type": "integer",
+                        "description": "Number of results to return (1-10, default 6).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "fetch_url",
-            "description": "Fetch text content from a web page by URL. Returns clean plaintext. Works especially well with Wikipedia URLs.",
+            "description": (
+                "Fetch and read the full text content from any web page URL. "
+                "Returns clean plaintext extracted from the HTML."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -691,8 +1070,33 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 },
             },
             {
+                "name": "web_search",
+                "description": (
+                    "Search the web for current information via Startpage. "
+                    "Returns results with titles, URLs, and snippets. "
+                    "Use fetch_url on any returned URL to read the full article content."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query, e.g. 'latest news today'",
+                        },
+                        "num_results": {
+                            "type": "integer",
+                            "description": "Number of results to return (1-10, default 6).",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
                 "name": "fetch_url",
-                "description": "Fetch text content from a web page by URL. Returns clean plaintext. Works especially well with Wikipedia URLs.",
+                "description": (
+                    "Fetch and read the full text content from any web page URL. "
+                    "Returns clean plaintext extracted from the HTML."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -728,7 +1132,6 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
 
 
 def execute_tool(name: str, arguments_json: str) -> str:
-    """Look up tool by name, parse JSON args, run it, return result string."""
     fn = TOOLS_REGISTRY.get(name)
     if fn is None:
         return f"Error: unknown tool '{name}'"
@@ -876,7 +1279,6 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
         req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
     else:
         req = _build_request(ep["models"], api_key, provider)
-
     try:
         with urllib.request.urlopen(req, timeout=MODEL_FETCH_TIMEOUT) as resp:
             body = resp.read().decode("utf-8", errors="replace")
@@ -887,19 +1289,16 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
     except OSError as exc:
         eprint(f"{C.ERROR}Network error fetching models: {exc}{C.RESET}")
         return None
-
     try:
         data = json.loads(body)
     except json.JSONDecodeError:
         eprint(f"{C.ERROR}Invalid JSON from model endpoint.{C.RESET}")
         return None
-
     api_err = data.get("error") if isinstance(data, dict) else None
     if api_err:
         msg = api_err.get("message", str(api_err)) if isinstance(api_err, dict) else str(api_err)
         eprint(f"{C.ERROR}API error: {msg}{C.RESET}")
         return None
-
     try:
         if provider == "gemini":
             models = [
@@ -920,44 +1319,30 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
     except (KeyError, TypeError) as exc:
         eprint(f"{C.ERROR}Could not parse model list: {exc}{C.RESET}")
         return None
-
     return [m for m in models if m]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MODEL SELECTION (shared by main + /model)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def select_model_interactive(
     provider: str, api_key: str, filters: list[str],
     current_model: str = "",
 ) -> Optional[str]:
-    """Fetch models, apply filters, present numbered list, return chosen id.
-
-    Returns None if the user cancels or an error occurs.
-    If *current_model* is set it is highlighted in the list.
-    """
     cprint(f"{C.INFO}Fetching models for {provider.upper()}…{C.RESET}")
     models = fetch_models(provider, api_key)
     if not models:
         eprint(f"{C.ERROR}No models returned by {provider.upper()}.{C.RESET}")
         return None
-
     if filters:
         models = filter_models(models, filters)
     if not models:
         eprint(f"{C.ERROR}No models matched filter: {' '.join(filters)}{C.RESET}")
         return None
-
     if len(models) == 1:
         cprint(f"{C.INFO}Auto-selected:{C.RESET} {models[0]}")
         return models[0]
-
     cprint(f"{C.INFO}Available models for {provider.upper()}:{C.RESET}")
     for i, m in enumerate(models, 1):
         marker = f"  {C.BOLD}{C.AI}◉{C.RESET}" if m == current_model else "   "
         cprint(f"{marker}{C.BOLD}{i:3}{C.RESET}. {m}")
-
     while True:
         try:
             choice = input(f"{C.INFO}Select model number (or 'c' to cancel): {C.RESET}").strip()
@@ -1034,7 +1419,6 @@ def build_payload(
     }
     if enable_tools:
         oai_payload["tools"] = OPENAI_TOOLS_SCHEMA
-
     if provider == "ollama":
         oai_payload["options"] = {
             "num_predict": DEFAULT_MAX_TOKENS,
@@ -1046,7 +1430,6 @@ def build_payload(
     elif provider != "together":
         oai_payload["max_tokens"] = DEFAULT_MAX_TOKENS
         oai_payload["top_p"] = DEFAULT_TOP_P
-
     return oai_payload
 
 
@@ -1059,12 +1442,6 @@ def stream_response(
     is_openai_compat: bool, api_key: str,
     enable_tools: bool, enable_thinking: bool,
 ) -> tuple[Optional[str], list[dict[str, Any]]]:
-    """Stream the reply.  Returns (text, normalised_tool_calls).
-
-    Each tool call is: {"id": str, "type": "function",
-                        "function": {"name": str, "arguments": str}}
-    where 'arguments' is always a JSON *string* (even if empty: "{}").
-    """
     payload = build_payload(provider, model_id, history, is_openai_compat, enable_tools)
     payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ep = ENDPOINTS[provider]
@@ -1093,10 +1470,8 @@ def stream_response(
     error_msg = ""
     interrupted = False
     line_buffer = ""
-
     oai_tool_calls: dict[int, dict[str, Any]] = {}
     gem_tool_calls: list[dict[str, Any]] = []
-
     MD_RENDERER.in_code_block = False
 
     def _flush_text(text: str) -> None:
@@ -1128,11 +1503,9 @@ def stream_response(
                 if not raw:
                     break
                 buffer += raw.decode("utf-8", errors="replace")
-
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
                     line = line.rstrip("\r")
-
                     json_chunk = ""
                     if line.startswith("data: "):
                         json_chunk = line[6:].strip()
@@ -1142,12 +1515,10 @@ def stream_response(
                         json_chunk = line
                     if not json_chunk:
                         continue
-
                     try:
                         obj = json.loads(json_chunk)
                     except json.JSONDecodeError:
                         continue
-
                     chunk_err = None
                     if isinstance(obj.get("error"), dict):
                         chunk_err = obj["error"].get("message", str(obj["error"]))
@@ -1158,9 +1529,7 @@ def stream_response(
                     if chunk_err:
                         error_msg = f"API error: {chunk_err}"
                         break
-
                     text_tok = think_tok = cur_finish = ""
-
                     if is_openai_compat:
                         if provider == "ollama":
                             msg_obj = obj.get("message", {})
@@ -1177,12 +1546,8 @@ def stream_response(
                                 elif not isinstance(args_raw, str):
                                     args_raw = "{}"
                                 oai_tool_calls[idx] = {
-                                    "id": f"call_{idx}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": fn.get("name", ""),
-                                        "arguments": args_raw,
-                                    },
+                                    "id": f"call_{idx}", "type": "function",
+                                    "function": {"name": fn.get("name", ""), "arguments": args_raw},
                                 }
                         else:
                             choice = (obj.get("choices") or [{}])[0]
@@ -1194,8 +1559,7 @@ def stream_response(
                                 idx = tc_chunk.get("index", len(oai_tool_calls))
                                 if idx not in oai_tool_calls:
                                     oai_tool_calls[idx] = {
-                                        "id": tc_chunk.get("id", f"call_{idx}"),
-                                        "type": "function",
+                                        "id": tc_chunk.get("id", f"call_{idx}"), "type": "function",
                                         "function": {
                                             "name": tc_chunk.get("function", {}).get("name", ""),
                                             "arguments": tc_chunk.get("function", {}).get("arguments", ""),
@@ -1215,8 +1579,7 @@ def stream_response(
                             error_msg = f"Content blocked (reason: {pf['blockReason']})"
                             break
                         content_obj = candidate.get("content", {})
-                        part_list = content_obj.get("parts", [])
-                        for part in part_list:
+                        for part in content_obj.get("parts", []):
                             if "text" in part:
                                 text_tok += part["text"]
                             if "functionCall" in part:
@@ -1225,22 +1588,18 @@ def stream_response(
                         if not cur_finish or cur_finish == "null":
                             if any(r.get("blocked") for r in candidate.get("safetyRatings", [])):
                                 cur_finish = "SAFETY"
-
                     if cur_finish and not finish_reason:
                         finish_reason = cur_finish
-
                     if first_chunk and (text_tok or think_tok):
                         sys.stdout.write(C.CLR)
                         sys.stdout.write(f"{C.AI}AI:{C.RESET}  ")
                         first_chunk = False
-
                     if think_tok and enable_thinking:
                         if not in_think_disp:
                             sys.stdout.write(f"{C.THINK}[Thinking] ")
                             in_think_disp = True
                         sys.stdout.write(f"{C.THINK}{think_tok}{C.RESET}")
                         sys.stdout.flush()
-
                     if text_tok:
                         full_text += text_tok
                         remaining = text_tok
@@ -1281,17 +1640,12 @@ def stream_response(
                                 else:
                                     _flush_text(remaining)
                                     remaining = ""
-
-                    if (
-                        not is_openai_compat
-                        and finish_reason in ("SAFETY", "RECITATION", "OTHER")
-                    ):
+                    if not is_openai_compat and finish_reason in ("SAFETY", "RECITATION", "OTHER"):
                         if not full_text:
                             error_msg = f"Stream ended (reason: {finish_reason})"
                         break
                     if provider == "ollama" and finish_reason == "stop":
                         break
-
     except KeyboardInterrupt:
         interrupted = True
         if first_chunk:
@@ -1316,7 +1670,6 @@ def stream_response(
         sys.stdout.flush()
     MD_RENDERER.in_code_block = False
 
-    # ── Normalise tool calls ────────────────────────────────────────
     tool_calls_out: list[dict[str, Any]] = []
     if is_openai_compat:
         for idx in sorted(oai_tool_calls):
@@ -1324,12 +1677,8 @@ def stream_response(
     else:
         for gtc in gem_tool_calls:
             tool_calls_out.append({
-                "id": gtc.get("name", "call_gemini"),
-                "type": "function",
-                "function": {
-                    "name": gtc.get("name", ""),
-                    "arguments": json.dumps(gtc.get("args", {})),
-                },
+                "id": gtc.get("name", "call_gemini"), "type": "function",
+                "function": {"name": gtc.get("name", ""), "arguments": json.dumps(gtc.get("args", {}))},
             })
 
     if first_chunk and not error_msg and not interrupted:
@@ -1345,17 +1694,13 @@ def stream_response(
     if error_msg:
         cprint(f"{C.ERROR}{error_msg}{C.RESET}")
         return None, []
-
     if interrupted and full_text:
         eprint(f"{C.INFO}(Partial response saved){C.RESET}")
-
     if len(full_text) > MAX_MESSAGE_LENGTH:
         full_text = full_text[:MAX_MESSAGE_LENGTH]
-
     clean = strip_think_tags(full_text)
     if not clean and not tool_calls_out and not interrupted:
         return None, []
-
     return (clean if clean else ""), tool_calls_out
 
 
@@ -1364,43 +1709,29 @@ def stream_response(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _append_assistant_turn(
-    history: History,
-    ai_text: Optional[str],
-    tool_calls: list[dict[str, Any]],
-    provider: str,
-    is_openai_compat: bool,
+    history: History, ai_text: Optional[str],
+    tool_calls: list[dict[str, Any]], provider: str, is_openai_compat: bool,
 ) -> None:
-    """Append the assistant's reply to *history* in the correct format."""
     if not is_openai_compat:
         parts: list[dict[str, Any]] = []
         if ai_text:
             parts.append({"text": ai_text})
         for tc in tool_calls:
-            parts.append({
-                "functionCall": {
-                    "name": tc["function"]["name"],
-                    "args": _args_to_obj(tc["function"]["arguments"]),
-                }
-            })
+            parts.append({"functionCall": {"name": tc["function"]["name"],
+                          "args": _args_to_obj(tc["function"]["arguments"])}})
         if parts:
             history.append({"role": "model", "parts": parts})
         return
-
     if provider == "ollama":
         asst_msg: Message = {"role": "assistant", "content": ai_text or ""}
         if tool_calls:
             asst_msg["tool_calls"] = [
-                {
-                    "function": {
-                        "name": tc["function"]["name"],
-                        "arguments": _args_to_obj(tc["function"]["arguments"]),
-                    }
-                }
+                {"function": {"name": tc["function"]["name"],
+                              "arguments": _args_to_obj(tc["function"]["arguments"])}}
                 for tc in tool_calls
             ]
         history.append(asst_msg)
         return
-
     asst_msg = {"role": "assistant", "content": ai_text or ""}
     if tool_calls:
         asst_msg["tool_calls"] = tool_calls
@@ -1408,81 +1739,54 @@ def _append_assistant_turn(
 
 
 def _append_tool_results(
-    history: History,
-    tool_calls: list[dict[str, Any]],
-    results: list[str],
-    provider: str,
-    is_openai_compat: bool,
+    history: History, tool_calls: list[dict[str, Any]],
+    results: list[str], provider: str, is_openai_compat: bool,
 ) -> None:
-    """Append tool-result messages to *history* in the correct format."""
     if not is_openai_compat:
         response_parts = [
-            {
-                "functionResponse": {
-                    "name": tc["function"]["name"],
-                    "response": {"result": result},
-                }
-            }
+            {"functionResponse": {"name": tc["function"]["name"],
+                                  "response": {"result": result}}}
             for tc, result in zip(tool_calls, results)
         ]
         history.append({"role": "user", "parts": response_parts})
         return
-
     if provider == "ollama":
         for result in results:
             history.append({"role": "tool", "content": result})
         return
-
     for tc, result in zip(tool_calls, results):
         history.append({
-            "role": "tool",
-            "tool_call_id": tc.get("id", ""),
-            "name": tc["function"]["name"],
-            "content": result,
+            "role": "tool", "tool_call_id": tc.get("id", ""),
+            "name": tc["function"]["name"], "content": result,
         })
 
 
 def _extract_display_text(msg: Message) -> str:
-    """Extract readable text from any message format for /history display."""
     role = msg.get("role", "")
-
     if role == "tool":
         name = msg.get("name", "tool")
         return f"[🛠️  {name}] {truncate(msg.get('content', ''), 120)}"
-
     if "tool_calls" in msg:
-        names = []
-        for tc in msg["tool_calls"]:
-            fn = tc.get("function", tc)
-            names.append(fn.get("name", "?"))
+        names = [tc.get("function", tc).get("name", "?") for tc in msg["tool_calls"]]
         base = msg.get("content") or ""
         return (base + f" [🛠️  → {', '.join(names)}]").strip()
-
     raw = msg.get("content") or msg.get("parts", [{}])
-
     if isinstance(raw, str):
         return raw
-
     if isinstance(raw, list) and raw:
         if isinstance(raw[0], dict):
             if "text" in raw[0]:
                 return raw[0]["text"]
             if "functionCall" in raw[0]:
-                names = [p["functionCall"].get("name", "?") for p in raw if "functionCall" in p]
-                return f"[🛠️  → {', '.join(names)}]"
+                return f"[🛠️  → {', '.join(p['functionCall'].get('name', '?') for p in raw if 'functionCall' in p)}]"
             if "functionResponse" in raw[0]:
-                names = [p["functionResponse"].get("name", "?") for p in raw if "functionResponse" in p]
-                return f"[🛠️  results for {', '.join(names)}]"
+                return f"[🛠️  results for {', '.join(p['functionResponse'].get('name', '?') for p in raw if 'functionResponse' in p)}]"
             for part in raw:
                 if isinstance(part, dict) and part.get("type") == "text":
                     return part.get("text", "")
-            has_image = any(
-                isinstance(p, dict) and (p.get("type") == "image_url" or "inlineData" in p)
-                for p in raw
-            )
+            has_image = any(isinstance(p, dict) and (p.get("type") == "image_url" or "inlineData" in p) for p in raw)
             return "[📎 image]" if has_image else "[content]"
         return str(raw)
-
     return str(raw) if raw else "[empty]"
 
 
@@ -1534,6 +1838,7 @@ def read_paste_input(prefix: str = "") -> Optional[str]:
 
 def print_usage() -> None:
     me = Path(sys.argv[0]).name
+    dns = _dns_label()
     cprint(f"""
 {C.INFO}Usage:{C.RESET}
   python {me} <provider> [filter]...
@@ -1558,25 +1863,28 @@ def print_usage() -> None:
 
 {C.TOOL}Tool calling:{C.RESET}
   When enabled, the model can invoke local tools:
-    • {C.BOLD}get_time{C.RESET}     – current local date & time
-    • {C.BOLD}calculator{C.RESET}   – safe arithmetic evaluation
-    • {C.BOLD}fetch_url{C.RESET}    – fetch & clean a web page (≤ {FETCH_MAX_CHARS:,} chars)
-    • {C.BOLD}wikipedia{C.RESET}    – search Wikipedia & return article text
+    • {C.BOLD}get_time{C.RESET}      – current local date & time
+    • {C.BOLD}calculator{C.RESET}    – safe arithmetic evaluation
+    • {C.BOLD}web_search{C.RESET}    – search the web via Startpage
+    • {C.BOLD}fetch_url{C.RESET}     – fetch & clean any web page (≤ {FETCH_MAX_CHARS:,} chars)
+    • {C.BOLD}wikipedia{C.RESET}     – search Wikipedia & return article text
+  History auto-compacted after tool calls (only question + answer kept).
+  SSRF protection active.  DNS resolver: {dns}.
   Gemini also gets {C.BOLD}Google Search{C.RESET} grounding when tools are on.
 
 {C.INFO}Examples:{C.RESET}
   {C.AI}python {me} gemini{C.RESET}
   {C.AI}python {me} openrouter claude{C.RESET}
-  {C.AI}python {me} groq llama{C.RESET}
   {C.AI}python {me} ollama{C.RESET}
 
 {C.WARN}Set your API keys via environment variables or in the API_KEYS dict.{C.RESET}""")
 
 
 def print_chat_help() -> None:
+    dns = _dns_label()
     cprint(f"""{C.INFO}Commands:{C.RESET}
   {C.BOLD}/history{C.RESET}            Show conversation
-  {C.BOLD}/model{C.RESET}              Switch model (keeps history)
+  {C.BOLD}/model [filter]{C.RESET}     Switch model (keeps history)
   {C.BOLD}/save <name>{C.RESET}        Save session
   {C.BOLD}/load <name>{C.RESET}        Load session
   {C.BOLD}/clear{C.RESET}              Delete all sessions
@@ -1589,7 +1897,15 @@ def print_chat_help() -> None:
   {C.BOLD}/help{C.RESET}               Show this help
   {C.BOLD}quit{C.RESET} / {C.BOLD}exit{C.RESET}          End session
 {C.TOOL}Available tools:{C.RESET}
-  get_time · calculator · fetch_url · wikipedia""")
+  get_time · calculator · web_search · fetch_url · wikipedia
+{C.INFO}Search:{C.RESET}
+  Startpage (web search)
+{C.INFO}Security:{C.RESET}
+  SSRF protection: private IPs, localhost, cloud metadata blocked.
+  DNS resolver: {dns}
+{C.INFO}History:{C.RESET}
+  Tool-call messages auto-compacted after each exchange.
+  Only your question + AI's final answer kept in history.""")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1614,9 +1930,9 @@ def chat_loop(
     thinking_on: bool           = ENABLE_THINKING_OUTPUT
     tools_on:    bool           = enable_tools
 
-    # ── Banner ───────────────────────────────────────────────────────
     def _print_banner() -> None:
         sep = "─" * 85
+        dns = _dns_label()
         cprint(f"\n{sep}")
         cprint(f"  {C.INFO}Provider:{C.RESET}  {provider.upper()}   {C.INFO}Model:{C.RESET}  {model_id}")
         cprint(
@@ -1638,6 +1954,9 @@ def chat_loop(
         cprint(f"  {C.INFO}Tool calling:{C.RESET}     {tool_st}  (toggle: /toggletools)")
         if tools_on:
             cprint(f"  {C.INFO}Tools:{C.RESET}           {', '.join(TOOLS_REGISTRY)}")
+            cprint(f"  {C.INFO}Search:{C.RESET}          Startpage")
+            cprint(f"  {C.INFO}History mode:{C.RESET}    auto-compact (tool msgs collapsed)")
+        cprint(f"  {C.INFO}SSRF protection:{C.RESET} on   {C.INFO}DNS:{C.RESET} {dns}")
         cprint(
             f"  {C.INFO}Input:{C.RESET}   end line with {C.BOLD}\\{C.RESET} "
             f"to continue  │  {C.BOLD}/paste{C.RESET} for multi-line"
@@ -1651,14 +1970,12 @@ def chat_loop(
 
     _print_banner()
 
-    # ── REPL ─────────────────────────────────────────────────────────
     while True:
         img_tag = (
             f"[{C.IMAGE}📎 {Path(image.path).name}{C.RESET}] "
             if image.attached else ""
         )
         prompt = f"{img_tag}{C.BOLD}{C.USER}You:{C.RESET} "
-
         raw = read_multiline_input(prompt)
         if raw is None:
             cprint(f"\n{C.INFO}Ending session.{C.RESET}")
@@ -1668,7 +1985,6 @@ def chat_loop(
         if user_input.lower() in ("quit", "exit"):
             break
 
-        # ── Slash commands ───────────────────────────────────────
         if user_input.startswith("/"):
             parts = user_input.split(None, 1)
             cmd = parts[0].lower()
@@ -1682,17 +1998,12 @@ def chat_loop(
                     handled = False
                 else:
                     cprint(f"{C.INFO}Nothing to send.{C.RESET}")
-
             elif cmd == "/help":
                 print_chat_help()
-
             elif cmd == "/model":
-                # ── Live model switch ────────────────────────────
-                # Optional inline filter: /model llama
                 inline_filters = args.split() if args else filters
                 new_model = select_model_interactive(
-                    provider, api_key, inline_filters,
-                    current_model=model_id,
+                    provider, api_key, inline_filters, current_model=model_id,
                 )
                 if new_model is not None:
                     old_model = model_id
@@ -1709,35 +2020,29 @@ def chat_loop(
                             f"{C.INFO}  Conversation history "
                             f"({len(history)} messages) preserved.{C.RESET}"
                         )
-
             elif cmd == "/upload":
                 if not args:
                     eprint(f"{C.IMAGE}Usage: /upload <image_path>{C.RESET}")
                 else:
                     image.load(args)
-
             elif cmd == "/image":
                 if image.attached:
                     cprint(f"{C.IMAGE}Attached: {image.path}  ({image.mime}){C.RESET}")
                 else:
                     cprint(f"{C.IMAGE}No image attached.{C.RESET}")
-
             elif cmd == "/clearimage":
                 image.clear()
                 cprint(f"{C.IMAGE}Image cleared.{C.RESET}")
-
             elif cmd == "/togglethinking":
                 thinking_on = not thinking_on
                 st = f"{C.BOLD}{C.THINK}enabled{C.RESET}" if thinking_on else f"{C.BOLD}disabled{C.RESET}"
                 cprint(f"{C.INFO}Thinking output {st}.{C.RESET}")
-
             elif cmd == "/toggletools":
                 tools_on = not tools_on
                 st = f"{C.BOLD}{C.TOOL}enabled{C.RESET}" if tools_on else f"{C.BOLD}disabled{C.RESET}"
                 cprint(f"{C.INFO}Tool calling {st}.{C.RESET}")
                 if tools_on:
                     cprint(f"{C.INFO}  Tools: {', '.join(TOOLS_REGISTRY)}{C.RESET}")
-
             elif cmd == "/history":
                 cprint(f"{C.INFO}── History ({len(history)} messages) ─────────────────────{C.RESET}")
                 if not history:
@@ -1745,19 +2050,15 @@ def chat_loop(
                 for msg in history:
                     role = msg.get("role", "?")
                     text = _extract_display_text(msg)
-                    colour = {
-                        "user": C.USER, "assistant": C.AI, "model": C.AI,
-                        "system": C.WARN, "tool": C.TOOL,
-                    }.get(role, C.DIM)
+                    colour = {"user": C.USER, "assistant": C.AI, "model": C.AI,
+                              "system": C.WARN, "tool": C.TOOL}.get(role, C.DIM)
                     cprint(f"  {colour}[{role}]{C.RESET}  {truncate(text, 500)}")
                 cprint(f"{C.INFO}────────────────────────────────────────────────────{C.RESET}")
-
             elif cmd == "/save":
                 if not args:
                     eprint(f"{C.WARN}Usage: /save <name>{C.RESET}")
                 elif validate_session_name(args):
                     save_session(args, history)
-
             elif cmd == "/load":
                 if not args:
                     eprint(f"{C.WARN}Usage: /load <name>{C.RESET}")
@@ -1765,17 +2066,14 @@ def chat_loop(
                     loaded = load_session(args)
                     if loaded is not None:
                         history = loaded
-
             elif cmd == "/clear":
                 clear_sessions()
-
             else:
                 eprint(f"{C.WARN}Unknown command '{cmd}'. Type /help for a list.{C.RESET}")
 
             if handled:
                 continue
 
-        # ── Guard ────────────────────────────────────────────────
         if not user_input and not image.attached:
             continue
         if not user_input and image.attached:
@@ -1785,12 +2083,13 @@ def chat_loop(
             continue
 
         eprint(f"{C.INFO}[Sending…]{C.RESET}")
-
         user_msg = build_user_message(user_input, image, provider, is_openai_compat)
         image.clear()
         history.append(user_msg)
 
-        # ── Inner tool-execution loop ────────────────────────────
+        compact_from = len(history)
+        had_tool_calls = False
+        final_ai_text: Optional[str] = None
         tool_iter = 0
 
         while True:
@@ -1798,45 +2097,42 @@ def chat_loop(
             if tool_iter > MAX_TOOL_ITERATIONS:
                 eprint(f"{C.ERROR}Tool-call loop limit ({MAX_TOOL_ITERATIONS}) reached.{C.RESET}")
                 break
-
             history = truncate_history(history, is_openai_compat)
-
             ai_text, tool_calls = stream_response(
                 provider, model_id, history, is_openai_compat,
                 api_key, tools_on, thinking_on,
             )
-
             if ai_text is None and not tool_calls:
                 if history and history[-1].get("role") == "user":
                     history.pop()
                     eprint(f"{C.WARN}(User message rolled back due to error){C.RESET}")
                 break
-
-            _append_assistant_turn(
-                history, ai_text, tool_calls, provider, is_openai_compat,
-            )
-
+            _append_assistant_turn(history, ai_text, tool_calls, provider, is_openai_compat)
             if tool_calls and tools_on:
+                had_tool_calls = True
                 results: list[str] = []
                 for tc in tool_calls:
                     fn_name = tc["function"]["name"]
                     fn_args = tc["function"]["arguments"]
                     display = _args_display(fn_args)
-                    cprint(
-                        f"\n{C.TOOL}⚡ Tool: {fn_name}"
-                        f"({display}){C.RESET}"
-                    )
+                    cprint(f"\n{C.TOOL}⚡ Tool: {fn_name}({display}){C.RESET}")
                     result = execute_tool(fn_name, fn_args)
                     cprint(f"{C.DIM}   → {truncate(result, 300)}{C.RESET}")
                     results.append(result)
-
-                _append_tool_results(
-                    history, tool_calls, results,
-                    provider, is_openai_compat,
-                )
+                _append_tool_results(history, tool_calls, results, provider, is_openai_compat)
                 continue
-
+            final_ai_text = ai_text
             break
+
+        if had_tool_calls and final_ai_text is not None:
+            if not is_openai_compat:
+                clean_final: Message = {"role": "model", "parts": [{"text": final_ai_text}]}
+            else:
+                clean_final = {"role": "assistant", "content": final_ai_text}
+            n_intermediate = len(history) - compact_from
+            history[compact_from:] = [clean_final]
+            if n_intermediate > 1:
+                eprint(f"{C.DIM}(History compacted: {n_intermediate} tool messages → 1 answer){C.RESET}")
 
         cprint("")
 
@@ -1872,7 +2168,6 @@ def main() -> None:
 
     is_openai_compat = (provider != "gemini")
 
-    # ── Tool-calling prompt ──────────────────────────────────────────
     enable_tools = False
     tool_names = ", ".join(TOOLS_REGISTRY)
     while True:
@@ -1884,14 +2179,14 @@ def main() -> None:
             sys.exit(0)
         if ans in ("y", "yes"):
             enable_tools = True
-            cprint(f"{C.TOOL}Tool calling enabled.{C.RESET}")
+            dns = _dns_label()
+            cprint(f"{C.TOOL}Tool calling enabled.  Search: Startpage  │  DNS: {dns}  │  SSRF: protected{C.RESET}")
             break
         elif ans in ("n", "no", ""):
             break
         else:
             eprint(f"{C.WARN}Please enter y or n.{C.RESET}")
 
-    # ── Initial model selection ──────────────────────────────────────
     model_id = select_model_interactive(provider, api_key, filters)
     if model_id is None:
         sys.exit(1)
