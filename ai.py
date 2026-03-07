@@ -15,7 +15,8 @@ Features:
   - Image attachment support (Vision models)
   - Multi-line input (backslash continuation + /paste mode)
   - Multi-provider support (Gemini, OpenRouter, Groq, Together, etc.)
-  - Tool/Function calling (Web fetch, Calculator, Local time)
+  - Tool/Function calling (Web fetch, Calculator, Local time, Wikipedia)
+  - Live model switching (/model command)
 
 Usage:
     python ai.py <provider> [filter]...
@@ -28,6 +29,7 @@ Providers: gemini, openrouter, groq, together, cerebras, novita, ollama
 
 Chat commands:
     /history            Show conversation history
+    /model              Switch to a different model mid-chat
     /save <name>        Save session to ~/.chat_sessions/<name>.json
     /load <name>        Load a saved session
     /clear              Delete all saved sessions
@@ -56,6 +58,8 @@ import signal
 import datetime
 import urllib.request
 import urllib.error
+import urllib.parse
+import html as _html
 import mimetypes
 import atexit
 from pathlib import Path
@@ -77,6 +81,9 @@ except ImportError:
 #  CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
+##############################################################################
+#                   !!! EDIT YOUR API KEYS HERE !!!                          #
+##############################################################################
 API_KEYS: dict[str, str] = {
     "gemini":     "",   # https://aistudio.google.com/app/apikey
     "openrouter": "",   # https://openrouter.ai/keys
@@ -105,6 +112,8 @@ MAX_TOOL_ITERATIONS    = 10
 
 REQUEST_TIMEOUT     = 300
 MODEL_FETCH_TIMEOUT = 30
+
+FETCH_MAX_CHARS = 8000
 
 USER_AGENT = "PythonChatCLI/1.2"
 
@@ -385,11 +394,36 @@ def _args_to_obj(arguments: str) -> dict[str, Any]:
 def _args_display(arguments: str) -> str:
     """Compact single-line display of tool arguments."""
     obj = _args_to_obj(arguments)
-    # Drop empty / garbage keys the model hallucinated
     obj = {k: v for k, v in obj.items() if k}
     if not obj:
         return ""
     return json.dumps(obj, ensure_ascii=False, separators=(", ", ": "))
+
+
+def _clean_html(raw: str) -> str:
+    """Strip scripts, styles, tags, and entities from raw HTML."""
+    text = re.sub(
+        r"<script[^>]*>.*?</script>", " ", raw,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(
+        r"<style[^>]*>.*?</style>", " ", text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(
+        r"<noscript[^>]*>.*?</noscript>", " ", text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.DOTALL)
+    text = re.sub(
+        r"<svg[^>]*>.*?</svg>", " ", text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = _html.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n[ \t]*\n[\n ]*", "\n\n", text)
+    return text.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -483,26 +517,90 @@ def tool_calculator(expression: str = "", **kwargs: Any) -> str:
 
 
 def tool_fetch_url(url: str = "", **kwargs: Any) -> str:
-    """Fetch a web page and return its text (HTML stripped, ≤ 3000 chars)."""
+    """Fetch a web page and return clean text (≤ FETCH_MAX_CHARS chars).
+
+    Automatically uses the Wikipedia API for wikipedia.org URLs
+    to get clean plaintext instead of scraping HTML.
+    """
     if not url:
         return "Error: No URL provided."
     if not url.startswith("http"):
         url = "https://" + url
+
+    # ── Wikipedia fast-path: use the MediaWiki API for clean text ──
+    wiki_match = re.match(
+        r"https?://(\w+)\.wikipedia\.org/wiki/([^#?]+)", url
+    )
+    if wiki_match:
+        lang, title = wiki_match.group(1), wiki_match.group(2)
+        api_url = (
+            f"https://{lang}.wikipedia.org/w/api.php?"
+            f"action=query"
+            f"&titles={urllib.parse.quote(title, safe='')}"
+            f"&prop=extracts"
+            f"&explaintext=1"
+            f"&exlimit=1"
+            f"&exchars={FETCH_MAX_CHARS}"
+            f"&format=json"
+        )
+        try:
+            req = urllib.request.Request(
+                api_url, headers={"User-Agent": USER_AGENT}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                pages = data.get("query", {}).get("pages", {})
+                for page_id, page_data in pages.items():
+                    if page_id == "-1":
+                        break
+                    extract = page_data.get("extract", "")
+                    page_title = page_data.get("title", title)
+                    if extract:
+                        return f"Wikipedia — {page_title}\n\n{extract}"[:FETCH_MAX_CHARS]
+        except Exception:
+            pass
+
+    # ── Generic fetch with proper HTML cleaning ───────────────────
     try:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
-            text = re.sub(r"<[^>]+>", " ", raw)
-            text = re.sub(r"\s+", " ", text).strip()
-            return text[:3000]
+            text = _clean_html(raw)
+            return text[:FETCH_MAX_CHARS]
     except Exception as exc:
         return f"Error fetching URL: {exc}"
+
+
+def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
+    """Search Wikipedia and return the top article's plaintext."""
+    if not query:
+        return "Error: No query provided."
+    search_url = (
+        f"https://{lang}.wikipedia.org/w/api.php?"
+        f"action=query&list=search"
+        f"&srsearch={urllib.parse.quote(query)}"
+        f"&srlimit=1&format=json"
+    )
+    try:
+        req = urllib.request.Request(search_url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        results = data.get("query", {}).get("search", [])
+        if not results:
+            return f"No Wikipedia results for: {query}"
+        title = results[0]["title"]
+        return tool_fetch_url(
+            url=f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(title, safe='')}"
+        )
+    except Exception as exc:
+        return f"Error: {exc}"
 
 
 TOOLS_REGISTRY: dict[str, Any] = {
     "get_time":   tool_get_time,
     "calculator": tool_calculator,
     "fetch_url":  tool_fetch_url,
+    "wikipedia":  tool_wikipedia,
 }
 
 OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
@@ -535,7 +633,7 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "fetch_url",
-            "description": "Fetch text content from a web page by URL.",
+            "description": "Fetch text content from a web page by URL. Returns clean plaintext. Works especially well with Wikipedia URLs.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -545,6 +643,27 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "wikipedia",
+            "description": "Search Wikipedia by query and return the top article's plaintext content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query, e.g. 'Governor of West Bengal'",
+                    },
+                    "lang": {
+                        "type": "string",
+                        "description": "Wikipedia language code, default 'en'.",
+                    },
+                },
+                "required": ["query"],
             },
         },
     },
@@ -573,7 +692,7 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
             },
             {
                 "name": "fetch_url",
-                "description": "Fetch text content from a web page by URL.",
+                "description": "Fetch text content from a web page by URL. Returns clean plaintext. Works especially well with Wikipedia URLs.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -583,6 +702,24 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                         },
                     },
                     "required": ["url"],
+                },
+            },
+            {
+                "name": "wikipedia",
+                "description": "Search Wikipedia by query and return the top article's plaintext content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query, e.g. 'Governor of West Bengal'",
+                        },
+                        "lang": {
+                            "type": "string",
+                            "description": "Wikipedia language code, default 'en'.",
+                        },
+                    },
+                    "required": ["query"],
                 },
             },
         ],
@@ -596,7 +733,6 @@ def execute_tool(name: str, arguments_json: str) -> str:
     if fn is None:
         return f"Error: unknown tool '{name}'"
     args = _args_to_obj(arguments_json)
-    # Strip hallucinated empty keys
     args = {k: v for k, v in args.items() if k}
     try:
         return str(fn(**args))
@@ -786,6 +922,54 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
         return None
 
     return [m for m in models if m]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODEL SELECTION (shared by main + /model)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def select_model_interactive(
+    provider: str, api_key: str, filters: list[str],
+    current_model: str = "",
+) -> Optional[str]:
+    """Fetch models, apply filters, present numbered list, return chosen id.
+
+    Returns None if the user cancels or an error occurs.
+    If *current_model* is set it is highlighted in the list.
+    """
+    cprint(f"{C.INFO}Fetching models for {provider.upper()}…{C.RESET}")
+    models = fetch_models(provider, api_key)
+    if not models:
+        eprint(f"{C.ERROR}No models returned by {provider.upper()}.{C.RESET}")
+        return None
+
+    if filters:
+        models = filter_models(models, filters)
+    if not models:
+        eprint(f"{C.ERROR}No models matched filter: {' '.join(filters)}{C.RESET}")
+        return None
+
+    if len(models) == 1:
+        cprint(f"{C.INFO}Auto-selected:{C.RESET} {models[0]}")
+        return models[0]
+
+    cprint(f"{C.INFO}Available models for {provider.upper()}:{C.RESET}")
+    for i, m in enumerate(models, 1):
+        marker = f"  {C.BOLD}{C.AI}◉{C.RESET}" if m == current_model else "   "
+        cprint(f"{marker}{C.BOLD}{i:3}{C.RESET}. {m}")
+
+    while True:
+        try:
+            choice = input(f"{C.INFO}Select model number (or 'c' to cancel): {C.RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            cprint(f"\n{C.INFO}Cancelled.{C.RESET}")
+            return None
+        if choice.lower() in ("c", "cancel", "q"):
+            cprint(f"{C.INFO}Cancelled.{C.RESET}")
+            return None
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
+            return models[int(choice) - 1]
+        eprint(f"{C.WARN}Enter a number between 1 and {len(models)}, or 'c' to cancel.{C.RESET}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -984,12 +1168,10 @@ def stream_response(
                             think_tok = msg_obj.get("thinking") or ""
                             if obj.get("done") is True:
                                 cur_finish = "stop"
-                            # Ollama sends full tool_calls in one shot
                             for tc in msg_obj.get("tool_calls", []):
                                 idx = len(oai_tool_calls)
                                 fn = tc.get("function", {})
                                 args_raw = fn.get("arguments", "")
-                                # Ollama sends arguments as object → serialise
                                 if isinstance(args_raw, dict):
                                     args_raw = json.dumps(args_raw)
                                 elif not isinstance(args_raw, str):
@@ -1188,13 +1370,8 @@ def _append_assistant_turn(
     provider: str,
     is_openai_compat: bool,
 ) -> None:
-    """Append the assistant's reply to *history* in the correct format.
-
-    Ollama's native /api/chat needs `arguments` as a JSON **object**,
-    not a string, and must not have the OpenAI `id` / `type` wrappers.
-    """
+    """Append the assistant's reply to *history* in the correct format."""
     if not is_openai_compat:
-        # ── Gemini ──────────────────────────────────────────────────
         parts: list[dict[str, Any]] = []
         if ai_text:
             parts.append({"text": ai_text})
@@ -1210,9 +1387,6 @@ def _append_assistant_turn(
         return
 
     if provider == "ollama":
-        # ── Ollama native ───────────────────────────────────────────
-        # arguments MUST be an object, not a JSON string.
-        # Do NOT include "id" / "type" — Ollama doesn't expect them.
         asst_msg: Message = {"role": "assistant", "content": ai_text or ""}
         if tool_calls:
             asst_msg["tool_calls"] = [
@@ -1227,7 +1401,6 @@ def _append_assistant_turn(
         history.append(asst_msg)
         return
 
-    # ── Standard OpenAI-compatible ──────────────────────────────────
     asst_msg = {"role": "assistant", "content": ai_text or ""}
     if tool_calls:
         asst_msg["tool_calls"] = tool_calls
@@ -1241,16 +1414,8 @@ def _append_tool_results(
     provider: str,
     is_openai_compat: bool,
 ) -> None:
-    """Append tool-result messages to *history* in the correct format.
-
-    Ollama only needs ``{"role": "tool", "content": "…"}``.
-    Gemini packs all results into one ``"user"`` turn with
-    ``functionResponse`` parts.
-    Standard OpenAI uses one ``"tool"`` message per call with
-    ``tool_call_id`` and ``name``.
-    """
+    """Append tool-result messages to *history* in the correct format."""
     if not is_openai_compat:
-        # ── Gemini ──────────────────────────────────────────────────
         response_parts = [
             {
                 "functionResponse": {
@@ -1264,12 +1429,10 @@ def _append_tool_results(
         return
 
     if provider == "ollama":
-        # ── Ollama native ───────────────────────────────────────────
         for result in results:
             history.append({"role": "tool", "content": result})
         return
 
-    # ── Standard OpenAI-compatible ──────────────────────────────────
     for tc, result in zip(tool_calls, results):
         history.append({
             "role": "tool",
@@ -1290,7 +1453,7 @@ def _extract_display_text(msg: Message) -> str:
     if "tool_calls" in msg:
         names = []
         for tc in msg["tool_calls"]:
-            fn = tc.get("function", tc)   # Ollama may omit the wrapper
+            fn = tc.get("function", tc)
             names.append(fn.get("name", "?"))
         base = msg.get("content") or ""
         return (base + f" [🛠️  → {', '.join(names)}]").strip()
@@ -1380,6 +1543,7 @@ def print_usage() -> None:
 
 {C.INFO}Chat commands:{C.RESET}
   {C.BOLD}/history{C.RESET}            Show conversation history
+  {C.BOLD}/model{C.RESET}              Switch to a different model mid-chat
   {C.BOLD}/save <name>{C.RESET}        Save session  (~/.chat_sessions/<name>.json)
   {C.BOLD}/load <name>{C.RESET}        Load a saved session
   {C.BOLD}/clear{C.RESET}              Delete all saved sessions
@@ -1396,7 +1560,8 @@ def print_usage() -> None:
   When enabled, the model can invoke local tools:
     • {C.BOLD}get_time{C.RESET}     – current local date & time
     • {C.BOLD}calculator{C.RESET}   – safe arithmetic evaluation
-    • {C.BOLD}fetch_url{C.RESET}    – fetch & strip a web page (≤ 3 000 chars)
+    • {C.BOLD}fetch_url{C.RESET}    – fetch & clean a web page (≤ {FETCH_MAX_CHARS:,} chars)
+    • {C.BOLD}wikipedia{C.RESET}    – search Wikipedia & return article text
   Gemini also gets {C.BOLD}Google Search{C.RESET} grounding when tools are on.
 
 {C.INFO}Examples:{C.RESET}
@@ -1411,6 +1576,7 @@ def print_usage() -> None:
 def print_chat_help() -> None:
     cprint(f"""{C.INFO}Commands:{C.RESET}
   {C.BOLD}/history{C.RESET}            Show conversation
+  {C.BOLD}/model{C.RESET}              Switch model (keeps history)
   {C.BOLD}/save <name>{C.RESET}        Save session
   {C.BOLD}/load <name>{C.RESET}        Load session
   {C.BOLD}/clear{C.RESET}              Delete all sessions
@@ -1423,7 +1589,7 @@ def print_chat_help() -> None:
   {C.BOLD}/help{C.RESET}               Show this help
   {C.BOLD}quit{C.RESET} / {C.BOLD}exit{C.RESET}          End session
 {C.TOOL}Available tools:{C.RESET}
-  get_time · calculator · fetch_url""")
+  get_time · calculator · fetch_url · wikipedia""")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1432,7 +1598,7 @@ def print_chat_help() -> None:
 
 def chat_loop(
     provider: str, model_id: str, is_openai_compat: bool,
-    api_key: str, enable_tools: bool,
+    api_key: str, enable_tools: bool, filters: list[str],
 ) -> None:
     if _READLINE_AVAILABLE:
         readline.set_history_length(1000)
@@ -1449,34 +1615,41 @@ def chat_loop(
     tools_on:    bool           = enable_tools
 
     # ── Banner ───────────────────────────────────────────────────────
-    sep = "─" * 85
-    cprint(f"\n{sep}")
-    cprint(f"  {C.INFO}Provider:{C.RESET}  {provider.upper()}   {C.INFO}Model:{C.RESET}  {model_id}")
-    cprint(
-        f"  {C.INFO}History:{C.RESET}   last {MAX_HISTORY_MESSAGES} turns  │  "
-        f"{C.INFO}Temp:{C.RESET} {DEFAULT_TEMPERATURE}  │  "
-        f"{C.INFO}Tokens:{C.RESET} {DEFAULT_MAX_TOKENS}  │  "
-        f"{C.INFO}TopP:{C.RESET} {DEFAULT_TOP_P}"
-    )
-    cprint(f"  {C.INFO}Max message:{C.RESET}  {MAX_MESSAGE_LENGTH:,} characters")
-    status = "active" if SYSTEM_PROMPT else "inactive (empty)"
-    cprint(f"  {C.INFO}System prompt:{C.RESET}  {status}")
-    if provider == "ollama":
-        ollama_url = ENDPOINTS["ollama"]["chat"].rsplit("/api/", 1)[0]
-        cprint(f"  {C.INFO}Ollama URL:{C.RESET}  {ollama_url}")
-    cprint(f"  {C.INFO}Rendering:{C.RESET}   Markdown + LaTeX → Unicode")
-    think_st = f"{C.BOLD}{C.THINK}enabled{C.RESET}" if thinking_on else "disabled"
-    cprint(f"  {C.INFO}Thinking output:{C.RESET}  {think_st}  (toggle: /togglethinking)")
-    tool_st = f"{C.BOLD}{C.TOOL}enabled{C.RESET}" if tools_on else "disabled"
-    cprint(f"  {C.INFO}Tool calling:{C.RESET}     {tool_st}  (toggle: /toggletools)")
-    if tools_on:
-        cprint(f"  {C.INFO}Tools:{C.RESET}           {', '.join(TOOLS_REGISTRY)}")
-    cprint(
-        f"  {C.INFO}Input:{C.RESET}   end line with {C.BOLD}\\{C.RESET} "
-        f"to continue  │  {C.BOLD}/paste{C.RESET} for multi-line"
-    )
-    cprint(f"  Type {C.BOLD}quit{C.RESET} or {C.BOLD}exit{C.RESET} to end  │  {C.BOLD}/help{C.RESET} for all commands")
-    cprint(sep + "\n")
+    def _print_banner() -> None:
+        sep = "─" * 85
+        cprint(f"\n{sep}")
+        cprint(f"  {C.INFO}Provider:{C.RESET}  {provider.upper()}   {C.INFO}Model:{C.RESET}  {model_id}")
+        cprint(
+            f"  {C.INFO}History:{C.RESET}   last {MAX_HISTORY_MESSAGES} turns  │  "
+            f"{C.INFO}Temp:{C.RESET} {DEFAULT_TEMPERATURE}  │  "
+            f"{C.INFO}Tokens:{C.RESET} {DEFAULT_MAX_TOKENS}  │  "
+            f"{C.INFO}TopP:{C.RESET} {DEFAULT_TOP_P}"
+        )
+        cprint(f"  {C.INFO}Max message:{C.RESET}  {MAX_MESSAGE_LENGTH:,} characters")
+        status = "active" if SYSTEM_PROMPT else "inactive (empty)"
+        cprint(f"  {C.INFO}System prompt:{C.RESET}  {status}")
+        if provider == "ollama":
+            ollama_url = ENDPOINTS["ollama"]["chat"].rsplit("/api/", 1)[0]
+            cprint(f"  {C.INFO}Ollama URL:{C.RESET}  {ollama_url}")
+        cprint(f"  {C.INFO}Rendering:{C.RESET}   Markdown + LaTeX → Unicode")
+        think_st = f"{C.BOLD}{C.THINK}enabled{C.RESET}" if thinking_on else "disabled"
+        cprint(f"  {C.INFO}Thinking output:{C.RESET}  {think_st}  (toggle: /togglethinking)")
+        tool_st = f"{C.BOLD}{C.TOOL}enabled{C.RESET}" if tools_on else "disabled"
+        cprint(f"  {C.INFO}Tool calling:{C.RESET}     {tool_st}  (toggle: /toggletools)")
+        if tools_on:
+            cprint(f"  {C.INFO}Tools:{C.RESET}           {', '.join(TOOLS_REGISTRY)}")
+        cprint(
+            f"  {C.INFO}Input:{C.RESET}   end line with {C.BOLD}\\{C.RESET} "
+            f"to continue  │  {C.BOLD}/paste{C.RESET} for multi-line"
+        )
+        cprint(
+            f"  Type {C.BOLD}quit{C.RESET} or {C.BOLD}exit{C.RESET} to end  │  "
+            f"{C.BOLD}/model{C.RESET} to switch  │  "
+            f"{C.BOLD}/help{C.RESET} for all commands"
+        )
+        cprint(sep + "\n")
+
+    _print_banner()
 
     # ── REPL ─────────────────────────────────────────────────────────
     while True:
@@ -1512,6 +1685,30 @@ def chat_loop(
 
             elif cmd == "/help":
                 print_chat_help()
+
+            elif cmd == "/model":
+                # ── Live model switch ────────────────────────────
+                # Optional inline filter: /model llama
+                inline_filters = args.split() if args else filters
+                new_model = select_model_interactive(
+                    provider, api_key, inline_filters,
+                    current_model=model_id,
+                )
+                if new_model is not None:
+                    old_model = model_id
+                    model_id = new_model
+                    if old_model == model_id:
+                        cprint(f"{C.INFO}Already using {model_id}.{C.RESET}")
+                    else:
+                        cprint(
+                            f"{C.INFO}Switched model: "
+                            f"{C.DIM}{old_model}{C.RESET}{C.INFO} → "
+                            f"{C.BOLD}{model_id}{C.RESET}"
+                        )
+                        cprint(
+                            f"{C.INFO}  Conversation history "
+                            f"({len(history)} messages) preserved.{C.RESET}"
+                        )
 
             elif cmd == "/upload":
                 if not args:
@@ -1609,19 +1806,16 @@ def chat_loop(
                 api_key, tools_on, thinking_on,
             )
 
-            # Hard error → roll back user message
             if ai_text is None and not tool_calls:
                 if history and history[-1].get("role") == "user":
                     history.pop()
                     eprint(f"{C.WARN}(User message rolled back due to error){C.RESET}")
                 break
 
-            # ── Append assistant turn ────────────────────────────
             _append_assistant_turn(
                 history, ai_text, tool_calls, provider, is_openai_compat,
             )
 
-            # ── Execute tool calls ───────────────────────────────
             if tool_calls and tools_on:
                 results: list[str] = []
                 for tc in tool_calls:
@@ -1633,17 +1827,15 @@ def chat_loop(
                         f"({display}){C.RESET}"
                     )
                     result = execute_tool(fn_name, fn_args)
-                    cprint(f"{C.DIM}   → {truncate(result, 120)}{C.RESET}")
+                    cprint(f"{C.DIM}   → {truncate(result, 300)}{C.RESET}")
                     results.append(result)
 
                 _append_tool_results(
                     history, tool_calls, results,
                     provider, is_openai_compat,
                 )
-                # Loop back so the model can use the results
                 continue
 
-            # No tool calls → done
             break
 
         cprint("")
@@ -1699,35 +1891,10 @@ def main() -> None:
         else:
             eprint(f"{C.WARN}Please enter y or n.{C.RESET}")
 
-    # ── Fetch models ─────────────────────────────────────────────────
-    cprint(f"{C.INFO}Fetching models for {provider.upper()}…{C.RESET}")
-    models = fetch_models(provider, api_key)
-    if not models:
-        cprint(f"{C.ERROR}No models returned by {provider.upper()}.{C.RESET}")
+    # ── Initial model selection ──────────────────────────────────────
+    model_id = select_model_interactive(provider, api_key, filters)
+    if model_id is None:
         sys.exit(1)
-
-    if filters:
-        models = filter_models(models, filters)
-    if not models:
-        cprint(f"{C.ERROR}No models matched filter: {' '.join(filters)}{C.RESET}")
-        sys.exit(1)
-
-    if len(models) == 1:
-        model_id = models[0]
-        cprint(f"{C.INFO}Auto-selected:{C.RESET} {model_id}")
-    else:
-        cprint(f"{C.INFO}Available models for {provider.upper()}:{C.RESET}")
-        for i, m in enumerate(models, 1):
-            cprint(f"  {C.BOLD}{i:3}{C.RESET}. {m}")
-        while True:
-            try:
-                choice = input(f"{C.INFO}Select model number: {C.RESET}").strip()
-            except (EOFError, KeyboardInterrupt):
-                sys.exit(0)
-            if choice.isdigit() and 1 <= int(choice) <= len(models):
-                model_id = models[int(choice) - 1]
-                break
-            eprint(f"{C.WARN}Enter a number between 1 and {len(models)}.{C.RESET}")
 
     cprint(f"{C.INFO}Using model:{C.RESET} {model_id}\n")
 
@@ -1737,7 +1904,7 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _sigint_handler)
 
-    chat_loop(provider, model_id, is_openai_compat, api_key, enable_tools)
+    chat_loop(provider, model_id, is_openai_compat, api_key, enable_tools, filters)
     cprint("👋 Session ended.")
 
 
