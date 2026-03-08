@@ -117,6 +117,16 @@ def eprint(msg: str) -> None:
     sys.stderr.flush()
 
 
+def _rl(code: str) -> str:
+    """Wrap ANSI code for readline input() prompts.
+
+    Tells readline this text is invisible (zero display width) so it
+    calculates line wrapping correctly in narrow terminals.
+    Only use in strings passed to input(), never in print/stdout.write.
+    """
+    return f"\001{code}\002"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  PROVIDER ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -380,7 +390,9 @@ def clear_sessions() -> None:
     for f in files:
         cprint(f"  {f.stem}")
     try:
-        answer = input(f"{C.WARN}Continue? (y/N): {C.RESET}").strip().lower()
+        answer = input(
+            f"{_rl(C.WARN)}Continue? (y/N): {_rl(C.RESET)}"
+        ).strip().lower()
     except (EOFError, KeyboardInterrupt):
         cprint(f"\n{C.INFO}Cancelled.{C.RESET}")
         return
@@ -949,10 +961,14 @@ def chat_loop(provider: str, model_id: str,
 
     # ── REPL ─────────────────────────────────────────────────────────────────
     while True:
-        # Build input prompt
-        img_tag = (f"[{C.IMAGE}📎 {Path(image.path).name}{C.RESET}] "
-                   if image.attached else "")
-        prompt = f"{img_tag}{C.BOLD}{C.USER}You:{C.RESET} "
+        # Build input prompt with _rl()-wrapped ANSI codes for readline
+        if image.attached:
+            img_tag = (f"[{_rl(C.IMAGE)}📎 {Path(image.path).name}"
+                       f"{_rl(C.RESET)}] ")
+        else:
+            img_tag = ""
+        prompt = (f"{img_tag}{_rl(C.BOLD)}{_rl(C.USER)}You:"
+                  f"{_rl(C.RESET)} ")
 
         try:
             user_input = input(prompt).strip()
@@ -1139,7 +1155,9 @@ def main() -> None:
             cprint(f"  {C.BOLD}{i:3}{C.RESET}. {m}")
         while True:
             try:
-                choice = input(f"{C.INFO}Select model number: {C.RESET}").strip()
+                choice = input(
+                    f"{_rl(C.INFO)}Select model number: {_rl(C.RESET)}"
+                ).strip()
             except (EOFError, KeyboardInterrupt):
                 sys.exit(0)
             if choice.isdigit() and 1 <= int(choice) <= len(models):
