@@ -11,16 +11,13 @@ Features:
   - Multi-provider support (Gemini, OpenRouter, Groq, Together, etc.)
   - Tool/Function calling (Web search, fetch, Calculator, Time, Wikipedia)
   - Web search via Startpage
+  - Live tool progress spinner
   - Live model switching (/model command)
   - History compaction (tool messages auto-collapsed after each exchange)
   - SSRF protection
 
 Usage:
     python ai.py <provider> [filter]...
-    ./ai.py gemini
-    ./ai.py openrouter claude
-    ./ai.py groq llama
-    ./ai.py ollama
 
 Providers: gemini, openrouter, groq, together, cerebras, novita, ollama
 
@@ -38,10 +35,6 @@ Chat commands:
     /toggletools        Toggle tool calling on/off
     /help               Show available commands
     quit / exit         End the session
-
-Multi-line input:
-    End any line with \\ to continue on the next line.
-    Use /paste for bulk paste mode.
 """
 
 import sys
@@ -57,6 +50,8 @@ import ipaddress
 import datetime
 import gzip
 import zlib
+import threading
+import time
 import http.cookiejar
 import urllib.request
 import urllib.error
@@ -83,14 +78,17 @@ except ImportError:
 #  CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
+##############################################################################
+#                   !!! EDIT YOUR API KEYS HERE !!!                          #
+##############################################################################
 API_KEYS: dict[str, str] = {
-    "gemini":     "",
-    "openrouter": "",
-    "groq":       "",
-    "together":   "",
-    "cerebras":   "",
-    "novita":     "",
-    "ollama":     "",
+    "gemini":     "",   # https://aistudio.google.com/app/apikey
+    "openrouter": "",   # https://openrouter.ai/keys
+    "groq":       "",   # https://console.groq.com/keys
+    "together":   "",   # https://api.together.ai/settings/api-keys
+    "cerebras":   "",   # https://cloud.cerebras.ai/
+    "novita":     "",   # https://novita.ai/
+    "ollama":     "",   # https://ollama.com/ (leave blank for local)
 }
 
 MAX_HISTORY_MESSAGES  = 20
@@ -128,6 +126,7 @@ BROWSER_USER_AGENT = (
 # ─────────────────────────────────────────────────────────────────────────────
 
 class C:
+    """ANSI colour codes for terminal output (NOT for input() prompts)."""
     RESET  = "\033[0m"
     USER   = "\033[38;5;199m"
     AI     = "\033[38;5;40m"
@@ -142,6 +141,16 @@ class C:
     CODE   = "\033[38;5;229m"
     TOOL   = "\033[38;5;141m"
     CLR    = "\033[2K\r"
+
+
+def _rl(code: str) -> str:
+    """Wrap ANSI code for readline input() prompts.
+
+    Tells readline this text is invisible (zero display width) so it
+    calculates line wrapping correctly in narrow terminals.
+    Only use in strings passed to input(), never in print/stdout.write.
+    """
+    return f"\001{code}\002"
 
 
 def cprint(msg: str, end: str = "\n") -> None:
@@ -521,6 +530,57 @@ def _make_opener() -> urllib.request.OpenerDirector:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  TOOL PROGRESS SPINNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _ToolProgress:
+    _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self) -> None:
+        self._active = False
+        self._status = ""
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self._start_time = 0.0
+
+    def start(self, label: str) -> None:
+        self._active = True
+        self._status = label
+        self._start_time = time.monotonic()
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+        self._thread.start()
+
+    def update(self, status: str) -> None:
+        with self._lock:
+            self._status = status
+
+    def stop(self) -> None:
+        self._active = False
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
+        sys.stdout.write(C.CLR)
+        sys.stdout.flush()
+
+    def _animate(self) -> None:
+        i = 0
+        while self._active:
+            with self._lock:
+                status = self._status
+            elapsed = time.monotonic() - self._start_time
+            timer = f" {C.DIM}({elapsed:.1f}s){C.RESET}"
+            frame = self._FRAMES[i % len(self._FRAMES)]
+            sys.stdout.write(
+                f"{C.CLR}{C.TOOL}   {frame} {status}{C.RESET}{timer}"
+            )
+            sys.stdout.flush()
+            time.sleep(0.08)
+            i += 1
+
+
+_PROGRESS = _ToolProgress()
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  WEB FETCHER
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -671,6 +731,7 @@ def tool_calculator(expression: str = "", **kwargs: Any) -> str:
 # ── Startpage search ────────────────────────────────────────────────────────
 
 def _startpage_search(query: str, limit: int) -> Optional[str]:
+    _PROGRESS.update("Connecting to Startpage…")
     opener = _make_opener()
     home_headers = {
         "User-Agent": BROWSER_USER_AGENT,
@@ -692,6 +753,7 @@ def _startpage_search(query: str, limit: int) -> Optional[str]:
     except Exception:
         pass
 
+    _PROGRESS.update(f"Searching: {truncate(query, 40)}")
     post_data = urllib.parse.urlencode({
         "q": query, "cat": "web", "cmd": "process_search",
         "language": "english", "engine0": "v1all",
@@ -726,6 +788,8 @@ def _startpage_search(query: str, limit: int) -> Optional[str]:
 
     if "captcha" in html_text.lower():
         return None
+
+    _PROGRESS.update("Parsing results…")
 
     entries:      list[str] = []
     seen_domains: set[str]  = set()
@@ -810,9 +874,16 @@ def tool_fetch_url(url: str = "", **kwargs: Any) -> str:
     if not ok:
         return f"Error: {err}"
 
+    try:
+        domain = urllib.parse.urlparse(url).hostname or url
+    except Exception:
+        domain = url
+
     wiki_match = re.match(r"https?://(\w+)\.wikipedia\.org/wiki/([^#?]+)", url)
     if wiki_match:
         lang, title = wiki_match.group(1), wiki_match.group(2)
+        display_title = urllib.parse.unquote(title).replace("_", " ")
+        _PROGRESS.update(f"Wikipedia: {truncate(display_title, 35)}")
         api_url = (
             f"https://{lang}.wikipedia.org/w/api.php?"
             f"action=query&titles={urllib.parse.quote(title, safe='')}"
@@ -834,8 +905,10 @@ def tool_fetch_url(url: str = "", **kwargs: Any) -> str:
         except Exception:
             pass
 
+    _PROGRESS.update(f"Fetching {truncate(domain, 35)}…")
     try:
         raw = _fetch_page(url)
+        _PROGRESS.update(f"Parsing {truncate(domain, 35)}…")
         title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, flags=re.DOTALL | re.IGNORECASE)
         page_title = ""
         if title_match:
@@ -873,6 +946,7 @@ def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
         return "Error: No query provided."
     if not re.fullmatch(r"[a-z]{2,5}", lang):
         lang = "en"
+    _PROGRESS.update(f"Searching Wikipedia: {truncate(query, 30)}")
     search_url = (
         f"https://{lang}.wikipedia.org/w/api.php?"
         f"action=query&list=search"
@@ -887,6 +961,7 @@ def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
         if not results:
             return f"No Wikipedia results for: {query}"
         title = results[0]["title"]
+        _PROGRESS.update(f"Fetching article: {truncate(title, 30)}")
         return tool_fetch_url(
             url=f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(title, safe='')}"
         )
@@ -1085,10 +1160,13 @@ def execute_tool(name: str, arguments_json: str) -> str:
         return f"Error: unknown tool '{name}'"
     args = _args_to_obj(arguments_json)
     args = {k: v for k, v in args.items() if k}
+    _PROGRESS.start(f"{name}…")
     try:
         return str(fn(**args))
     except Exception as exc:
         return f"Error executing '{name}': {exc}"
+    finally:
+        _PROGRESS.stop()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1161,7 +1239,9 @@ def clear_sessions() -> None:
     for f in files:
         cprint(f"  {f.stem}")
     try:
-        answer = input(f"{C.WARN}Continue? (y/N): {C.RESET}").strip().lower()
+        answer = input(
+            f"{_rl(C.WARN)}Continue? (y/N): {_rl(C.RESET)}"
+        ).strip().lower()
     except (EOFError, KeyboardInterrupt):
         cprint(f"\n{C.INFO}Cancelled.{C.RESET}")
         return
@@ -1293,7 +1373,9 @@ def select_model_interactive(
         cprint(f"{marker}{C.BOLD}{i:3}{C.RESET}. {m}")
     while True:
         try:
-            choice = input(f"{C.INFO}Select model number (or 'c' to cancel): {C.RESET}").strip()
+            choice = input(
+                f"{_rl(C.INFO)}Select model number (or 'c' to cancel): {_rl(C.RESET)}"
+            ).strip()
         except (EOFError, KeyboardInterrupt):
             cprint(f"\n{C.INFO}Cancelled.{C.RESET}")
             return None
@@ -1742,7 +1824,9 @@ def _extract_display_text(msg: Message) -> str:
 #  MULTI-LINE INPUT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def read_multiline_input(initial_prompt: str, cont_prompt: str = "  .. ") -> Optional[str]:
+def read_multiline_input(initial_prompt: str, cont_prompt: str = "") -> Optional[str]:
+    if not cont_prompt:
+        cont_prompt = f"  {_rl(C.DIM)}..{_rl(C.RESET)} "
     try:
         line = input(initial_prompt)
     except (EOFError, KeyboardInterrupt):
@@ -1762,9 +1846,10 @@ def read_multiline_input(initial_prompt: str, cont_prompt: str = "  .. ") -> Opt
 def read_paste_input(prefix: str = "") -> Optional[str]:
     cprint(f"{C.INFO}Paste mode — end with {C.BOLD}---{C.RESET}{C.INFO} on its own line to send:{C.RESET}")
     lines: list[str] = []
+    paste_prompt = f"  {_rl(C.DIM)}│{_rl(C.RESET)} "
     while True:
         try:
-            line = input(f"  {C.DIM}│{C.RESET} ")
+            line = input(paste_prompt)
         except (EOFError, KeyboardInterrupt):
             cprint(f"\n{C.INFO}(Paste cancelled){C.RESET}")
             return "\n".join(lines).strip() if lines else None
@@ -1815,6 +1900,7 @@ def print_usage() -> None:
     • {C.BOLD}web_search{C.RESET}    – search the web via Startpage
     • {C.BOLD}fetch_url{C.RESET}     – fetch & clean any web page (≤ {FETCH_MAX_CHARS:,} chars)
     • {C.BOLD}wikipedia{C.RESET}     – search Wikipedia & return article text
+  Live progress spinner shows tool status in real time.
   History auto-compacted after tool calls (only question + answer kept).
   SSRF protection active.
   Gemini also gets {C.BOLD}Google Search{C.RESET} grounding when tools are on.
@@ -1844,7 +1930,7 @@ def print_chat_help() -> None:
   {C.BOLD}quit{C.RESET} / {C.BOLD}exit{C.RESET}          End session
 {C.TOOL}Available tools:{C.RESET}
   get_time · calculator · web_search · fetch_url · wikipedia
-{C.INFO}Search:{C.RESET}  Startpage
+{C.INFO}Search:{C.RESET}  Startpage (live progress spinner)
 {C.INFO}Security:{C.RESET}  SSRF protection active (private IPs, localhost, cloud metadata blocked)
 {C.INFO}History:{C.RESET}
   Tool-call messages auto-compacted after each exchange.
@@ -1896,7 +1982,7 @@ def chat_loop(
         cprint(f"  {C.INFO}Tool calling:{C.RESET}     {tool_st}  (toggle: /toggletools)")
         if tools_on:
             cprint(f"  {C.INFO}Tools:{C.RESET}           {', '.join(TOOLS_REGISTRY)}")
-            cprint(f"  {C.INFO}Search:{C.RESET}          Startpage")
+            cprint(f"  {C.INFO}Search:{C.RESET}          Startpage (live progress)")
             cprint(f"  {C.INFO}History mode:{C.RESET}    auto-compact (tool msgs collapsed)")
         cprint(f"  {C.INFO}SSRF protection:{C.RESET} on")
         cprint(
@@ -1914,10 +2000,10 @@ def chat_loop(
 
     while True:
         img_tag = (
-            f"[{C.IMAGE}📎 {Path(image.path).name}{C.RESET}] "
+            f"[{_rl(C.IMAGE)}📎 {Path(image.path).name}{_rl(C.RESET)}] "
             if image.attached else ""
         )
-        prompt = f"{img_tag}{C.BOLD}{C.USER}You:{C.RESET} "
+        prompt = f"{img_tag}{_rl(C.BOLD)}{_rl(C.USER)}You:{_rl(C.RESET)} "
         raw = read_multiline_input(prompt)
         if raw is None:
             cprint(f"\n{C.INFO}Ending session.{C.RESET}")
@@ -2115,7 +2201,7 @@ def main() -> None:
     while True:
         try:
             ans = input(
-                f"{C.TOOL}Enable tool calling ({tool_names})? (y/N): {C.RESET}"
+                f"{_rl(C.TOOL)}Enable tool calling ({tool_names})? (y/N): {_rl(C.RESET)}"
             ).strip().lower()
         except (EOFError, KeyboardInterrupt):
             sys.exit(0)
@@ -2135,6 +2221,7 @@ def main() -> None:
     cprint(f"{C.INFO}Using model:{C.RESET} {model_id}\n")
 
     def _sigint_handler(sig: int, frame: Any) -> None:
+        _PROGRESS.stop()
         cprint(f"\n{C.WARN}Interrupted.{C.RESET}")
         sys.exit(130)
 
