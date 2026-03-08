@@ -5,10 +5,7 @@ Pure stdlib, Python 3.9+. Zero pip installs required.
 
 Usage:
     python ai.py <provider> [filter]...
-    ./ai.py gemini
-    ./ai.py openrouter 32b
-    ./ai.py groq llama
-
+    
 Providers: gemini, openrouter, groq, together, cerebras, novita, ollama
 
 Chat commands:
