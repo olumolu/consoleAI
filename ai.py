@@ -13,7 +13,7 @@ Features:
   - Web search via Startpage
   - Live model switching (/model command)
   - History compaction (tool messages auto-collapsed after each exchange)
-  - SSRF protection with DNS-over-HTTPS support
+  - SSRF protection
 
 Usage:
     python ai.py <provider> [filter]...
@@ -123,8 +123,6 @@ BROWSER_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
-DOH_URL = "" # add your own dns
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  ANSI COLOURS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,33 +155,10 @@ def eprint(msg: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  DNS-over-HTTPS RESOLVER
+#  SSRF PROTECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _resolve_doh(hostname: str) -> list[str]:
-    if not DOH_URL:
-        return []
-    ips: list[str] = []
-    for qtype in ("A", "AAAA"):
-        params = urllib.parse.urlencode({"name": hostname, "type": qtype})
-        url = f"{DOH_URL}?{params}"
-        req = urllib.request.Request(
-            url, headers={"Accept": "application/dns-json", "User-Agent": USER_AGENT},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
-                for answer in data.get("Answer", []):
-                    if answer.get("type") in (1, 28):
-                        ip_str = answer.get("data", "").strip()
-                        if ip_str:
-                            ips.append(ip_str)
-        except Exception:
-            continue
-    return ips
-
-
-def _resolve_system(hostname: str) -> list[str]:
+def _is_private_ip(hostname: str) -> bool:
     ips: list[str] = []
     try:
         infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
@@ -191,23 +166,6 @@ def _resolve_system(hostname: str) -> list[str]:
             ips.append(sockaddr[0])
     except (socket.gaierror, socket.herror, OSError):
         pass
-    return ips
-
-
-def _resolve_hostname(hostname: str) -> list[str]:
-    if DOH_URL:
-        ips = _resolve_doh(hostname)
-        if ips:
-            return ips
-    return _resolve_system(hostname)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SSRF PROTECTION
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _is_private_ip(hostname: str) -> bool:
-    ips = _resolve_hostname(hostname)
     if not ips:
         return True
     for ip_str in ips:
@@ -540,16 +498,6 @@ def _clean_search_text(text: str) -> str:
     text = _html.unescape(text)
     text = _strip_css(text)
     return text.strip()
-
-
-def _dns_label() -> str:
-    if DOH_URL:
-        try:
-            host = urllib.parse.urlparse(DOH_URL).hostname or DOH_URL
-        except Exception:
-            host = DOH_URL
-        return f"DoH ({host})"
-    return "System DNS"
 
 
 def _decompress(data: bytes, encoding: str) -> bytes:
@@ -1838,7 +1786,6 @@ def read_paste_input(prefix: str = "") -> Optional[str]:
 
 def print_usage() -> None:
     me = Path(sys.argv[0]).name
-    dns = _dns_label()
     cprint(f"""
 {C.INFO}Usage:{C.RESET}
   python {me} <provider> [filter]...
@@ -1869,7 +1816,7 @@ def print_usage() -> None:
     • {C.BOLD}fetch_url{C.RESET}     – fetch & clean any web page (≤ {FETCH_MAX_CHARS:,} chars)
     • {C.BOLD}wikipedia{C.RESET}     – search Wikipedia & return article text
   History auto-compacted after tool calls (only question + answer kept).
-  SSRF protection active.  DNS resolver: {dns}.
+  SSRF protection active.
   Gemini also gets {C.BOLD}Google Search{C.RESET} grounding when tools are on.
 
 {C.INFO}Examples:{C.RESET}
@@ -1881,7 +1828,6 @@ def print_usage() -> None:
 
 
 def print_chat_help() -> None:
-    dns = _dns_label()
     cprint(f"""{C.INFO}Commands:{C.RESET}
   {C.BOLD}/history{C.RESET}            Show conversation
   {C.BOLD}/model [filter]{C.RESET}     Switch model (keeps history)
@@ -1898,11 +1844,8 @@ def print_chat_help() -> None:
   {C.BOLD}quit{C.RESET} / {C.BOLD}exit{C.RESET}          End session
 {C.TOOL}Available tools:{C.RESET}
   get_time · calculator · web_search · fetch_url · wikipedia
-{C.INFO}Search:{C.RESET}
-  Startpage (web search)
-{C.INFO}Security:{C.RESET}
-  SSRF protection: private IPs, localhost, cloud metadata blocked.
-  DNS resolver: {dns}
+{C.INFO}Search:{C.RESET}  Startpage
+{C.INFO}Security:{C.RESET}  SSRF protection active (private IPs, localhost, cloud metadata blocked)
 {C.INFO}History:{C.RESET}
   Tool-call messages auto-compacted after each exchange.
   Only your question + AI's final answer kept in history.""")
@@ -1932,7 +1875,6 @@ def chat_loop(
 
     def _print_banner() -> None:
         sep = "─" * 85
-        dns = _dns_label()
         cprint(f"\n{sep}")
         cprint(f"  {C.INFO}Provider:{C.RESET}  {provider.upper()}   {C.INFO}Model:{C.RESET}  {model_id}")
         cprint(
@@ -1956,7 +1898,7 @@ def chat_loop(
             cprint(f"  {C.INFO}Tools:{C.RESET}           {', '.join(TOOLS_REGISTRY)}")
             cprint(f"  {C.INFO}Search:{C.RESET}          Startpage")
             cprint(f"  {C.INFO}History mode:{C.RESET}    auto-compact (tool msgs collapsed)")
-        cprint(f"  {C.INFO}SSRF protection:{C.RESET} on   {C.INFO}DNS:{C.RESET} {dns}")
+        cprint(f"  {C.INFO}SSRF protection:{C.RESET} on")
         cprint(
             f"  {C.INFO}Input:{C.RESET}   end line with {C.BOLD}\\{C.RESET} "
             f"to continue  │  {C.BOLD}/paste{C.RESET} for multi-line"
@@ -2179,8 +2121,7 @@ def main() -> None:
             sys.exit(0)
         if ans in ("y", "yes"):
             enable_tools = True
-            dns = _dns_label()
-            cprint(f"{C.TOOL}Tool calling enabled.  Search: Startpage  │  DNS: {dns}  │  SSRF: protected{C.RESET}")
+            cprint(f"{C.TOOL}Tool calling enabled.  Search: Startpage  │  SSRF: protected{C.RESET}")
             break
         elif ans in ("n", "no", ""):
             break
