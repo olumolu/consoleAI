@@ -9,7 +9,7 @@ Features:
   - Image attachment support (Vision models)
   - Multi-line input (backslash continuation + /paste mode)
   - Multi-provider support (Gemini, OpenRouter, Groq, Together, etc.)
-  - Tool/Function calling (Web search, fetch, Calculator, Time, Wikipedia)
+  - Tool/Function calling (Web search, fetch, Calculator, Time, Wikipedia, Grokipedia)
   - Web search via Startpage
   - Live tool progress spinner
   - Live model switching (/model command)
@@ -492,7 +492,7 @@ def filter_models(models: list[str], filters: list[str]) -> list[str]:
     if not filters:
         return models
     eprint(f"{C.INFO}Filtering with: {' '.join(filters)}  (word-boundary){C.RESET}")
-    result: list[str] = []
+    result: list[str] =[]
     for model in models:
         ml = model.lower()
         if all(
@@ -987,7 +987,7 @@ def _startpage_search(query: str, limit: int) -> Optional[str]:
 
     entries: list[str] = []
     seen_domains: set[str] = set()
-    results_data: list[tuple[str, str, str]] = []
+    results_data: list[tuple[str, str, str]] =[]
 
     for m in re.finditer(
         r'<a[^>]+class="[^"]*result-title[^"]*"[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
@@ -1164,7 +1164,7 @@ def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
         req = urllib.request.Request(search_url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        results = data.get("query", {}).get("search", [])
+        results = data.get("query", {}).get("search",[])
         if not results:
             return f"No Wikipedia results for: {query}"
         title = results[0]["title"]
@@ -1176,15 +1176,47 @@ def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
         return f"Error: {exc}"
 
 
+def tool_grokipedia(query: str = "", **kwargs: Any) -> str:
+    if not query:
+        return "Error: No query provided."
+    _PROGRESS.update(f"Searching Grokipedia: {truncate(query, 30)}")
+    
+    search_res = _startpage_search(f"{query} site:grokipedia.com", limit=4)
+    if search_res:
+        # Grokipedia articles generally reside under /page/...
+        match = re.search(r"URL:\s+(https?://(?:www\.)?grokipedia\.com/page/[^\s]+)", search_res, re.IGNORECASE)
+        if not match:
+            # Fallback to any grokipedia link if structure changes
+            match = re.search(r"URL:\s+(https?://(?:www\.)?grokipedia\.com/[^\s]+)", search_res, re.IGNORECASE)
+            
+        if match:
+            url = match.group(1)
+            try:
+                title = urllib.parse.unquote(url.split('/')[-1]).replace('_', ' ')
+            except Exception:
+                title = "Article"
+            _PROGRESS.update(f"Fetching Grokipedia: {truncate(title, 30)}")
+            
+            content = tool_fetch_url(url=url)
+            if content.startswith("Page:"):
+                return f"Grokipedia Search Result:\n{content}"
+            return f"Grokipedia — {title}\nURL: {url}\n\n{content}"
+            
+        return f"Could not find a valid Grokipedia URL in search results for: {query}\n\nSearch Results:\n{search_res}"
+    
+    return f"No Grokipedia results found for: {query}"
+
+
 TOOLS_REGISTRY: dict[str, Any] = {
     "get_time":    tool_get_time,
     "calculator":  tool_calculator,
     "web_search":  tool_web_search,
     "fetch_url":   tool_fetch_url,
     "wikipedia":   tool_wikipedia,
+    "grokipedia":  tool_grokipedia,
 }
 
-OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
+OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] =[
     {
         "type": "function",
         "function": {
@@ -1258,6 +1290,20 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                     "query": {"type": "string", "description": "The search query"},
                     "lang": {"type": "string", "description": "Wikipedia language code, default 'en'"},
                 },
+                "required":["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grokipedia",
+            "description": "Search Grokipedia (AI-generated encyclopedia) by query and return the top article's plaintext content. Often provides more up-to-date information.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"},
+                },
                 "required": ["query"],
             },
         },
@@ -1266,7 +1312,7 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
 
 GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
-        "functionDeclarations": [
+        "functionDeclarations":[
             {"name": "get_time", "description": "Get the current local time and date."},
             {
                 "name": "calculator",
@@ -1318,6 +1364,17 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                     "properties": {
                         "query": {"type": "string", "description": "The search query"},
                         "lang": {"type": "string", "description": "Wikipedia language code, default 'en'"},
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "grokipedia",
+                "description": "Search Grokipedia (AI-generated encyclopedia) by query and return the top article's plaintext content. Often provides more up-to-date information.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query"},
                     },
                     "required": ["query"],
                 },
@@ -1447,8 +1504,8 @@ def clear_sessions() -> None:
 
 def init_history(is_openai_compat: bool) -> History:
     if SYSTEM_PROMPT and is_openai_compat:
-        return [{"role": "system", "content": SYSTEM_PROMPT}]
-    return []
+        return[{"role": "system", "content": SYSTEM_PROMPT}]
+    return[]
 
 
 def truncate_history(history: History, is_openai_compat: bool) -> History:
@@ -1518,19 +1575,19 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
         if provider == "gemini":
             models = [
                 m["name"].replace("models/", "")
-                for m in data.get("models", [])
+                for m in data.get("models",[])
                 if (
                     any("generateContent" in method for method in m.get("supportedGenerationMethods", []))
                     and not m["name"].startswith("models/embedding")
                 )
             ]
         elif provider == "ollama":
-            models = [m["name"] for m in data.get("models", [])]
+            models = [m["name"] for m in data.get("models",[])]
         elif provider == "together":
-            arr = data if isinstance(data, list) else data.get("data", [])
+            arr = data if isinstance(data, list) else data.get("data",[])
             models = sorted(m["id"] for m in arr)
         else:
-            models = sorted(m["id"] for m in data.get("data", []))
+            models = sorted(m["id"] for m in data.get("data",[]))
     except (KeyError, TypeError) as exc:
         eprint(f"{C.ERROR}Could not parse model list: {exc}{C.RESET}")
         return None
@@ -1583,7 +1640,7 @@ def build_user_message(
         if not is_openai_compat:
             return {
                 "role": "user",
-                "parts": [
+                "parts":[
                     {"text": prompt},
                     {"inlineData": {"mimeType": image.mime, "data": image.base64}},
                 ],
@@ -1593,7 +1650,7 @@ def build_user_message(
         else:
             return {
                 "role": "user",
-                "content": [
+                "content":[
                     {"type": "text", "text": text},
                     {"type": "image_url", "image_url": {
                         "url": f"data:{image.mime};base64,{image.base64}",
@@ -1678,7 +1735,7 @@ def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
         r.think = msg_obj.get("thinking") or ""
         if obj.get("done") is True:
             r.finish = obj.get("done_reason") or "stop"
-        for tc in msg_obj.get("tool_calls", []):
+        for tc in msg_obj.get("tool_calls",[]):
             fn = tc.get("function", {})
             args_raw = fn.get("arguments", "")
             if isinstance(args_raw, dict):
@@ -1697,7 +1754,7 @@ def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
     r.text = delta.get("content") or ""
     r.think = delta.get("reasoning") or ""
     r.finish = choice.get("finish_reason") or ""
-    for tc_chunk in delta.get("tool_calls", []):
+    for tc_chunk in delta.get("tool_calls",[]):
         r.tool_chunks.append({
             "index": tc_chunk.get("index", 0),
             "id": tc_chunk.get("id"),
@@ -1719,7 +1776,7 @@ def _parse_gemini_chunk(obj: dict[str, Any]) -> _ChunkResult:
         return r
 
     content_obj = candidate.get("content", {})
-    for part in content_obj.get("parts", []):
+    for part in content_obj.get("parts",[]):
         if "text" in part:
             r.text += part["text"]
         if "functionCall" in part:
@@ -1731,7 +1788,7 @@ def _parse_gemini_chunk(obj: dict[str, Any]) -> _ChunkResult:
 
     r.finish = candidate.get("finishReason", "")
     if not r.finish or r.finish == "null":
-        if any(rating.get("blocked") for rating in candidate.get("safetyRatings", [])):
+        if any(rating.get("blocked") for rating in candidate.get("safetyRatings",[])):
             r.finish = "SAFETY"
     return r
 
@@ -1921,7 +1978,7 @@ def stream_response(
     done_received = False
 
     oai_tool_calls: dict[int, dict[str, Any]] = {}
-    gem_tool_calls: list[dict[str, Any]] = []
+    gem_tool_calls: list[dict[str, Any]] =[]
 
     try:
         with _request_with_retry(req, timeout=REQUEST_TIMEOUT) as resp:
@@ -2045,7 +2102,7 @@ def stream_response(
 
     renderer.finalize()
 
-    tool_calls_out: list[dict[str, Any]] = []
+    tool_calls_out: list[dict[str, Any]] =[]
     if is_openai_compat:
         for idx in sorted(oai_tool_calls):
             tool_calls_out.append(oai_tool_calls[idx])
@@ -2086,7 +2143,7 @@ def stream_response(
             return (clean if clean else ""), tool_calls_out
 
         cprint(f"{C.ERROR}{error_msg}{C.RESET}")
-        return None, []
+        return None,[]
 
     if interrupted and renderer.full_text:
         eprint(f"{C.INFO}(Partial response saved){C.RESET}")
@@ -2096,7 +2153,7 @@ def stream_response(
         full_text = full_text[:MAX_MESSAGE_LENGTH]
     clean = strip_think_tags(full_text)
     if not clean and not tool_calls_out and not interrupted:
-        return None, []
+        return None,[]
     return (clean if clean else ""), tool_calls_out
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2108,7 +2165,7 @@ def _append_assistant_turn(
     tool_calls: list[dict[str, Any]], provider: str, is_openai_compat: bool,
 ) -> None:
     if not is_openai_compat:
-        parts: list[dict[str, Any]] = []
+        parts: list[dict[str, Any]] =[]
         if ai_text:
             parts.append({"text": ai_text})
         for tc in tool_calls:
@@ -2232,7 +2289,7 @@ def read_multiline_input(initial_prompt: str, cont_prompt: str = "") -> Optional
 
 def read_paste_input(prefix: str = "") -> Optional[str]:
     cprint(f"{C.INFO}Paste mode — end with {C.BOLD}---{C.RESET}{C.INFO} on its own line to send:{C.RESET}")
-    lines: list[str] = []
+    lines: list[str] =[]
     paste_prompt = f"  {_rl(C.DIM)}│{_rl(C.RESET)} "
     while True:
         try:
@@ -2300,7 +2357,7 @@ def print_chat_help() -> None:
   {C.BOLD}/help{C.RESET}               Show this help
   {C.BOLD}quit{C.RESET} / {C.BOLD}exit{C.RESET}          End session
 {C.TOOL}Available tools:{C.RESET}
-  get_time · calculator · web_search · fetch_url · wikipedia
+  get_time · calculator · web_search · fetch_url · wikipedia · grokipedia
 """)
 
 
@@ -2508,7 +2565,7 @@ def chat_loop(
                 _append_assistant_turn(history, ai_text, tool_calls, provider, is_openai_compat)
                 if tool_calls and tools_on:
                     had_tool_calls = True
-                    results: list[str] = []
+                    results: list[str] =[]
                     for tc in tool_calls:
                         fn_name = tc["function"]["name"]
                         fn_args = tc["function"]["arguments"]
@@ -2533,7 +2590,7 @@ def chat_loop(
             else:
                 clean_final = {"role": "assistant", "content": final_ai_text}
             n_intermediate = len(history) - compact_from
-            history[compact_from:] = [clean_final]
+            history[compact_from:] =[clean_final]
             if n_intermediate > 1:
                 eprint(f"{C.DIM}(History compacted: {n_intermediate} tool messages → 1 answer){C.RESET}")
 
@@ -2545,7 +2602,7 @@ def chat_loop(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    for name, val, lo, hi in [
+    for name, val, lo, hi in[
         ("DEFAULT_TEMPERATURE", DEFAULT_TEMPERATURE, 0, 2),
         ("DEFAULT_TOP_P", DEFAULT_TOP_P, 0, 1),
         ("DEFAULT_MAX_TOKENS", DEFAULT_MAX_TOKENS, 1, 1_000_000),
