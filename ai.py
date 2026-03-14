@@ -15,7 +15,6 @@ Features:
   - Live model switching (/model command)
   - History compaction (tool messages auto-collapsed after each exchange)
   - SSRF protection with DNS-pinning
-
 Usage:
     python ai.py <provider> [filter]...
 
@@ -1607,8 +1606,12 @@ def build_user_message(
 
 
 def build_payload(
-    provider: str, model_id: str, history: History,
-    is_openai_compat: bool, enable_tools: bool,
+    provider: str,
+    model_id: str,
+    history: History,
+    is_openai_compat: bool,
+    enable_tools: bool,
+    enable_thinking: bool,
 ) -> dict[str, Any]:
     if not is_openai_compat:
         contents = [m for m in history if m.get("role") != "system"]
@@ -1632,9 +1635,12 @@ def build_payload(
         "temperature": DEFAULT_TEMPERATURE,
         "stream": True,
     }
+
     if enable_tools:
         oai_payload["tools"] = OPENAI_TOOLS_SCHEMA
+
     if provider == "ollama":
+        oai_payload["think"] = enable_thinking
         oai_payload["options"] = {
             "num_predict": DEFAULT_MAX_TOKENS,
             "top_p": DEFAULT_TOP_P,
@@ -1645,8 +1651,8 @@ def build_payload(
     elif provider != "together":
         oai_payload["max_tokens"] = DEFAULT_MAX_TOKENS
         oai_payload["top_p"] = DEFAULT_TOP_P
-    return oai_payload
 
+    return oai_payload
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SSE PARSERS
@@ -1882,7 +1888,14 @@ def stream_response(
     is_openai_compat: bool, api_key: str,
     enable_tools: bool, enable_thinking: bool,
 ) -> tuple[Optional[str], list[dict[str, Any]]]:
-    payload = build_payload(provider, model_id, history, is_openai_compat, enable_tools)
+    payload = build_payload(
+    provider,
+    model_id,
+    history,
+    is_openai_compat,
+    enable_tools,
+    enable_thinking,
+    )
     payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ep = ENDPOINTS[provider]
 
@@ -2540,7 +2553,6 @@ def main() -> None:
         if not (lo <= val <= hi):
             sys.exit(f"Config error: {name}={val} must be between {lo} and {hi}")
 
-    # Argument parsing
     argv = sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help"):
         print_usage()
@@ -2563,17 +2575,17 @@ def main() -> None:
     while True:
         try:
             ans = input(
-                f"{_rl(C.THINK)}Enable thinking/reasoning output? (Y/n): {_rl(C.RESET)}"
+                f"{_rl(C.THINK)}Enable thinking/reasoning ? (Y/n): {_rl(C.RESET)}"
             ).strip().lower()
         except (EOFError, KeyboardInterrupt):
             sys.exit(0)
         if ans in ("", "y", "yes"):
             enable_thinking = True
-            cprint(f"{C.THINK}Thinking output enabled.{C.RESET}")
+            cprint(f"{C.THINK}Thinking enabled.{C.RESET}")
             break
         elif ans in ("n", "no"):
             enable_thinking = False
-            cprint(f"{C.THINK}Thinking output disabled.{C.RESET}")
+            cprint(f"{C.THINK}Thinking disabled.{C.RESET}")
             break
         else:
             eprint(f"{C.WARN}Please enter y or n.{C.RESET}")
