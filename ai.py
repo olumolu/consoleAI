@@ -9,12 +9,13 @@ Features:
   - Image attachment support (Vision models)
   - Multi-line input (backslash continuation + /paste mode)
   - Multi-provider support (Gemini, OpenRouter, Groq, Together, etc.)
-  - Tool/Function calling (Web search, fetch, Calculator, Time, Wikipedia)
-  - Web search via Startpage
+  - Tool/Function calling
+  - Enhanced web research via Startpage HTML scraping
+  - Multi-query search + source reranking + excerpt extraction
   - Live tool progress spinner
   - Live model switching (/model command)
   - History compaction (tool messages auto-collapsed after each exchange)
-  - SSRF protection with DNS-pinning
+  - SSRF protection with DNS validation
 Usage:
     python ai.py <provider> [filter]...
 
@@ -77,55 +78,62 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CONFIGURATION
+# CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-##############################################################################
-#                   !!! EDIT YOUR API KEYS HERE !!!                          #
-##############################################################################
 API_KEYS: dict[str, str] = {
-    "gemini":     "",   # https://aistudio.google.com/app/apikey
-    "openrouter": "",   # https://openrouter.ai/keys
-    "groq":       "",   # https://console.groq.com/keys
-    "together":   "",   # https://api.together.ai/settings/api-keys
-    "cerebras":   "",   # https://cloud.cerebras.ai/
-    "novita":     "",   # https://novita.ai/
-    "ollama":     "",   # https://ollama.com/ (leave blank for local)
+    "gemini":     "",
+    "openrouter": "",
+    "groq":       "",
+    "together":   "",
+    "cerebras":   "",
+    "novita":     "",
+    "ollama":     "",
 }
 
-
-# Conversation defaults
-MAX_HISTORY_MESSAGES  = 20        # Max user+AI turns kept in context
-MAX_MESSAGE_LENGTH    = 50_000    # Max chars for a single message
-DEFAULT_TEMPERATURE   = 0.7       # 0–2: higher = more creative
-DEFAULT_MAX_TOKENS    = 3000      # Max tokens in each AI reply
-DEFAULT_TOP_P         = 0.9       # 0–1: nucleus sampling
+MAX_HISTORY_MESSAGES  = 20
+MAX_MESSAGE_LENGTH    = 50_000
+DEFAULT_TEMPERATURE   = 0.7
+DEFAULT_MAX_TOKENS    = 3000
+DEFAULT_TOP_P         = 0.9
 SESSION_DIR           = Path.home() / ".chat_sessions"
 HISTORY_FILE          = Path.home() / ".ai_cli_history"
 
-# Image support
 MAX_IMAGE_SIZE_MB = 20
 SUPPORTED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
-# System prompt (set to "" to disable)
-SYSTEM_PROMPT = "You are a helpful assistant running in a command-line interface."
+FETCH_MAX_CHARS    = 12000
+FETCH_MAX_BYTES    = 5 * 1024 * 1024
+SEARCH_MAX_RESULTS = 6
+
+SYSTEM_PROMPT = """You are a helpful assistant running in a command-line interface.
+
+If a question may require current, niche, factual, or externally verifiable information, use tools before answering.
+
+Use tools like this:
+- use web_research for most web lookups
+- use web_search only to quickly discover candidate URLs
+- use fetch_url when you already know the page to inspect
+- when using fetch_url, prefer passing a focus query
+
+When browsing:
+- prefer official docs, vendor pages, primary sources, government, education, and high-quality technical sources
+- do not rely only on SERP snippets
+- compare multiple sources for important claims
+- if sources disagree, say so
+- when tools were used, cite sources as [1], [2], [3]
+"""
 
 MAX_TOOL_ITERATIONS = 10
 TOOL_EXEC_TIMEOUT   = 60
 
-# Request timeouts in seconds
-REQUEST_TIMEOUT     = 300   # Streaming chat timeout
-MODEL_FETCH_TIMEOUT = 30    # Model listing timeout
-
-FETCH_MAX_CHARS    = 8000
-FETCH_MAX_BYTES    = 5 * 1024 * 1024
-SEARCH_MAX_RESULTS = 6
+REQUEST_TIMEOUT     = 300
+MODEL_FETCH_TIMEOUT = 30
 
 MAX_RETRIES          = 3
 RETRYABLE_HTTP_CODES = (429, 500, 502, 503, 504)
 
-# User-Agent sent with all HTTP requests
-USER_AGENT = "PythonChatCLI/1.4"
+USER_AGENT = "PythonChatCLI/1.5"
 
 BROWSER_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -134,7 +142,7 @@ BROWSER_USER_AGENT = (
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ANSI COLOURS
+# ANSI COLOURS
 # ─────────────────────────────────────────────────────────────────────────────
 
 class C:
@@ -159,7 +167,7 @@ def _rl(code: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  THREAD-SAFE OUTPUT
+# THREAD-SAFE OUTPUT
 # ─────────────────────────────────────────────────────────────────────────────
 
 _STDOUT_LOCK = threading.Lock()
@@ -184,7 +192,7 @@ def _stdout_write(text: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SSRF PROTECTION
+# SSRF PROTECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _is_ip_blocked(ip_str: str) -> bool:
@@ -264,7 +272,7 @@ _URL_OPENER = urllib.request.build_opener(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  LATEX RENDERER
+# LATEX RENDERER
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LatexRenderer:
@@ -336,7 +344,7 @@ LATEX_RENDERER = LatexRenderer()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  MARKDOWN RENDERER
+# MARKDOWN RENDERER
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MarkdownRenderer:
@@ -384,7 +392,7 @@ MD_RENDERER = MarkdownRenderer()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PROVIDER ENDPOINTS
+# PROVIDER ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 
 ENDPOINTS: dict[str, dict[str, str]] = {
@@ -422,7 +430,7 @@ VALID_PROVIDERS = list(ENDPOINTS.keys())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  HELPERS
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def truncate(s: str, n: int) -> str:
@@ -548,7 +556,7 @@ _BLOCK_REMOVE_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _BLOCK_TAG_RE = re.compile(
-    r'<(/?)(div|p|br|h[1-6]|li|tr|article|section|main)[^>]*>',
+    r'<(/?)(div|p|br|h[1-6]|li|tr|article|section|main|pre|blockquote|ul|ol)[^>]*>',
     re.IGNORECASE,
 )
 _TAG_RE = re.compile(r'<[^>]+>')
@@ -580,6 +588,7 @@ def _clean_search_text(text: str) -> str:
     text = _TAG_RE.sub("", text)
     text = _html.unescape(text)
     text = _CSS_COMBINED_RE.sub('', text)
+    text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
@@ -610,11 +619,319 @@ def _decompress(data: bytes, encoding: str) -> bytes:
 
 def _make_opener() -> urllib.request.OpenerDirector:
     jar = http.cookiejar.CookieJar()
-    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    return urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar),
+        _SSRFSafeRedirectHandler(),
+    )
+
+
+SEARCH_CACHE: dict[str, list[dict[str, Any]]] = {}
+PAGE_CACHE: dict[str, tuple[str, str]] = {}
+
+_STOPWORDS = {
+    "the", "and", "for", "are", "with", "that", "this", "from", "was", "were",
+    "have", "has", "had", "into", "about", "what", "when", "where", "which",
+    "their", "they", "them", "then", "than", "your", "you", "how", "why",
+    "can", "could", "should", "would", "will", "may", "might", "also",
+    "there", "here", "more", "most", "some", "such", "just", "like",
+    "over", "under", "onto", "upon", "each", "many", "much", "very",
+}
+
+
+def _tokenize(text: str) -> list[str]:
+    return [
+        t for t in re.findall(r"[a-z0-9]{2,}", (text or "").lower())
+        if t not in _STOPWORDS
+    ]
+
+
+def _normalize_url(url: str) -> str:
+    try:
+        p = urllib.parse.urlparse(url)
+    except Exception:
+        return url
+    scheme = (p.scheme or "https").lower()
+    netloc = (p.netloc or "").lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    path = p.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+
+    qs = urllib.parse.parse_qsl(p.query, keep_blank_values=False)
+    qs = [
+        (k, v) for k, v in qs
+        if not (
+            k.lower().startswith("utm_")
+            or k.lower() in {"gclid", "fbclid", "ref", "ref_src", "source"}
+        )
+    ]
+    query = urllib.parse.urlencode(qs, doseq=True)
+    return urllib.parse.urlunparse((scheme, netloc, path, "", query, ""))
+
+
+def _unwrap_result_url(url: str) -> str:
+    url = _html.unescape(url or "").strip()
+    if not url:
+        return ""
+
+    if url.startswith("/"):
+        abs_url = urllib.parse.urljoin("https://www.startpage.com", url)
+    else:
+        abs_url = url
+
+    try:
+        p = urllib.parse.urlparse(abs_url)
+    except Exception:
+        return url
+
+    if p.scheme in ("http", "https") and "startpage.com" not in (p.netloc or "").lower():
+        return abs_url
+
+    qs = urllib.parse.parse_qs(p.query)
+    for key in ("url", "u", "to", "target"):
+        vals = qs.get(key)
+        if vals:
+            cand = urllib.parse.unquote(vals[0])
+            if cand.startswith("http://") or cand.startswith("https://"):
+                return cand
+
+    return abs_url
+
+
+def _domain_quality_bonus(url: str) -> float:
+    host = (urllib.parse.urlparse(url).netloc or "").lower()
+    score = 0.0
+
+    if host.startswith("docs.") or ".docs." in host:
+        score += 5.0
+    if host.startswith("developer.") or ".developer." in host:
+        score += 4.0
+    if host.endswith(".gov"):
+        score += 4.0
+    if host.endswith(".edu"):
+        score += 3.0
+    if "wikipedia.org" in host:
+        score += 2.0
+    if "github.com" in host or host.endswith(".github.io"):
+        score += 2.0
+    if "stackoverflow.com" in host or "stackexchange.com" in host:
+        score += 2.0
+    if "python.org" in host:
+        score += 2.0
+    if "docs.python.org" in host:
+        score += 2.0
+
+    if "medium.com" in host:
+        score -= 1.0
+    if "quora.com" in host:
+        score -= 2.0
+    if "pinterest." in host:
+        score -= 3.0
+    if "facebook.com" in host or "instagram.com" in host:
+        score -= 2.0
+
+    return score
+
+
+def _should_skip_result(url: str) -> bool:
+    host = (urllib.parse.urlparse(url).netloc or "").lower()
+    if not host:
+        return True
+    if "startpage.com" in host:
+        return True
+    if any(bad in host for bad in (
+        "facebook.com", "instagram.com", "pinterest.", "tiktok.com"
+    )):
+        return True
+    return False
+
+
+def _score_text(
+    query: str,
+    title: str = "",
+    snippet: str = "",
+    url: str = "",
+    body: str = "",
+) -> float:
+    q_tokens = _tokenize(query)
+    title_l = (title or "").lower()
+    snippet_l = (snippet or "").lower()
+    body_l = (body or "").lower()
+    url_l = (url or "").lower()
+    full = f"{title_l} {snippet_l} {url_l} {body_l[:6000]}"
+
+    score = 0.0
+    phrase = (query or "").strip().lower()
+
+    if phrase:
+        if phrase in title_l:
+            score += 8.0
+        if phrase in full:
+            score += 6.0
+
+    for tok in q_tokens:
+        if tok in title_l:
+            score += 4.0
+        if tok in snippet_l:
+            score += 2.0
+        score += min(full.count(tok), 5) * 0.8
+
+    year = str(datetime.datetime.now().year)
+    if year in full:
+        score += 1.0
+
+    score += _domain_quality_bonus(url)
+    return score
+
+
+def _query_variants(query: str) -> list[str]:
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    ql = q.lower()
+    year = datetime.datetime.now().year
+    out = [q]
+
+    if any(k in ql for k in (
+        "latest", "current", "new", "recent", "today", "now",
+        "version", "release", "pricing", "price", "updated", "update"
+    )):
+        out.append(f"{q} {year}")
+
+    if any(k in ql for k in (
+        "api", "sdk", "docs", "documentation", "install", "cli",
+        "python", "javascript", "typescript", "error", "traceback",
+        "library", "package", "pip", "uv", "docker", "fastapi"
+    )):
+        out.append(f"{q} official documentation")
+
+    if len(q.split()) >= 3:
+        out.append(f"\"{q}\"")
+
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for item in out:
+        k = item.lower()
+        if k not in seen:
+            seen.add(k)
+            dedup.append(item)
+    return dedup
+
+
+def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> list[str]:
+    paras = [p.strip() for p in re.split(r"\n{2,}", text or "") if p.strip()]
+    chunks: list[str] = []
+    cur = ""
+
+    def push(buf: str) -> None:
+        buf = buf.strip()
+        if buf:
+            chunks.append(buf)
+
+    for p in paras:
+        if len(p) > chunk_size:
+            if cur:
+                push(cur)
+                cur = ""
+            start = 0
+            while start < len(p):
+                end = min(start + chunk_size, len(p))
+                piece = p[start:end].strip()
+                if piece:
+                    chunks.append(piece)
+                if end >= len(p):
+                    break
+                start = max(end - overlap, start + 1)
+            continue
+
+        if not cur:
+            cur = p
+        elif len(cur) + 2 + len(p) <= chunk_size:
+            cur += "\n\n" + p
+        else:
+            push(cur)
+            cur = p
+
+    if cur:
+        push(cur)
+
+    return chunks
+
+
+def _select_best_chunks(
+    query: str,
+    title: str,
+    url: str,
+    text: str,
+    max_chunks: int = 3,
+) -> list[str]:
+    chunks = _chunk_text(text)
+    if not chunks:
+        return []
+
+    ranked = sorted(
+        chunks,
+        key=lambda ch: _score_text(query, title=title, url=url, body=ch),
+        reverse=True,
+    )
+
+    out: list[str] = []
+    seen_heads: set[str] = set()
+    for ch in ranked:
+        sig = ch[:120]
+        if sig in seen_heads:
+            continue
+        seen_heads.add(sig)
+        out.append(ch)
+        if len(out) >= max_chunks:
+            break
+    return out
+
+
+def _extract_title_and_text(raw_html: str) -> tuple[str, str]:
+    title = ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", raw_html, flags=re.I | re.S)
+    if m:
+        title = re.sub(r"\s+", " ", _clean_search_text(m.group(1))).strip()
+
+    candidates: list[str] = []
+
+    patterns = [
+        r"<article[^>]*>(.*?)</article>",
+        r"<main[^>]*>(.*?)</main>",
+        r"<section[^>]*>(.*?)</section>",
+        r'<div[^>]+(?:id|class)=["\'][^"\']*(?:article|content|post|entry|body|main|markdown|docs?|story)[^"\']*["\'][^>]*>(.*?)</div>',
+    ]
+
+    for pat in patterns:
+        for mm in re.finditer(pat, raw_html, flags=re.I | re.S):
+            cleaned = _clean_html(mm.group(1))
+            if len(cleaned) > 200:
+                candidates.append(cleaned)
+
+    whole = _clean_html(raw_html)
+    if whole:
+        candidates.append(whole)
+
+    best = max(candidates, key=len) if candidates else ""
+    return title, best
+
+
+def _fetch_page_text(url: str) -> tuple[str, str]:
+    url = _normalize_url(url)
+    cached = PAGE_CACHE.get(url)
+    if cached is not None:
+        return cached
+    raw = _fetch_page(url)
+    title, text = _extract_title_and_text(raw)
+    PAGE_CACHE[url] = (title, text)
+    return title, text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TOOL PROGRESS SPINNER
+# TOOL PROGRESS SPINNER
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _ToolProgress:
@@ -664,7 +981,7 @@ _PROGRESS = _ToolProgress()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  HTTP HELPERS WITH RETRY
+# HTTP HELPERS WITH RETRY
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _request_with_retry(
@@ -700,7 +1017,7 @@ def _request_with_retry(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  WEB FETCHER
+# WEB FETCHER
 # ─────────────────────────────────────────────────────────────────────────────
 
 _FETCH_HEADERS_PRIMARY: dict[str, str] = {
@@ -734,11 +1051,15 @@ def _fetch_page(url: str, timeout: int = 20) -> str:
         try:
             with _URL_OPENER.open(req, timeout=timeout) as resp:
                 content_length = resp.headers.get("Content-Length")
-                if content_length and int(content_length) > FETCH_MAX_BYTES:
-                    raise ValueError(
-                        f"Response too large: {int(content_length) // (1024*1024)} MB "
-                        f"(max {FETCH_MAX_BYTES // (1024*1024)} MB)"
-                    )
+                if content_length:
+                    try:
+                        if int(content_length) > FETCH_MAX_BYTES:
+                            raise ValueError(
+                                f"Response too large: {int(content_length) // (1024*1024)} MB "
+                                f"(max {FETCH_MAX_BYTES // (1024*1024)} MB)"
+                            )
+                    except ValueError:
+                        pass
                 raw_bytes = resp.read(FETCH_MAX_BYTES + 1)
                 if len(raw_bytes) > FETCH_MAX_BYTES:
                     raw_bytes = raw_bytes[:FETCH_MAX_BYTES]
@@ -760,7 +1081,7 @@ def _fetch_page(url: str, timeout: int = 20) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  IMAGE HANDLING
+# IMAGE HANDLING
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ImageAttachment:
@@ -807,7 +1128,7 @@ class ImageAttachment:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TOOL / FUNCTION CALLING
+# TOOL / FUNCTION CALLING
 # ─────────────────────────────────────────────────────────────────────────────
 
 def tool_get_time(**kwargs: Any) -> str:
@@ -924,34 +1245,41 @@ def tool_calculator(expression: str = "", **kwargs: Any) -> str:
         return f"Error: {exc}"
 
 
-def _startpage_search(query: str, limit: int) -> Optional[str]:
+def _startpage_search_structured(query: str, limit: int) -> list[dict[str, Any]]:
+    cache_key = f"sp::{query}::{limit}"
+    cached = SEARCH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached[:limit]
+
     _PROGRESS.update("Connecting to Startpage…")
     opener = _make_opener()
+
     home_headers = {
         "User-Agent": BROWSER_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, identity",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
         "DNT": "1",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
     }
+
     try:
-        home_req = urllib.request.Request("https://www.startpage.com/", headers=home_headers)
-        with opener.open(home_req, timeout=10) as resp:
-            resp.read(500_000)
+        req = urllib.request.Request("https://www.startpage.com/", headers=home_headers)
+        with opener.open(req, timeout=10) as resp:
+            resp.read(300_000)
     except Exception:
         pass
 
     _PROGRESS.update(f"Searching: {truncate(query, 40)}")
     post_data = urllib.parse.urlencode({
-        "q": query, "cat": "web", "cmd": "process_search",
-        "language": "english", "engine0": "v1all",
+        "q": query,
+        "cat": "web",
+        "cmd": "process_search",
+        "language": "english",
+        "engine0": "v1all",
     }).encode()
+
     post_headers = {
         "User-Agent": BROWSER_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -960,186 +1288,200 @@ def _startpage_search(query: str, limit: int) -> Optional[str]:
         "Content-Type": "application/x-www-form-urlencoded",
         "Origin": "https://www.startpage.com",
         "Referer": "https://www.startpage.com/",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
         "DNT": "1",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
     }
+
     try:
-        search_req = urllib.request.Request(
+        req = urllib.request.Request(
             "https://www.startpage.com/do/search",
-            data=post_data, headers=post_headers, method="POST",
+            data=post_data,
+            headers=post_headers,
+            method="POST",
         )
-        with opener.open(search_req, timeout=15) as resp:
+        with opener.open(req, timeout=15) as resp:
             raw_bytes = resp.read(FETCH_MAX_BYTES)
             raw_bytes = _decompress(raw_bytes, resp.headers.get("Content-Encoding", ""))
             html_text = raw_bytes.decode("utf-8", errors="replace")
     except Exception:
-        return None
+        return []
 
     if "captcha" in html_text.lower():
-        return None
+        return []
 
     _PROGRESS.update("Parsing results…")
 
-    entries: list[str] = []
-    seen_domains: set[str] = set()
     results_data: list[tuple[str, str, str]] = []
 
     for m in re.finditer(
         r'<a[^>]+class="[^"]*result-title[^"]*"[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-        html_text, re.DOTALL,
+        html_text, re.DOTALL | re.IGNORECASE,
     ):
-        url = m.group(1)
+        href = m.group(1)
         title = _clean_search_text(m.group(2))
         snippet = ""
-        after = html_text[m.end():m.end() + 2000]
-        snip_m = re.search(
+        after = html_text[m.end():m.end() + 2500]
+        snip = re.search(
             r'class="[^"]*(?:result-description|w-gl__description)[^"]*"[^>]*>(.*?)</(?:p|div|span)>',
-            after, re.DOTALL,
+            after, re.DOTALL | re.IGNORECASE,
         )
-        if snip_m:
-            snippet = _clean_search_text(snip_m.group(1))
-        results_data.append((url, title, snippet))
-
-    if not results_data:
-        for m in re.finditer(
-            r'href=["\']([^"\']+)["\'][^>]*class="[^"]*result-title[^"]*"[^>]*>(.*?)</a>',
-            html_text, re.DOTALL,
-        ):
-            results_data.append((m.group(1), _clean_search_text(m.group(2)), ""))
+        if snip:
+            snippet = _clean_search_text(snip.group(1))
+        results_data.append((href, title, snippet))
 
     if not results_data:
         for m in re.finditer(
             r'<h[23][^>]*>\s*<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
             html_text, re.DOTALL | re.IGNORECASE,
         ):
-            url = m.group(1)
-            title = _clean_search_text(m.group(2))
-            if "startpage.com" not in url and len(title) > 3:
-                results_data.append((url, title, ""))
+            results_data.append((m.group(1), _clean_search_text(m.group(2)), ""))
 
     if not results_data:
         for m in re.finditer(
             r'<a[^>]+href=["\'](http[^"\']+)["\'][^>]*>(.*?)</a>',
-            html_text, re.DOTALL,
+            html_text, re.DOTALL | re.IGNORECASE,
         ):
-            url = m.group(1)
             title = _clean_search_text(m.group(2))
-            if "startpage.com" not in url and "google.com/policies" not in url and len(title) > 3:
-                results_data.append((url, title, ""))
+            if len(title) >= 3:
+                results_data.append((m.group(1), title, ""))
 
-    for r_url, r_title, r_snip in results_data:
-        if len(entries) >= limit:
+    out: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    for href, title, snippet in results_data:
+        url = _unwrap_result_url(href)
+        if not url.startswith(("http://", "https://")):
+            continue
+
+        url = _normalize_url(url)
+        if _should_skip_result(url):
+            continue
+
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        if not title:
+            title = url
+
+        out.append({
+            "title": title,
+            "url": url,
+            "snippet": snippet,
+            "source": "startpage",
+            "score": _score_text(query, title=title, snippet=snippet, url=url),
+        })
+
+        if len(out) >= limit * 3:
             break
-        if not r_url.startswith("http") or "startpage.com" in r_url:
-            continue
-        if not r_title or len(r_title) < 3:
-            continue
-        try:
-            domain = urllib.parse.urlparse(r_url).netloc
-        except Exception:
-            domain = r_url
-        if domain in seen_domains:
-            continue
-        seen_domains.add(domain)
-        entry = f"{len(entries) + 1}. {r_title}\n   URL: {r_url}"
-        if r_snip:
-            entry += f"\n   {r_snip}"
-        entries.append(entry)
 
-    if not entries:
-        return None
+    out.sort(key=lambda r: r["score"], reverse=True)
+    SEARCH_CACHE[cache_key] = out
+    return out[:limit]
 
-    header = f"Web search results for: {query}\n"
-    header += f"({len(entries)} results via Startpage — use fetch_url on any URL for full content)\n"
-    return header + "\n" + "\n\n".join(entries)
+
+def search_web_structured(query: str, limit: int = SEARCH_MAX_RESULTS) -> list[dict[str, Any]]:
+    all_results: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    variants = _query_variants(query)[:3]
+    for i, qv in enumerate(variants):
+        results = _startpage_search_structured(qv, max(limit, 6))
+        for r in results:
+            url = r["url"]
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            item = dict(r)
+            item["query_used"] = qv
+            item["score"] = float(item.get("score", 0.0)) + (3.0 if i == 0 else 0.0)
+            all_results.append(item)
+
+    all_results.sort(key=lambda r: r["score"], reverse=True)
+    return all_results[:limit]
 
 
 def tool_web_search(query: str = "", num_results: int = 0, **kwargs: Any) -> str:
     if not query:
         return "Error: No query provided."
+
     limit = num_results if 1 <= num_results <= 10 else SEARCH_MAX_RESULTS
-    result = _startpage_search(query, limit)
-    if result:
-        return result
-    return f"No results found for: {query}"
+    results = search_web_structured(query, limit=limit)
+    if not results:
+        return f"No results found for: {query}"
+
+    lines = [
+        f"Web search results for: {query}",
+        f"({len(results)} results via Startpage; use web_research for deeper synthesis or fetch_url for a specific page)",
+        "",
+    ]
+
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. {r['title']}")
+        lines.append(f"   URL: {r['url']}")
+        if r.get("snippet"):
+            lines.append(f"   {r['snippet']}")
+        if r.get("query_used") and r["query_used"] != query:
+            lines.append(f"   matched via query variant: {r['query_used']}")
+        lines.append("")
+
+    return "\n".join(lines).strip()[:FETCH_MAX_CHARS]
 
 
-def tool_fetch_url(url: str = "", **kwargs: Any) -> str:
+def tool_fetch_url(url: str = "", focus_query: str = "", **kwargs: Any) -> str:
     if not url:
         return "Error: No URL provided."
+
     if not url.startswith("http"):
         url = "https://" + url
+
+    url = _normalize_url(url)
+    focus_query = str(focus_query or "").strip()
+
     ok, err = _validate_url(url)
     if not ok:
         return f"Error: {err}"
 
     try:
-        domain = urllib.parse.urlparse(url).hostname or url
-    except Exception:
-        domain = url
-
-    wiki_match = re.match(r"https?://(\w+)\.wikipedia\.org/wiki/([^#?]+)", url)
-    if wiki_match:
-        lang, title = wiki_match.group(1), wiki_match.group(2)
-        display_title = urllib.parse.unquote(title).replace("_", " ")
-        _PROGRESS.update(f"Wikipedia: {truncate(display_title, 35)}")
-        api_url = (
-            f"https://{lang}.wikipedia.org/w/api.php?"
-            f"action=query&titles={urllib.parse.quote(title, safe='')}"
-            f"&prop=extracts&explaintext=1&exlimit=1"
-            f"&exchars={FETCH_MAX_CHARS}&format=json"
-        )
         try:
-            req = urllib.request.Request(api_url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
-                pages = data.get("query", {}).get("pages", {})
-                for page_id, page_data in pages.items():
-                    if page_id == "-1":
-                        break
-                    extract = page_data.get("extract", "")
-                    page_title = page_data.get("title", title)
-                    if extract:
-                        return f"Wikipedia — {page_title}\n\n{extract}"[:FETCH_MAX_CHARS]
+            domain = urllib.parse.urlparse(url).hostname or url
         except Exception:
-            pass
+            domain = url
 
-    _PROGRESS.update(f"Fetching {truncate(domain, 35)}…")
-    try:
-        raw = _fetch_page(url)
-        _PROGRESS.update(f"Parsing {truncate(domain, 35)}…")
-        title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, flags=re.DOTALL | re.IGNORECASE)
-        page_title = ""
-        if title_match:
-            page_title = re.sub(r"\s+", " ", _html.unescape(
-                re.sub(r"<[^>]+>", "", title_match.group(1))
-            )).strip()
-        article_text = ""
-        for tag in (
-            "article", "main",
-            r'div[^>]+class="[^"]*(?:article|story|content|post|body|entry)[^"]*"',
-            r'div[^>]+id="[^"]*(?:article|story|content|main|body)[^"]*"',
-        ):
-            article_match = re.search(
-                rf"<{tag}[^>]*>(.*?)</{tag.split('[')[0]}>",
-                raw, flags=re.DOTALL | re.IGNORECASE,
+        _PROGRESS.update(f"Fetching {truncate(domain, 35)}…")
+        title, text = _fetch_page_text(url)
+        if not text:
+            return f"Error: No readable text found at {url}"
+
+        if focus_query:
+            _PROGRESS.update(f"Ranking excerpts for: {truncate(focus_query, 35)}")
+            excerpts = _select_best_chunks(
+                focus_query, title=title, url=url, text=text, max_chunks=4
             )
-            if article_match:
-                candidate = _clean_html(article_match.group(1))
-                if len(candidate) > 200:
-                    article_text = candidate
-                    break
-        text = article_text if article_text else _clean_html(raw)
-        header = f"Page: {page_title}\nURL: {url}\n\n" if page_title else ""
+            if not excerpts:
+                excerpts = [text[:1600]]
+
+            lines = [
+                f"Page: {title or url}",
+                f"URL: {url}",
+                f"Focus query: {focus_query}",
+                "",
+            ]
+            for i, ex in enumerate(excerpts, 1):
+                lines.append(f"[Excerpt {i}]")
+                lines.append(ex)
+                lines.append("")
+
+            return "\n".join(lines).strip()[:FETCH_MAX_CHARS]
+
+        header = f"Page: {title}\nURL: {url}\n\n" if title else f"URL: {url}\n\n"
         full = header + text
         if len(full) > FETCH_MAX_CHARS:
-            return full[:FETCH_MAX_CHARS] + "\n\n[Content truncated — page exceeded character limit]"
+            return full[:FETCH_MAX_CHARS] + "\n\n[Content truncated]"
         return full
+
     except urllib.error.HTTPError as exc:
         return f"Error fetching URL: HTTP {exc.code} ({exc.reason})"
     except ValueError as exc:
@@ -1148,11 +1490,116 @@ def tool_fetch_url(url: str = "", **kwargs: Any) -> str:
         return f"Error fetching URL: {exc}"
 
 
+def _fetch_many_pages(urls: list[str], query: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    lock = threading.Lock()
+    threads: list[threading.Thread] = []
+
+    def worker(url: str) -> None:
+        try:
+            title, text = _fetch_page_text(url)
+            excerpts = _select_best_chunks(query, title=title, url=url, text=text, max_chunks=3)
+            body_for_score = "\n\n".join(excerpts) if excerpts else text[:2500]
+            score = _score_text(query, title=title, url=url, body=body_for_score)
+            with lock:
+                out.append({
+                    "url": url,
+                    "title": title or url,
+                    "score": score,
+                    "excerpts": excerpts if excerpts else [text[:1200]],
+                })
+        except Exception:
+            pass
+
+    for url in urls:
+        t = threading.Thread(target=worker, args=(url,), daemon=True)
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join(timeout=20)
+
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out
+
+
+def tool_web_research(query: str = "", max_sources: int = 4, **kwargs: Any) -> str:
+    if not query:
+        return "Error: No query provided."
+
+    try:
+        max_sources = int(max_sources)
+    except Exception:
+        max_sources = 4
+    max_sources = max(1, min(max_sources, 6))
+
+    _PROGRESS.update("Searching query variants…")
+    results = search_web_structured(query, limit=max(10, max_sources * 4))
+    if not results:
+        return f"No results found for: {query}"
+
+    selected: list[dict[str, Any]] = []
+    seen_domains: set[str] = set()
+
+    for r in results:
+        host = (urllib.parse.urlparse(r["url"]).netloc or "").lower()
+        if host in seen_domains:
+            continue
+        seen_domains.add(host)
+        selected.append(r)
+        if len(selected) >= max_sources:
+            break
+
+    if len(selected) < max_sources:
+        seen_urls = {r["url"] for r in selected}
+        for r in results:
+            if r["url"] in seen_urls:
+                continue
+            selected.append(r)
+            seen_urls.add(r["url"])
+            if len(selected) >= max_sources:
+                break
+
+    _PROGRESS.update("Fetching source pages…")
+    fetched = _fetch_many_pages([r["url"] for r in selected], query)
+    if not fetched:
+        return tool_web_search(query=query, num_results=max_sources)
+
+    selected_by_url = {r["url"]: r for r in selected}
+
+    lines = [
+        f"Research results for: {query}",
+        f"Sources reviewed: {len(fetched)}",
+        "",
+    ]
+
+    for i, item in enumerate(fetched, 1):
+        meta = selected_by_url.get(item["url"], {})
+        lines.append(f"[{i}] {item['title']}")
+        lines.append(f"URL: {item['url']}")
+        if meta.get("snippet"):
+            lines.append(f"Snippet: {truncate(meta['snippet'], 280)}")
+        if meta.get("query_used") and meta["query_used"] != query:
+            lines.append(f"Matched via query variant: {meta['query_used']}")
+        lines.append("Relevant excerpts:")
+        for ex in item["excerpts"][:2]:
+            lines.append(f"- {truncate(ex, 700)}")
+        lines.append("")
+
+    lines.append(
+        "Use the numbered sources above when answering. Prefer claims supported by multiple sources. "
+        "If sources conflict, say so explicitly."
+    )
+
+    return "\n".join(lines).strip()[:FETCH_MAX_CHARS]
+
+
 def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
     if not query:
         return "Error: No query provided."
     if not re.fullmatch(r"[a-z]{2,5}", lang):
         lang = "en"
+
     _PROGRESS.update(f"Searching Wikipedia: {truncate(query, 30)}")
     search_url = (
         f"https://{lang}.wikipedia.org/w/api.php?"
@@ -1164,24 +1611,65 @@ def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
         req = urllib.request.Request(search_url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
+
         results = data.get("query", {}).get("search", [])
         if not results:
             return f"No Wikipedia results for: {query}"
+
         title = results[0]["title"]
         _PROGRESS.update(f"Fetching article: {truncate(title, 30)}")
-        return tool_fetch_url(
-            url=f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(title, safe='')}"
+        extract_url = (
+            f"https://{lang}.wikipedia.org/w/api.php?"
+            f"action=query&prop=extracts&explaintext=1&exlimit=1"
+            f"&titles={urllib.parse.quote(title)}&format=json"
         )
+        req2 = urllib.request.Request(extract_url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req2, timeout=15) as resp:
+            data2 = json.loads(resp.read().decode("utf-8", errors="replace"))
+        pages = data2.get("query", {}).get("pages", {})
+        extract = ""
+        page_title = title
+        for page_id, page_data in pages.items():
+            if page_id == "-1":
+                continue
+            page_title = page_data.get("title", title)
+            extract = page_data.get("extract", "")
+            break
+
+        if not extract:
+            return f"No Wikipedia extract found for: {query}"
+
+        excerpts = _select_best_chunks(
+            query=query,
+            title=page_title,
+            url=f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(page_title.replace(' ', '_'))}",
+            text=extract,
+            max_chunks=3,
+        )
+        if not excerpts:
+            excerpts = [extract[:2000]]
+
+        lines = [
+            f"Wikipedia — {page_title}",
+            f"URL: https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(page_title.replace(' ', '_'))}",
+            "",
+        ]
+        for i, ex in enumerate(excerpts, 1):
+            lines.append(f"[Excerpt {i}]")
+            lines.append(ex)
+            lines.append("")
+        return "\n".join(lines).strip()[:FETCH_MAX_CHARS]
     except Exception as exc:
         return f"Error: {exc}"
 
 
 TOOLS_REGISTRY: dict[str, Any] = {
-    "get_time":    tool_get_time,
-    "calculator":  tool_calculator,
-    "web_search":  tool_web_search,
-    "fetch_url":   tool_fetch_url,
-    "wikipedia":   tool_wikipedia,
+    "get_time":      tool_get_time,
+    "calculator":    tool_calculator,
+    "web_search":    tool_web_search,
+    "web_research":  tool_web_research,
+    "fetch_url":     tool_fetch_url,
+    "wikipedia":     tool_wikipedia,
 }
 
 OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
@@ -1219,9 +1707,8 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "function": {
             "name": "web_search",
             "description": (
-                "Search the web for current information via Startpage. "
-                "Returns results with titles, URLs, and snippets. "
-                "Use fetch_url on any returned URL to read the full article content."
+                "Quick web lookup via Startpage. Returns candidate results with titles, URLs, snippets, "
+                "and query variants used. Prefer web_research for answering factual/current questions."
             ),
             "parameters": {
                 "type": "object",
@@ -1236,12 +1723,35 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "web_research",
+            "description": (
+                "Perform deeper web research for a question. Searches multiple query variants, "
+                "fetches several pages, and returns the most relevant excerpts with numbered sources. "
+                "Use this for current events, factual claims, docs, versions, pricing, comparisons, and updates."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The research question"},
+                    "max_sources": {"type": "integer", "description": "How many sources to inspect (1-6, default 4)"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "fetch_url",
-            "description": "Fetch and read the full text content from any web page URL.",
+            "description": (
+                "Fetch text from a web page. If focus_query is provided, return the most relevant excerpts "
+                "instead of only the start of the page."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "The full HTTP/HTTPS URL to fetch"},
+                    "focus_query": {"type": "string", "description": "Optional question used to rank the best excerpts"},
                 },
                 "required": ["url"],
             },
@@ -1251,7 +1761,7 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "wikipedia",
-            "description": "Search Wikipedia by query and return the top article's plaintext content.",
+            "description": "Search Wikipedia by query and return the top article's most relevant plaintext excerpts.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1286,9 +1796,8 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
             {
                 "name": "web_search",
                 "description": (
-                    "Search the web for current information via Startpage. "
-                    "Returns results with titles, URLs, and snippets. "
-                    "Use fetch_url on any returned URL to read the full article content."
+                    "Quick web lookup via Startpage. Returns candidate results with titles, URLs, snippets, "
+                    "and query variants used. Prefer web_research for answering factual/current questions."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1300,19 +1809,39 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 },
             },
             {
+                "name": "web_research",
+                "description": (
+                    "Perform deeper web research for a question. Searches multiple query variants, "
+                    "fetches several pages, and returns the most relevant excerpts with numbered sources. "
+                    "Use this for current events, factual claims, docs, versions, pricing, comparisons, and updates."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The research question"},
+                        "max_sources": {"type": "integer", "description": "How many sources to inspect (1-6, default 4)"},
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
                 "name": "fetch_url",
-                "description": "Fetch and read the full text content from any web page URL.",
+                "description": (
+                    "Fetch text from a web page. If focus_query is provided, return the most relevant excerpts "
+                    "instead of only the start of the page."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "url": {"type": "string", "description": "The full HTTP/HTTPS URL to fetch"},
+                        "focus_query": {"type": "string", "description": "Optional question used to rank the best excerpts"},
                     },
                     "required": ["url"],
                 },
             },
             {
                 "name": "wikipedia",
-                "description": "Search Wikipedia by query and return the top article's plaintext content.",
+                "description": "Search Wikipedia by query and return the top article's most relevant plaintext excerpts.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1358,7 +1887,7 @@ def execute_tool(name: str, arguments_json: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SESSION MANAGEMENT
+# SESSION MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _session_path(name: str) -> Path:
@@ -1442,7 +1971,7 @@ def clear_sessions() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  HISTORY MANAGEMENT
+# HISTORY MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def init_history(is_openai_compat: bool) -> History:
@@ -1467,7 +1996,7 @@ def truncate_history(history: History, is_openai_compat: bool) -> History:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  MODEL FETCHING
+# MODEL FETCHING
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_request(
@@ -1572,7 +2101,7 @@ def select_model_interactive(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PAYLOAD BUILDING
+# PAYLOAD BUILDING
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_user_message(
@@ -1626,7 +2155,7 @@ def build_payload(
         if SYSTEM_PROMPT:
             payload["systemInstruction"] = {"parts": [{"text": SYSTEM_PROMPT}]}
         if enable_tools:
-            payload["tools"] = GEMINI_TOOLS_SCHEMA + [{"googleSearch": {}}]
+            payload["tools"] = GEMINI_TOOLS_SCHEMA
         return payload
 
     oai_payload: dict[str, Any] = {
@@ -1654,8 +2183,9 @@ def build_payload(
 
     return oai_payload
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  SSE PARSERS
+# SSE PARSERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _ChunkResult:
@@ -1737,12 +2267,10 @@ def _parse_gemini_chunk(obj: dict[str, Any]) -> _ChunkResult:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STREAM RENDERER
+# STREAM RENDERER
 # ─────────────────────────────────────────────────────────────────────────────
 
 class StreamRenderer:
-    """Smooth streaming with safe markdown/latex rendering."""
-
     def __init__(self, enable_thinking: bool) -> None:
         self.full_text = ""
         self.enable_thinking = enable_thinking
@@ -1880,7 +2408,7 @@ class StreamRenderer:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STREAMING RESPONSE
+# STREAMING RESPONSE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def stream_response(
@@ -1889,12 +2417,12 @@ def stream_response(
     enable_tools: bool, enable_thinking: bool,
 ) -> tuple[Optional[str], list[dict[str, Any]]]:
     payload = build_payload(
-    provider,
-    model_id,
-    history,
-    is_openai_compat,
-    enable_tools,
-    enable_thinking,
+        provider,
+        model_id,
+        history,
+        is_openai_compat,
+        enable_tools,
+        enable_thinking,
     )
     payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ep = ENDPOINTS[provider]
@@ -2099,8 +2627,9 @@ def stream_response(
         return None, []
     return (clean if clean else ""), tool_calls_out
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  HISTORY HELPERS
+# HISTORY HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _append_assistant_turn(
@@ -2178,11 +2707,11 @@ def _extract_display_text(msg: Message) -> str:
     role = msg.get("role", "")
     if role == "tool":
         name = msg.get("name", "tool")
-        return f"[🛠️  {name}] {truncate(msg.get('content', ''), 120)}"
+        return f"[🛠️ {name}] {truncate(msg.get('content', ''), 120)}"
     if "tool_calls" in msg:
         names = [tc.get("function", tc).get("name", "?") for tc in msg["tool_calls"]]
         base = msg.get("content") or ""
-        return (base + f" [🛠️  → {', '.join(names)}]").strip()
+        return (base + f" [🛠️ → {', '.join(names)}]").strip()
 
     raw = msg.get("content") or msg.get("parts", [{}])
     if isinstance(raw, str):
@@ -2192,9 +2721,9 @@ def _extract_display_text(msg: Message) -> str:
             if "text" in raw[0]:
                 return raw[0]["text"]
             if "functionCall" in raw[0]:
-                return f"[🛠️  → {', '.join(p['functionCall'].get('name', '?') for p in raw if 'functionCall' in p)}]"
+                return f"[🛠️ → {', '.join(p['functionCall'].get('name', '?') for p in raw if 'functionCall' in p)}]"
             if "functionResponse" in raw[0]:
-                return f"[🛠️  results for {', '.join(p['functionResponse'].get('name', '?') for p in raw if 'functionResponse' in p)}]"
+                return f"[🛠️ results for {', '.join(p['functionResponse'].get('name', '?') for p in raw if 'functionResponse' in p)}]"
             for part in raw:
                 if isinstance(part, dict) and part.get("type") == "text":
                     return part.get("text", "")
@@ -2208,7 +2737,7 @@ def _extract_display_text(msg: Message) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  MULTI-LINE INPUT
+# MULTI-LINE INPUT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def read_multiline_input(initial_prompt: str, cont_prompt: str = "") -> Optional[str]:
@@ -2251,7 +2780,7 @@ def read_paste_input(prefix: str = "") -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  USAGE / HELP
+# USAGE / HELP
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_usage() -> None:
@@ -2265,11 +2794,11 @@ def print_usage() -> None:
 
 {C.INFO}Setup:{C.RESET}
   Edit the {C.BOLD}API_KEYS{C.RESET} dict at the top of this script with your keys.
-  Edit the Ollama endpoints below if you want localhost instead of ollama.com.
+  Edit the Ollama endpoints if you want localhost instead of ollama.com.
 
 {C.INFO}Chat commands:{C.RESET}
   {C.BOLD}/history{C.RESET}            Show conversation history
-  {C.BOLD}/model{C.RESET}              Switch to a different model mid-chat
+  {C.BOLD}/model{C.RESET}              Switch model
   {C.BOLD}/save <name>{C.RESET}        Save session
   {C.BOLD}/load <name>{C.RESET}        Load a saved session
   {C.BOLD}/clear{C.RESET}              Delete all saved sessions
@@ -2300,12 +2829,12 @@ def print_chat_help() -> None:
   {C.BOLD}/help{C.RESET}               Show this help
   {C.BOLD}quit{C.RESET} / {C.BOLD}exit{C.RESET}          End session
 {C.TOOL}Available tools:{C.RESET}
-  get_time · calculator · web_search · fetch_url · wikipedia
+  get_time · calculator · web_search · web_research · fetch_url · wikipedia
 """)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  MAIN CHAT LOOP
+# MAIN CHAT LOOP
 # ─────────────────────────────────────────────────────────────────────────────
 
 def chat_loop(
@@ -2350,10 +2879,10 @@ def chat_loop(
         cprint(f"  {C.INFO}Tool calling:{C.RESET}     {tool_st}  (toggle: /toggletools)")
         if tools_on:
             cprint(f"  {C.INFO}Tools:{C.RESET}           {', '.join(TOOLS_REGISTRY)}")
-            cprint(f"  {C.INFO}Search:{C.RESET}          Startpage (live progress)")
+            cprint(f"  {C.INFO}Search backend:{C.RESET}  Startpage HTML scrape + multi-query reranking")
             cprint(f"  {C.INFO}Tool timeout:{C.RESET}    {TOOL_EXEC_TIMEOUT}s per call")
             cprint(f"  {C.INFO}History mode:{C.RESET}    auto-compact (tool msgs collapsed)")
-        cprint(f"  {C.INFO}SSRF protection:{C.RESET} on (DNS-pinned)")
+        cprint(f"  {C.INFO}SSRF protection:{C.RESET} on")
         cprint(f"  {C.INFO}Retry:{C.RESET}           {MAX_RETRIES}x on 429/5xx")
         cprint(
             f"  {C.INFO}Input:{C.RESET}   end line with {C.BOLD}\\{C.RESET} "
@@ -2541,7 +3070,7 @@ def chat_loop(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ENTRY POINT
+# ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2601,7 +3130,7 @@ def main() -> None:
             sys.exit(0)
         if ans in ("y", "yes"):
             enable_tools = True
-            cprint(f"{C.TOOL}Tool calling enabled.  Search: Startpage  │  SSRF: protected{C.RESET}")
+            cprint(f"{C.TOOL}Tool calling enabled. Search: Startpage + multi-source research │ SSRF: protected{C.RESET}")
             break
         elif ans in ("n", "no", ""):
             break
