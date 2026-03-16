@@ -4,37 +4,25 @@ Universal Chat CLI
 Pure stdlib, Python 3.9+. Zero pip installs required.
 
 Features:
-  - Markdown rendering (Bold, Italic, Code, Fenced code blocks)
-  - LaTeX rendering (Greek letters, superscripts, fractions → Unicode)
-  - Image attachment support (Vision models)
-  - Multi-line input (backslash continuation + /paste mode)
-  - Multi-provider support (Gemini, OpenRouter, Groq, Together, etc.)
-  - Tool/Function calling
-  - Enhanced web research via Startpage HTML scraping
-  - Multi-query search + source reranking + excerpt extraction
+  - Markdown rendering (bold, italic, inline code, fenced code blocks)
+  - Simple LaTeX rendering to Unicode
+  - Image attachment support
+  - Multi-line input and paste mode
+  - Multi-provider support
+  - Tool/function calling
+  - Deep web research via Startpage HTML scraping
+  - Source reranking + excerpt extraction
+  - SSRF protection
   - Live tool progress spinner
-  - Live model switching (/model command)
-  - History compaction (tool messages auto-collapsed after each exchange)
-  - SSRF protection with DNS validation
+  - Live model switching
+  - Session save/load
+  - History compaction after tool use
+
 Usage:
-    python ai.py <provider> [filter]...
+  python ai.py <provider> [filter]...
 
-Providers: gemini, openrouter, groq, together, cerebras, novita, ollama
-
-Chat commands:
-    /history            Show conversation history
-    /model              Switch to a different model mid-chat
-    /save <name>        Save session to ~/.chat_sessions/<name>.json
-    /load <name>        Load a saved session
-    /clear              Delete all saved sessions
-    /upload <path>      Attach an image to your next message
-    /image              Show currently attached image
-    /clearimage         Remove the attached image
-    /paste [text]       Multi-line paste mode (end with ---)
-    /togglethinking     Toggle reasoning/thinking output display
-    /toggletools        Toggle tool calling on/off
-    /help               Show available commands
-    quit / exit         End the session
+Providers:
+  gemini, openrouter, groq, together, cerebras, novita, ollama
 """
 
 import sys
@@ -61,6 +49,7 @@ import urllib.parse
 import html as _html
 import mimetypes
 import atexit
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Optional
 
@@ -78,7 +67,7 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION
+# CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
 API_KEYS: dict[str, str] = {
@@ -91,58 +80,55 @@ API_KEYS: dict[str, str] = {
     "ollama":     "",
 }
 
-MAX_HISTORY_MESSAGES  = 20
-MAX_MESSAGE_LENGTH    = 50_000
-DEFAULT_TEMPERATURE   = 0.7
-DEFAULT_MAX_TOKENS    = 3000
-DEFAULT_TOP_P         = 0.9
-SESSION_DIR           = Path.home() / ".chat_sessions"
-HISTORY_FILE          = Path.home() / ".ai_cli_history"
+MAX_HISTORY_MESSAGES = 20
+MAX_MESSAGE_LENGTH = 50_000
+DEFAULT_TEMPERATURE = 0.7
+DEFAULT_MAX_TOKENS = 3000
+DEFAULT_TOP_P = 1.0
+
+SESSION_DIR = Path.home() / ".chat_sessions"
+HISTORY_FILE = Path.home() / ".ai_cli_history"
 
 MAX_IMAGE_SIZE_MB = 20
 SUPPORTED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
-FETCH_MAX_CHARS    = 12000
-FETCH_MAX_BYTES    = 5 * 1024 * 1024
+FETCH_MAX_CHARS = 30_000
+FETCH_MAX_BYTES = 5 * 1024 * 1024
 SEARCH_MAX_RESULTS = 6
 
-SYSTEM_PROMPT = """You are a helpful assistant running in a command-line interface.
-
-If a question may require current, niche, factual, or externally verifiable information, use tools before answering.
-
-Use tools like this:
-- use web_research for most web lookups
-- use web_search only to quickly discover candidate URLs
-- use fetch_url when you already know the page to inspect
-- when using fetch_url, prefer passing a focus query
-
-When browsing:
-- prefer official docs, vendor pages, primary sources, government, education, and high-quality technical sources
-- do not rely only on SERP snippets
-- compare multiple sources for important claims
-- if sources disagree, say so
-- when tools were used, cite sources as [1], [2], [3]
-"""
-
 MAX_TOOL_ITERATIONS = 10
-TOOL_EXEC_TIMEOUT   = 60
+TOOL_EXEC_TIMEOUT = 60
 
-REQUEST_TIMEOUT     = 300
+REQUEST_TIMEOUT = 300
 MODEL_FETCH_TIMEOUT = 30
 
-MAX_RETRIES          = 3
+MAX_RETRIES = 3
 RETRYABLE_HTTP_CODES = (429, 500, 502, 503, 504)
 
-USER_AGENT = "PythonChatCLI/1.5"
-
+USER_AGENT = "PythonChatCLI/2.0"
 BROWSER_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
+RESEARCH_MIN_SOURCES = 4
+RESEARCH_TARGET_SOURCES = 5
+RESEARCH_MAX_SOURCES = 8
+RESEARCH_BATCH_SIZE = 6
+RESEARCH_MAX_CANDIDATES = 30
+
+SYSTEM_PROMPT = """You are a highly helpful assistant running in a command-line interface.
+
+For factual, current, version, release, pricing, documentation, troubleshooting, benchmark, or comparison questions:
+- Prefer web_research(query, max_sources=5) over plain web_search.
+- Do not give a final answer until you have reviewed at least 4 independent sources when possible.
+- If fewer than 4 sources are reachable, say so explicitly.
+- Use fetch_url for specific pages when needed.
+"""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANSI COLOURS
+# ANSI
 # ─────────────────────────────────────────────────────────────────────────────
 
 class C:
@@ -167,7 +153,7 @@ def _rl(code: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# THREAD-SAFE OUTPUT
+# OUTPUT
 # ─────────────────────────────────────────────────────────────────────────────
 
 _STDOUT_LOCK = threading.Lock()
@@ -243,12 +229,11 @@ def _validate_url(url: str) -> tuple[bool, str]:
     except Exception:
         return False, "Invalid URL format"
     if parsed.scheme not in ("http", "https"):
-        return False, f"Blocked protocol: {parsed.scheme}:// (only http/https allowed)"
-    hostname = parsed.hostname
-    if not hostname:
+        return False, f"Blocked protocol: {parsed.scheme}://"
+    if not parsed.hostname:
         return False, "No hostname in URL"
     try:
-        _resolve_and_validate(hostname)
+        _resolve_and_validate(parsed.hostname)
     except ValueError as exc:
         return False, str(exc)
     return True, ""
@@ -272,7 +257,7 @@ _URL_OPENER = urllib.request.build_opener(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LATEX RENDERER
+# RENDERERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LatexRenderer:
@@ -306,30 +291,23 @@ class LatexRenderer:
         self._sub_single = re.compile(r'_([a-zA-Z0-9])')
 
     def render(self, text: str) -> str:
-        text = self._display_pat.sub(
-            lambda m: self._convert(m.group(1) or m.group(2)), text
-        )
+        text = self._display_pat.sub(lambda m: self._convert(m.group(1) or m.group(2)), text)
         text = self._inline_pat.sub(lambda m: self._convert(m.group(1)), text)
         return text
 
     def _convert(self, tex: str) -> str:
-        if not tex:
-            return ""
-        tex = tex.strip()
+        tex = (tex or "").strip()
         for name, uni in self.greek.items():
             tex = tex.replace(f"\\{name}", uni)
-
         prev = None
         while tex != prev:
             prev = tex
             tex = self._frac_inner.sub(r'(\1/\2)', tex)
         tex = self._frac_outer.sub(r'(\1/\2)', tex)
-
         tex = self._sup_brace.sub(lambda m: m.group(1).translate(self.sup_map), tex)
         tex = self._sup_single.sub(lambda m: m.group(1).translate(self.sup_map), tex)
         tex = self._sub_brace.sub(lambda m: m.group(1).translate(self.sub_map), tex)
         tex = self._sub_single.sub(lambda m: m.group(1).translate(self.sub_map), tex)
-
         for cmd, sym in {
             "\\cdot": "·", "\\times": "×", "\\div": "÷", "\\sqrt": "√",
             "\\infty": "∞", "\\pm": "±", "\\neq": "≠", "\\leq": "≤",
@@ -340,24 +318,16 @@ class LatexRenderer:
         return tex
 
 
-LATEX_RENDERER = LatexRenderer()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MARKDOWN RENDERER
-# ─────────────────────────────────────────────────────────────────────────────
-
 class MarkdownRenderer:
     def __init__(self) -> None:
-        self.bold_pat   = re.compile(r'\*\*(.+?)\*\*')
+        self.bold_pat = re.compile(r'\*\*(.+?)\*\*')
         self.italic_pat = re.compile(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)')
-        self.code_pat   = re.compile(r'`([^`]+)`')
+        self.code_pat = re.compile(r'`([^`]+)`')
         self.header_pat = re.compile(r'^(#{1,6})\s+(.*)')
         self.in_code_block = False
 
     def _render_line_impl(self, line: str, in_code_block: bool) -> tuple[str, bool]:
         stripped = line.strip()
-
         if stripped.startswith("```"):
             new_state = not in_code_block
             lang = stripped[3:].strip()
@@ -368,9 +338,9 @@ class MarkdownRenderer:
         if in_code_block:
             return f"{C.CODE}{line}{C.RESET}", in_code_block
 
-        h_match = self.header_pat.match(line)
-        if h_match:
-            return f"{C.BOLD}{C.INFO}{h_match.group(2)}{C.RESET}", in_code_block
+        h = self.header_pat.match(line)
+        if h:
+            return f"{C.BOLD}{C.INFO}{h.group(2)}{C.RESET}", in_code_block
 
         line = LATEX_RENDERER.render(line)
         line = self.code_pat.sub(rf'{C.CODE}`\1`{C.RESET}{C.AI}', line)
@@ -379,8 +349,8 @@ class MarkdownRenderer:
         return line, in_code_block
 
     def render_line(self, line: str) -> str:
-        rendered, new_state = self._render_line_impl(line, self.in_code_block)
-        self.in_code_block = new_state
+        rendered, state = self._render_line_impl(line, self.in_code_block)
+        self.in_code_block = state
         return rendered
 
     def preview_line(self, line: str) -> str:
@@ -388,11 +358,12 @@ class MarkdownRenderer:
         return rendered
 
 
+LATEX_RENDERER = LatexRenderer()
 MD_RENDERER = MarkdownRenderer()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PROVIDER ENDPOINTS
+# PROVIDERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 ENDPOINTS: dict[str, dict[str, str]] = {
@@ -452,26 +423,19 @@ def validate_session_name(name: str) -> bool:
 def check_placeholder_key(key: str, provider: str) -> bool:
     if provider == "ollama":
         return True
-    msg = ""
+    bad = ""
     if not key:
-        msg = "is empty"
+        bad = "is empty"
     elif key.startswith("YOUR_") or key.endswith("-HERE") or "..." in key:
-        msg = "appears to be a placeholder"
+        bad = "appears to be a placeholder"
     elif provider == "gemini" and key == "-":
-        msg = "is the default placeholder '-'"
+        bad = "is the default placeholder '-'"
     elif provider == "openrouter" and key == "sk-or-v1-":
-        msg = "is an incomplete OpenRouter key"
+        bad = "is an incomplete OpenRouter key"
     elif provider == "groq" and key.startswith("gsk_") and len(key) < 10:
-        msg = "looks like an incomplete Groq key"
-    elif provider == "cerebras" and key == "csk-":
-        msg = "is the bare Cerebras prefix"
-    elif provider == "novita" and len(key) < 10:
-        msg = "is too short to be valid"
-    if msg:
-        eprint(f"{C.WARN}{'!' * 68}{C.RESET}")
-        eprint(f"{C.WARN}!! WARNING: API key for '{provider.upper()}' {msg}.{C.RESET}")
-        eprint(f"{C.WARN}!! Edit the API_KEYS dict at the top of this script.{C.RESET}")
-        eprint(f"{C.WARN}{'!' * 68}{C.RESET}")
+        bad = "looks incomplete"
+    if bad:
+        eprint(f"{C.WARN}WARNING: API key for {provider.upper()} {bad}.{C.RESET}")
         return False
     return True
 
@@ -499,16 +463,12 @@ def strip_think_tags(text: str) -> str:
 def filter_models(models: list[str], filters: list[str]) -> list[str]:
     if not filters:
         return models
-    eprint(f"{C.INFO}Filtering with: {' '.join(filters)}  (word-boundary){C.RESET}")
-    result: list[str] = []
+    out: list[str] = []
     for model in models:
         ml = model.lower()
-        if all(
-            re.search(r"(?:^|[^a-z0-9])" + re.escape(f.lower()) + r"(?:[^a-z0-9]|$)", ml)
-            for f in filters
-        ):
-            result.append(model)
-    return result
+        if all(re.search(r"(?:^|[^a-z0-9])" + re.escape(f.lower()) + r"(?:[^a-z0-9]|$)", ml) for f in filters):
+            out.append(model)
+    return out
 
 
 def _read_chunk(resp: Any, size: int = 8192) -> bytes:
@@ -519,8 +479,7 @@ def _read_chunk(resp: Any, size: int = 8192) -> bytes:
 
 
 def _is_length_finish(reason: str) -> bool:
-    r = (reason or "").strip()
-    return r in {"length", "max_tokens", "MAX_TOKENS", "max_output_tokens"}
+    return (reason or "").strip() in {"length", "max_tokens", "MAX_TOKENS", "max_output_tokens"}
 
 
 def _save_readline_history() -> None:
@@ -544,52 +503,12 @@ def _args_to_obj(arguments: str) -> dict[str, Any]:
 
 def _args_display(arguments: str) -> str:
     obj = _args_to_obj(arguments)
-    obj = {k: v for k, v in obj.items() if k}
     if not obj:
         return ""
     return json.dumps(obj, ensure_ascii=False, separators=(", ", ": "))
 
 
-_BLOCK_REMOVE_RE = re.compile(
-    r'<(?:script|style|noscript|svg)[^>]*>.*?</(?:script|style|noscript|svg)>'
-    r'|<!--.*?-->',
-    re.DOTALL | re.IGNORECASE,
-)
-_BLOCK_TAG_RE = re.compile(
-    r'<(/?)(div|p|br|h[1-6]|li|tr|article|section|main|pre|blockquote|ul|ol)[^>]*>',
-    re.IGNORECASE,
-)
-_TAG_RE = re.compile(r'<[^>]+>')
-_WHITESPACE_RE = re.compile(r'[ \t]+')
-_BLANK_LINES_RE = re.compile(r'\n[ \t]*\n[\n ]*')
-_CSS_COMBINED_RE = re.compile(
-    r'\.css-[a-zA-Z0-9_-]+\{[^}]*\}'
-    r'|\.[a-zA-Z_][\w-]*\{[^}]*\}'
-    r'|@media\s*\([^)]*\)\s*\{[^}]*(?:\{[^}]*\}[^}]*)?\}'
-    r'|@[a-zA-Z-]+\s*[^{]*\{[^}]*(?:\{[^}]*\}[^}]*)?\}'
-    r'|\{[^}]{0,500}\}',
-)
-
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-
-
-def _clean_html(raw: str) -> str:
-    text = _BLOCK_REMOVE_RE.sub(' ', raw)
-    text = _BLOCK_TAG_RE.sub('\n', text)
-    text = _TAG_RE.sub(' ', text)
-    text = _html.unescape(text)
-    text = _CSS_COMBINED_RE.sub('', text)
-    text = _WHITESPACE_RE.sub(' ', text)
-    text = _BLANK_LINES_RE.sub('\n\n', text)
-    return text.strip()
-
-
-def _clean_search_text(text: str) -> str:
-    text = _TAG_RE.sub("", text)
-    text = _html.unescape(text)
-    text = _CSS_COMBINED_RE.sub('', text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
 
 
 def _visible_len(text: str) -> int:
@@ -625,6 +544,266 @@ def _make_opener() -> urllib.request.OpenerDirector:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML CLEANING
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip_tags = {'script', 'style', 'noscript', 'svg', 'iframe', 'template'}
+        self.block_tags = {
+            'div', 'p', 'br', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+            'li', 'tr', 'article', 'section', 'main', 'pre',
+            'blockquote', 'ul', 'ol', 'hr', 'table'
+        }
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if tag in self.skip_tags:
+            self.skip_depth += 1
+        elif self.skip_depth == 0 and tag in self.block_tags:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.skip_tags:
+            if self.skip_depth > 0:
+                self.skip_depth -= 1
+        elif self.skip_depth == 0 and tag in self.block_tags:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self.skip_depth == 0:
+            self.parts.append(data)
+
+    def get_text(self) -> str:
+        raw = "".join(self.parts)
+        lines = [re.sub(r"[ \t]+", " ", line.strip()) for line in raw.split("\n")]
+        lines = [line for line in lines if line]
+        return "\n\n".join(lines)
+
+
+def _clean_html(raw: str) -> str:
+    if not raw:
+        return ""
+    parser = TextExtractor()
+    try:
+        parser.feed(raw)
+        return parser.get_text()
+    except Exception:
+        text = re.sub(r"<[^>]+>", " ", raw)
+        text = _html.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL SPINNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _ToolProgress:
+    _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._status = ""
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self._start = 0.0
+
+    def start(self, label: str) -> None:
+        self.stop()
+        self._stop.clear()
+        with self._lock:
+            self._status = label
+        self._start = time.monotonic()
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+        self._thread.start()
+
+    def update(self, status: str) -> None:
+        with self._lock:
+            self._status = status
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+        _stdout_write(C.CLR)
+
+    def _animate(self) -> None:
+        i = 0
+        while not self._stop.is_set():
+            with self._lock:
+                status = self._status
+            elapsed = time.monotonic() - self._start
+            frame = self._FRAMES[i % len(self._FRAMES)]
+            _stdout_write(f"{C.CLR}{C.TOOL}   {frame} {status}{C.RESET} {C.DIM}({elapsed:.1f}s){C.RESET}")
+            self._stop.wait(0.08)
+            i += 1
+
+
+_PROGRESS = _ToolProgress()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _request_with_retry(
+    req: urllib.request.Request,
+    timeout: int = REQUEST_TIMEOUT,
+    max_retries: int = MAX_RETRIES,
+    opener: Optional[urllib.request.OpenerDirector] = None,
+) -> Any:
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_retries):
+        try:
+            if opener:
+                return opener.open(req, timeout=timeout)
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code not in RETRYABLE_HTTP_CODES or attempt >= max_retries - 1:
+                raise
+            wait = 2 ** attempt
+            ra = exc.headers.get("Retry-After") if exc.headers else None
+            if ra and ra.isdigit():
+                wait = min(int(ra), 30)
+            eprint(f"{C.WARN}HTTP {exc.code} — retrying in {wait}s…{C.RESET}")
+            time.sleep(wait)
+        except (urllib.error.URLError, OSError) as exc:
+            last_exc = exc
+            if attempt >= max_retries - 1:
+                raise
+            wait = 2 ** attempt
+            eprint(f"{C.WARN}Network error — retrying in {wait}s…{C.RESET}")
+            time.sleep(wait)
+    raise last_exc  # type: ignore[misc]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEB FETCH
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FETCH_HEADERS_PRIMARY = {
+    "User-Agent": BROWSER_USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, identity",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": "https://www.google.com/",
+}
+
+_FETCH_HEADERS_FALLBACK = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+}
+
+
+def _fetch_page(url: str, timeout: int = 20) -> str:
+    ok, err = _validate_url(url)
+    if not ok:
+        raise ValueError(f"Blocked: {err}")
+
+    last_error: Optional[Exception] = None
+
+    for headers in (_FETCH_HEADERS_PRIMARY, _FETCH_HEADERS_FALLBACK):
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with _URL_OPENER.open(req, timeout=timeout) as resp:
+                cl = resp.headers.get("Content-Length")
+                if cl:
+                    try:
+                        if int(cl) > FETCH_MAX_BYTES:
+                            raise ValueError("Response too large")
+                    except ValueError:
+                        pass
+                raw = resp.read(FETCH_MAX_BYTES + 1)
+                if len(raw) > FETCH_MAX_BYTES:
+                    raw = raw[:FETCH_MAX_BYTES]
+                raw = _decompress(raw, resp.headers.get("Content-Encoding", ""))
+                return raw.decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code in (401, 403, 429):
+                continue
+            raise
+        except ValueError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Failed to fetch page")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMAGE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ImageAttachment:
+    def __init__(self) -> None:
+        self.path = ""
+        self.base64 = ""
+        self.mime = ""
+
+    def clear(self) -> None:
+        self.path = ""
+        self.base64 = ""
+        self.mime = ""
+
+    @property
+    def attached(self) -> bool:
+        return bool(self.base64)
+
+    def load(self, raw_path: str) -> bool:
+        path = Path(raw_path.strip("'\""))
+        if not path.is_file():
+            eprint(f"{C.ERROR}Error: File not found: {path}{C.RESET}")
+            return False
+
+        size_mb = path.stat().st_size / (1024 * 1024)
+        if size_mb > MAX_IMAGE_SIZE_MB:
+            eprint(f"{C.ERROR}Error: Image too large ({size_mb:.1f} MB). Max {MAX_IMAGE_SIZE_MB} MB.{C.RESET}")
+            return False
+
+        mime, _ = mimetypes.guess_type(str(path))
+        if not mime:
+            mime = {
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
+            }.get(path.suffix.lower(), "")
+
+        if mime not in SUPPORTED_MIME_TYPES:
+            eprint(f"{C.ERROR}Error: Unsupported type '{mime}'.{C.RESET}")
+            return False
+
+        eprint(f"{C.IMAGE}Encoding image…{C.RESET}")
+        try:
+            raw = path.read_bytes()
+            self.base64 = base64.b64encode(raw).decode("ascii")
+            self.mime = mime
+            self.path = str(path)
+            eprint(f"{C.IMAGE}✓ Attached: {path.name} ({mime}, {len(raw)//1024} KB){C.RESET}")
+            return True
+        except OSError as exc:
+            eprint(f"{C.ERROR}Error reading image: {exc}{C.RESET}")
+            return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESEARCH ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
 SEARCH_CACHE: dict[str, list[dict[str, Any]]] = {}
 PAGE_CACHE: dict[str, tuple[str, str]] = {}
 
@@ -633,16 +812,29 @@ _STOPWORDS = {
     "have", "has", "had", "into", "about", "what", "when", "where", "which",
     "their", "they", "them", "then", "than", "your", "you", "how", "why",
     "can", "could", "should", "would", "will", "may", "might", "also",
-    "there", "here", "more", "most", "some", "such", "just", "like",
-    "over", "under", "onto", "upon", "each", "many", "much", "very",
+    "there", "here", "some", "such", "just", "like", "onto", "upon", "each",
+    "many", "much", "very",
 }
 
-
 def _tokenize(text: str) -> list[str]:
-    return [
-        t for t in re.findall(r"[a-z0-9]{2,}", (text or "").lower())
-        if t not in _STOPWORDS
-    ]
+    raw = (text or "").strip()
+    tokens = re.findall(r"[a-z0-9]{2,}", raw.lower())
+
+    # Keep all tokens for short or quoted queries
+    if len(tokens) <= 3 or '"' in raw:
+        return tokens
+
+    filtered = [t for t in tokens if t not in _STOPWORDS]
+    return filtered or tokens
+
+def _domain_of(url: str) -> str:
+    try:
+        host = (urllib.parse.urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
 
 
 def _normalize_url(url: str) -> str:
@@ -657,7 +849,6 @@ def _normalize_url(url: str) -> str:
     path = p.path or "/"
     if path != "/":
         path = path.rstrip("/")
-
     qs = urllib.parse.parse_qsl(p.query, keep_blank_values=False)
     qs = [
         (k, v) for k, v in qs
@@ -674,19 +865,17 @@ def _unwrap_result_url(url: str) -> str:
     url = _html.unescape(url or "").strip()
     if not url:
         return ""
-
     if url.startswith("/"):
-        abs_url = urllib.parse.urljoin("https://www.startpage.com", url)
-    else:
-        abs_url = url
+        url = urllib.parse.urljoin("https://www.startpage.com", url)
 
     try:
-        p = urllib.parse.urlparse(abs_url)
+        p = urllib.parse.urlparse(url)
     except Exception:
         return url
 
-    if p.scheme in ("http", "https") and "startpage.com" not in (p.netloc or "").lower():
-        return abs_url
+    host = (p.netloc or "").lower()
+    if p.scheme in ("http", "https") and "startpage.com" not in host:
+        return url
 
     qs = urllib.parse.parse_qs(p.query)
     for key in ("url", "u", "to", "target"):
@@ -695,14 +884,23 @@ def _unwrap_result_url(url: str) -> str:
             cand = urllib.parse.unquote(vals[0])
             if cand.startswith("http://") or cand.startswith("https://"):
                 return cand
+    return url
 
-    return abs_url
+
+def _should_skip_result(url: str) -> bool:
+    host = _domain_of(url)
+    if not host:
+        return True
+    if "startpage.com" in host:
+        return True
+    if any(bad in host for bad in ("facebook.com", "instagram.com", "pinterest.", "tiktok.com")):
+        return True
+    return False
 
 
 def _domain_quality_bonus(url: str) -> float:
-    host = (urllib.parse.urlparse(url).netloc or "").lower()
+    host = _domain_of(url)
     score = 0.0
-
     if host.startswith("docs.") or ".docs." in host:
         score += 5.0
     if host.startswith("developer.") or ".developer." in host:
@@ -717,52 +915,24 @@ def _domain_quality_bonus(url: str) -> float:
         score += 2.0
     if "stackoverflow.com" in host or "stackexchange.com" in host:
         score += 2.0
-    if "python.org" in host:
-        score += 2.0
-    if "docs.python.org" in host:
-        score += 2.0
-
     if "medium.com" in host:
         score -= 1.0
     if "quora.com" in host:
         score -= 2.0
-    if "pinterest." in host:
-        score -= 3.0
-    if "facebook.com" in host or "instagram.com" in host:
-        score -= 2.0
-
     return score
 
 
-def _should_skip_result(url: str) -> bool:
-    host = (urllib.parse.urlparse(url).netloc or "").lower()
-    if not host:
-        return True
-    if "startpage.com" in host:
-        return True
-    if any(bad in host for bad in (
-        "facebook.com", "instagram.com", "pinterest.", "tiktok.com"
-    )):
-        return True
-    return False
-
-
-def _score_text(
-    query: str,
-    title: str = "",
-    snippet: str = "",
-    url: str = "",
-    body: str = "",
-) -> float:
+def _score_text(query: str, title: str = "", snippet: str = "", url: str = "", body: str = "") -> float:
     q_tokens = _tokenize(query)
+    phrase = (query or "").strip().lower()
+
     title_l = (title or "").lower()
     snippet_l = (snippet or "").lower()
-    body_l = (body or "").lower()
     url_l = (url or "").lower()
-    full = f"{title_l} {snippet_l} {url_l} {body_l[:6000]}"
+    body_l = (body or "").lower()
 
+    full = f"{title_l} {snippet_l} {url_l} {body_l[:6000]}"
     score = 0.0
-    phrase = (query or "").strip().lower()
 
     if phrase:
         if phrase in title_l:
@@ -777,10 +947,6 @@ def _score_text(
             score += 2.0
         score += min(full.count(tok), 5) * 0.8
 
-    year = str(datetime.datetime.now().year)
-    if year in full:
-        score += 1.0
-
     score += _domain_quality_bonus(url)
     return score
 
@@ -790,21 +956,14 @@ def _query_variants(query: str) -> list[str]:
     if not q:
         return []
 
-    ql = q.lower()
     year = datetime.datetime.now().year
+    ql = q.lower()
     out = [q]
 
-    if any(k in ql for k in (
-        "latest", "current", "new", "recent", "today", "now",
-        "version", "release", "pricing", "price", "updated", "update"
-    )):
+    if any(k in ql for k in ("latest", "current", "new", "recent", "today", "now", "version", "release", "pricing", "price", "updated", "update")):
         out.append(f"{q} {year}")
 
-    if any(k in ql for k in (
-        "api", "sdk", "docs", "documentation", "install", "cli",
-        "python", "javascript", "typescript", "error", "traceback",
-        "library", "package", "pip", "uv", "docker", "fastapi"
-    )):
+    if any(k in ql for k in ("api", "sdk", "docs", "documentation", "install", "cli", "python", "javascript", "typescript", "error", "traceback", "library", "package", "pip", "docker", "fastapi")):
         out.append(f"{q} official documentation")
 
     if len(q.split()) >= 3:
@@ -826,9 +985,8 @@ def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> list[s
     cur = ""
 
     def push(buf: str) -> None:
-        buf = buf.strip()
-        if buf:
-            chunks.append(buf)
+        if buf.strip():
+            chunks.append(buf.strip())
 
     for p in paras:
         if len(p) > chunk_size:
@@ -853,37 +1011,23 @@ def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> list[s
         else:
             push(cur)
             cur = p
-
     if cur:
         push(cur)
-
     return chunks
 
 
-def _select_best_chunks(
-    query: str,
-    title: str,
-    url: str,
-    text: str,
-    max_chunks: int = 3,
-) -> list[str]:
+def _best_excerpts(query: str, title: str, url: str, text: str, max_chunks: int = 4) -> list[str]:
     chunks = _chunk_text(text)
     if not chunks:
         return []
-
-    ranked = sorted(
-        chunks,
-        key=lambda ch: _score_text(query, title=title, url=url, body=ch),
-        reverse=True,
-    )
-
+    ranked = sorted(chunks, key=lambda ch: _score_text(query, title=title, url=url, body=ch), reverse=True)
     out: list[str] = []
-    seen_heads: set[str] = set()
+    seen: set[str] = set()
     for ch in ranked:
         sig = ch[:120]
-        if sig in seen_heads:
+        if sig in seen:
             continue
-        seen_heads.add(sig)
+        seen.add(sig)
         out.append(ch)
         if len(out) >= max_chunks:
             break
@@ -894,17 +1038,15 @@ def _extract_title_and_text(raw_html: str) -> tuple[str, str]:
     title = ""
     m = re.search(r"<title[^>]*>(.*?)</title>", raw_html, flags=re.I | re.S)
     if m:
-        title = re.sub(r"\s+", " ", _clean_search_text(m.group(1))).strip()
+        title = re.sub(r"\s+", " ", _clean_html(m.group(1))).strip()
 
     candidates: list[str] = []
-
     patterns = [
         r"<article[^>]*>(.*?)</article>",
         r"<main[^>]*>(.*?)</main>",
         r"<section[^>]*>(.*?)</section>",
         r'<div[^>]+(?:id|class)=["\'][^"\']*(?:article|content|post|entry|body|main|markdown|docs?|story)[^"\']*["\'][^>]*>(.*?)</div>',
     ]
-
     for pat in patterns:
         for mm in re.finditer(pat, raw_html, flags=re.I | re.S):
             cleaned = _clean_html(mm.group(1))
@@ -930,342 +1072,26 @@ def _fetch_page_text(url: str) -> tuple[str, str]:
     return title, text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TOOL PROGRESS SPINNER
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _ToolProgress:
-    _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-
-    def __init__(self) -> None:
-        self._stop_event = threading.Event()
-        self._status = ""
-        self._thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
-        self._start_time = 0.0
-
-    def start(self, label: str) -> None:
-        self.stop()
-        self._stop_event.clear()
-        with self._lock:
-            self._status = label
-        self._start_time = time.monotonic()
-        self._thread = threading.Thread(target=self._animate, daemon=True)
-        self._thread.start()
-
-    def update(self, status: str) -> None:
-        with self._lock:
-            self._status = status
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-            self._thread = None
-        _stdout_write(C.CLR)
-
-    def _animate(self) -> None:
-        i = 0
-        while not self._stop_event.is_set():
-            with self._lock:
-                status = self._status
-            elapsed = time.monotonic() - self._start_time
-            timer = f" {C.DIM}({elapsed:.1f}s){C.RESET}"
-            frame = self._FRAMES[i % len(self._FRAMES)]
-            _stdout_write(f"{C.CLR}{C.TOOL}   {frame} {status}{C.RESET}{timer}")
-            self._stop_event.wait(0.08)
-            i += 1
-
-
-_PROGRESS = _ToolProgress()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HTTP HELPERS WITH RETRY
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _request_with_retry(
-    req: urllib.request.Request,
-    timeout: int = REQUEST_TIMEOUT,
-    max_retries: int = MAX_RETRIES,
-    opener: Optional[urllib.request.OpenerDirector] = None,
-) -> Any:
-    last_exc: Optional[Exception] = None
-    for attempt in range(max_retries):
-        try:
-            if opener:
-                return opener.open(req, timeout=timeout)
-            return urllib.request.urlopen(req, timeout=timeout)
-        except urllib.error.HTTPError as exc:
-            last_exc = exc
-            if exc.code not in RETRYABLE_HTTP_CODES or attempt >= max_retries - 1:
-                raise
-            wait = 2 ** attempt
-            retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            if retry_after and retry_after.isdigit():
-                wait = min(int(retry_after), 30)
-            eprint(f"{C.WARN}HTTP {exc.code} — retrying in {wait}s (attempt {attempt + 1}/{max_retries})…{C.RESET}")
-            time.sleep(wait)
-        except (urllib.error.URLError, OSError) as exc:
-            last_exc = exc
-            if attempt >= max_retries - 1:
-                raise
-            wait = 2 ** attempt
-            eprint(f"{C.WARN}Network error — retrying in {wait}s…{C.RESET}")
-            time.sleep(wait)
-    raise last_exc  # type: ignore[misc]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# WEB FETCHER
-# ─────────────────────────────────────────────────────────────────────────────
-
-_FETCH_HEADERS_PRIMARY: dict[str, str] = {
-    "User-Agent": BROWSER_USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, identity",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Referer": "https://www.google.com/",
-}
-
-_FETCH_HEADERS_FALLBACK: dict[str, str] = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "Accept": "*/*",
-    "Accept-Encoding": "identity",
-}
-
-
-def _fetch_page(url: str, timeout: int = 20) -> str:
-    ok, err = _validate_url(url)
-    if not ok:
-        raise ValueError(f"Blocked: {err}")
-    last_error: Optional[Exception] = None
-    for headers in (_FETCH_HEADERS_PRIMARY, _FETCH_HEADERS_FALLBACK):
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with _URL_OPENER.open(req, timeout=timeout) as resp:
-                content_length = resp.headers.get("Content-Length")
-                if content_length:
-                    try:
-                        if int(content_length) > FETCH_MAX_BYTES:
-                            raise ValueError(
-                                f"Response too large: {int(content_length) // (1024*1024)} MB "
-                                f"(max {FETCH_MAX_BYTES // (1024*1024)} MB)"
-                            )
-                    except ValueError:
-                        pass
-                raw_bytes = resp.read(FETCH_MAX_BYTES + 1)
-                if len(raw_bytes) > FETCH_MAX_BYTES:
-                    raw_bytes = raw_bytes[:FETCH_MAX_BYTES]
-                raw_bytes = _decompress(raw_bytes, resp.headers.get("Content-Encoding", ""))
-                return raw_bytes.decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            last_error = exc
-            if exc.code in (401, 403, 429):
-                continue
-            raise
-        except ValueError:
-            raise
-        except Exception as exc:
-            last_error = exc
-            continue
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("Failed to fetch URL")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# IMAGE HANDLING
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ImageAttachment:
-    def __init__(self) -> None:
-        self.path = self.base64 = self.mime = ""
-
-    def clear(self) -> None:
-        self.path = self.base64 = self.mime = ""
-
-    @property
-    def attached(self) -> bool:
-        return bool(self.base64)
-
-    def load(self, raw_path: str) -> bool:
-        path = Path(raw_path.strip("'\""))
-        if not path.is_file():
-            eprint(f"{C.ERROR}Error: File not found: {path}{C.RESET}")
-            return False
-        size_mb = path.stat().st_size / (1024 * 1024)
-        if size_mb > MAX_IMAGE_SIZE_MB:
-            eprint(f"{C.ERROR}Error: Image too large ({size_mb:.1f} MB). Max {MAX_IMAGE_SIZE_MB} MB.{C.RESET}")
-            return False
-        mime, _ = mimetypes.guess_type(str(path))
-        if not mime:
-            ext_map = {
-                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
-            }
-            mime = ext_map.get(path.suffix.lower(), "")
-        if mime not in SUPPORTED_MIME_TYPES:
-            eprint(f"{C.ERROR}Error: Unsupported type '{mime}'. Supported: {', '.join(sorted(SUPPORTED_MIME_TYPES))}{C.RESET}")
-            return False
-        eprint(f"{C.IMAGE}Encoding image…{C.RESET}")
-        try:
-            raw = path.read_bytes()
-            self.base64 = base64.b64encode(raw).decode("ascii")
-            self.mime = mime
-            self.path = str(path)
-            eprint(f"{C.IMAGE}✓ Attached: {path.name} ({mime}, {len(raw) // 1024} KB){C.RESET}")
-            return True
-        except OSError as exc:
-            eprint(f"{C.ERROR}Error reading image: {exc}{C.RESET}")
-            return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TOOL / FUNCTION CALLING
-# ─────────────────────────────────────────────────────────────────────────────
-
-def tool_get_time(**kwargs: Any) -> str:
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-_CALC_MAX_EXPONENT = 10_000
-_CALC_MAX_RESULT = 1e308
-
-_CALC_ALLOWED_FUNCS: dict[str, Any] = {
-    "sqrt": math.sqrt,
-    "abs": abs,
-    "sin": math.sin,
-    "cos": math.cos,
-    "tan": math.tan,
-    "asin": math.asin,
-    "acos": math.acos,
-    "atan": math.atan,
-    "log": math.log,
-    "log2": math.log2,
-    "log10": math.log10,
-    "exp": math.exp,
-    "floor": math.floor,
-    "ceil": math.ceil,
-    "factorial": math.factorial,
-    "gcd": math.gcd,
-}
-
-_CALC_ALLOWED_CONSTS: dict[str, float] = {
-    "pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf,
-}
-
-_CALC_BIN_OPS: dict[type, Any] = {
-    ast.Add: operator.add, ast.Sub: operator.sub,
-    ast.Mult: operator.mul, ast.Div: operator.truediv,
-    ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
-    ast.Pow: operator.pow, ast.BitXor: operator.xor,
-}
-
-_CALC_UNARY_OPS: dict[type, Any] = {
-    ast.USub: operator.neg, ast.UAdd: operator.pos,
-}
-
-
-def tool_calculator(expression: str = "", **kwargs: Any) -> str:
-    def _eval_node(node: ast.AST) -> Any:
-        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-            return node.value
-
-        if isinstance(node, ast.Name) and node.id in _CALC_ALLOWED_CONSTS:
-            return _CALC_ALLOWED_CONSTS[node.id]
-
-        if isinstance(node, ast.BinOp):
-            fn = _CALC_BIN_OPS.get(type(node.op))
-            if fn is None:
-                raise TypeError(f"Unsupported operator: {type(node.op).__name__}")
-            left = _eval_node(node.left)
-            right = _eval_node(node.right)
-            if fn is operator.pow:
-                if isinstance(right, (int, float)) and abs(right) > _CALC_MAX_EXPONENT:
-                    raise ValueError(f"Exponent too large: {right} (max ±{_CALC_MAX_EXPONENT})")
-            result = fn(left, right)
-            if isinstance(result, float):
-                if result != result:
-                    raise ValueError("Result is NaN")
-                if abs(result) > _CALC_MAX_RESULT and not math.isinf(result):
-                    raise OverflowError("Result too large")
-            return result
-
-        if isinstance(node, ast.UnaryOp):
-            fn = _CALC_UNARY_OPS.get(type(node.op))
-            if fn is None:
-                raise TypeError(f"Unsupported unary operator: {type(node.op).__name__}")
-            return fn(_eval_node(node.operand))
-
-        if isinstance(node, ast.Call):
-            if not isinstance(node.func, ast.Name):
-                raise TypeError("Only simple function names allowed")
-            func_name = node.func.id
-            fn = _CALC_ALLOWED_FUNCS.get(func_name)
-            if fn is None:
-                raise TypeError(
-                    f"Unknown function '{func_name}'. Allowed: {', '.join(sorted(_CALC_ALLOWED_FUNCS))}"
-                )
-            if node.keywords:
-                raise TypeError("Keyword arguments not supported")
-            args = [_eval_node(a) for a in node.args]
-            if func_name == "factorial":
-                if len(args) != 1:
-                    raise TypeError("factorial() takes exactly 1 argument")
-                if not isinstance(args[0], int) or args[0] < 0:
-                    raise ValueError("factorial() requires a non-negative integer")
-                if args[0] > 1000:
-                    raise ValueError(f"factorial({args[0]}) too large (max 1000)")
-            return fn(*args)
-
-        raise TypeError(f"Unsupported expression element: {type(node).__name__}")
-
-    if not expression or not expression.strip():
-        return "Error: No expression provided."
-
-    try:
-        expression = expression.replace("^", "**")
-        tree = ast.parse(expression, mode="eval")
-        result = _eval_node(tree.body)
-        if isinstance(result, float) and result == int(result) and not math.isinf(result):
-            return str(int(result))
-        return str(result)
-    except (TypeError, ValueError, OverflowError, ZeroDivisionError) as exc:
-        return f"Error: {exc}"
-    except SyntaxError:
-        return f"Error: Invalid expression syntax: {expression}"
-    except Exception as exc:
-        return f"Error: {exc}"
-
-
-def _startpage_search_structured(query: str, limit: int) -> list[dict[str, Any]]:
+def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, Any]]:
     cache_key = f"sp::{query}::{limit}"
     cached = SEARCH_CACHE.get(cache_key)
     if cached is not None:
         return cached[:limit]
 
-    _PROGRESS.update("Connecting to Startpage…")
     opener = _make_opener()
 
-    home_headers = {
-        "User-Agent": BROWSER_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, identity",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
-
     try:
-        req = urllib.request.Request("https://www.startpage.com/", headers=home_headers)
+        _PROGRESS.update("Connecting to Startpage…")
+        req = urllib.request.Request(
+            "https://www.startpage.com/",
+            headers={
+                "User-Agent": BROWSER_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, identity",
+                "DNT": "1",
+            },
+        )
         with opener.open(req, timeout=10) as resp:
             resp.read(300_000)
     except Exception:
@@ -1280,30 +1106,26 @@ def _startpage_search_structured(query: str, limit: int) -> list[dict[str, Any]]
         "engine0": "v1all",
     }).encode()
 
-    post_headers = {
-        "User-Agent": BROWSER_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, identity",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://www.startpage.com",
-        "Referer": "https://www.startpage.com/",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
-
     try:
         req = urllib.request.Request(
             "https://www.startpage.com/do/search",
             data=post_data,
-            headers=post_headers,
+            headers={
+                "User-Agent": BROWSER_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, identity",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://www.startpage.com",
+                "Referer": "https://www.startpage.com/",
+                "DNT": "1",
+            },
             method="POST",
         )
         with opener.open(req, timeout=15) as resp:
-            raw_bytes = resp.read(FETCH_MAX_BYTES)
-            raw_bytes = _decompress(raw_bytes, resp.headers.get("Content-Encoding", ""))
-            html_text = raw_bytes.decode("utf-8", errors="replace")
+            raw = resp.read(FETCH_MAX_BYTES)
+            raw = _decompress(raw, resp.headers.get("Content-Encoding", ""))
+            html_text = raw.decode("utf-8", errors="replace")
     except Exception:
         return []
 
@@ -1311,157 +1133,333 @@ def _startpage_search_structured(query: str, limit: int) -> list[dict[str, Any]]
         return []
 
     _PROGRESS.update("Parsing results…")
-
-    results_data: list[tuple[str, str, str]] = []
+    found: list[tuple[str, str, str]] = []
 
     for m in re.finditer(
         r'<a[^>]+class="[^"]*result-title[^"]*"[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-        html_text, re.DOTALL | re.IGNORECASE,
+        html_text, re.I | re.S,
     ):
         href = m.group(1)
-        title = _clean_search_text(m.group(2))
+        title = re.sub(r"\s+", " ", _clean_html(m.group(2))).strip()
         snippet = ""
         after = html_text[m.end():m.end() + 2500]
-        snip = re.search(
+        sm = re.search(
             r'class="[^"]*(?:result-description|w-gl__description)[^"]*"[^>]*>(.*?)</(?:p|div|span)>',
-            after, re.DOTALL | re.IGNORECASE,
+            after, re.I | re.S,
         )
-        if snip:
-            snippet = _clean_search_text(snip.group(1))
-        results_data.append((href, title, snippet))
+        if sm:
+            snippet = re.sub(r"\s+", " ", _clean_html(sm.group(1))).strip()
+        found.append((href, title, snippet))
 
-    if not results_data:
+    if not found:
         for m in re.finditer(
             r'<h[23][^>]*>\s*<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-            html_text, re.DOTALL | re.IGNORECASE,
+            html_text, re.I | re.S,
         ):
-            results_data.append((m.group(1), _clean_search_text(m.group(2)), ""))
-
-    if not results_data:
-        for m in re.finditer(
-            r'<a[^>]+href=["\'](http[^"\']+)["\'][^>]*>(.*?)</a>',
-            html_text, re.DOTALL | re.IGNORECASE,
-        ):
-            title = _clean_search_text(m.group(2))
-            if len(title) >= 3:
-                results_data.append((m.group(1), title, ""))
+            found.append((m.group(1), re.sub(r"\s+", " ", _clean_html(m.group(2))).strip(), ""))
 
     out: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
-
-    for href, title, snippet in results_data:
-        url = _unwrap_result_url(href)
+    for href, title, snippet in found:
+        url = _normalize_url(_unwrap_result_url(href))
         if not url.startswith(("http://", "https://")):
             continue
-
-        url = _normalize_url(url)
         if _should_skip_result(url):
             continue
-
         if url in seen_urls:
             continue
         seen_urls.add(url)
-
         if not title:
             title = url
-
         out.append({
             "title": title,
             "url": url,
             "snippet": snippet,
-            "source": "startpage",
             "score": _score_text(query, title=title, snippet=snippet, url=url),
         })
-
         if len(out) >= limit * 3:
             break
 
-    out.sort(key=lambda r: r["score"], reverse=True)
+    out.sort(key=lambda x: x["score"], reverse=True)
     SEARCH_CACHE[cache_key] = out
     return out[:limit]
 
 
-def search_web_structured(query: str, limit: int = SEARCH_MAX_RESULTS) -> list[dict[str, Any]]:
-    all_results: list[dict[str, Any]] = []
+def _search_candidates(query: str, max_sources: int) -> list[dict[str, Any]]:
+    variants = _query_variants(query)[:4]
+    all_rows: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
 
-    variants = _query_variants(query)[:3]
-    for i, qv in enumerate(variants):
-        results = _startpage_search_structured(qv, max(limit, 6))
-        for r in results:
-            url = r["url"]
+    per_variant = max(10, max_sources * 5)
+
+    for variant_index, variant in enumerate(variants):
+        rows = _startpage_search_structured(variant, limit=per_variant)
+        for rank, row in enumerate(rows, 1):
+            url = _normalize_url(row["url"])
             if url in seen_urls:
                 continue
             seen_urls.add(url)
+            item = dict(row)
+            item["query_used"] = variant
+            item["score"] = float(item.get("score", 0.0))
+            if variant_index == 0:
+                item["score"] += 3.0
+            item["score"] += max(0.0, 2.0 - 0.15 * (rank - 1))
+            all_rows.append(item)
 
-            item = dict(r)
-            item["query_used"] = qv
-            item["score"] = float(item.get("score", 0.0)) + (3.0 if i == 0 else 0.0)
-            all_results.append(item)
+    all_rows.sort(key=lambda x: x["score"], reverse=True)
 
-    all_results.sort(key=lambda r: r["score"], reverse=True)
-    return all_results[:limit]
+    primary: list[dict[str, Any]] = []
+    fallback: list[dict[str, Any]] = []
+    seen_domains: set[str] = set()
+
+    for item in all_rows:
+        dom = _domain_of(item["url"])
+        if dom and dom not in seen_domains:
+            primary.append(item)
+            seen_domains.add(dom)
+        else:
+            fallback.append(item)
+
+    return (primary + fallback)[:RESEARCH_MAX_CANDIDATES]
+
+
+def _fetch_source_batch(batch: list[dict[str, Any]], query: str) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    ok_rows: list[dict[str, Any]] = []
+    bad_rows: list[dict[str, str]] = []
+    lock = threading.Lock()
+    threads: list[threading.Thread] = []
+
+    def worker(candidate: dict[str, Any]) -> None:
+        url = candidate["url"]
+        try:
+            title, text = _fetch_page_text(url)
+            if len((text or "").strip()) < 200:
+                raise ValueError("not enough readable text")
+
+            final_title = title or candidate.get("title") or url
+            excerpts = _best_excerpts(query, final_title, url, text, max_chunks=4)
+            if not excerpts:
+                excerpts = [text[:1800]]
+
+            score = float(candidate.get("score", 0.0)) + _score_text(
+                query,
+                title=final_title,
+                url=url,
+                body="\n\n".join(excerpts),
+            )
+
+            with lock:
+                ok_rows.append({
+                    "title": final_title,
+                    "url": url,
+                    "snippet": candidate.get("snippet", ""),
+                    "query_used": candidate.get("query_used", query),
+                    "score": score,
+                    "excerpts": excerpts[:4],
+                })
+        except Exception as exc:
+            with lock:
+                bad_rows.append({"url": url, "error": str(exc)})
+
+    for item in batch:
+        t = threading.Thread(target=worker, args=(item,), daemon=True)
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join(timeout=22)
+
+    return ok_rows, bad_rows
+
+
+def _research_sources(query: str, max_sources: int) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, Any]]]:
+    max_sources = max(1, min(max_sources, RESEARCH_MAX_SOURCES))
+    candidates = _search_candidates(query, max_sources=max_sources)
+    if not candidates:
+        return [], [], []
+
+    fetched_raw: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    cursor = 0
+
+    while cursor < len(candidates):
+        batch = candidates[cursor:cursor + RESEARCH_BATCH_SIZE]
+        cursor += RESEARCH_BATCH_SIZE
+        _PROGRESS.update(f"Fetching sources… {min(cursor, len(candidates))}/{len(candidates)} candidates")
+        ok_rows, bad_rows = _fetch_source_batch(batch, query)
+        fetched_raw.extend(ok_rows)
+        failures.extend(bad_rows)
+
+        unique_domains = {_domain_of(item["url"]) for item in fetched_raw if _domain_of(item["url"])}
+        if len(unique_domains) >= max_sources:
+            break
+
+    fetched_raw.sort(key=lambda x: x["score"], reverse=True)
+
+    selected: list[dict[str, Any]] = []
+    leftovers: list[dict[str, Any]] = []
+    seen_domains: set[str] = set()
+
+    for item in fetched_raw:
+        dom = _domain_of(item["url"])
+        if dom and dom not in seen_domains:
+            selected.append(item)
+            seen_domains.add(dom)
+        else:
+            leftovers.append(item)
+
+    if len(selected) < max_sources:
+        for item in leftovers:
+            selected.append(item)
+            if len(selected) >= max_sources:
+                break
+
+    return selected[:max_sources], failures, candidates
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOLS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def tool_get_time(**kwargs: Any) -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+_CALC_MAX_EXPONENT = 10_000
+_CALC_MAX_RESULT = 1e308
+
+_CALC_ALLOWED_FUNCS: dict[str, Any] = {
+    "sqrt": math.sqrt, "abs": abs, "sin": math.sin, "cos": math.cos, "tan": math.tan,
+    "asin": math.asin, "acos": math.acos, "atan": math.atan,
+    "log": math.log, "log2": math.log2, "log10": math.log10,
+    "exp": math.exp, "floor": math.floor, "ceil": math.ceil,
+    "factorial": math.factorial, "gcd": math.gcd,
+}
+_CALC_ALLOWED_CONSTS: dict[str, float] = {
+    "pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf,
+}
+_CALC_BIN_OPS: dict[type, Any] = {
+    ast.Add: operator.add, ast.Sub: operator.sub,
+    ast.Mult: operator.mul, ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+    ast.Pow: operator.pow, ast.BitXor: operator.xor,
+}
+_CALC_UNARY_OPS: dict[type, Any] = {
+    ast.USub: operator.neg, ast.UAdd: operator.pos,
+}
+
+
+def tool_calculator(expression: str = "", **kwargs: Any) -> str:
+    def _eval_node(node: ast.AST) -> Any:
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in _CALC_ALLOWED_CONSTS:
+            return _CALC_ALLOWED_CONSTS[node.id]
+        if isinstance(node, ast.BinOp):
+            fn = _CALC_BIN_OPS.get(type(node.op))
+            if fn is None:
+                raise TypeError(f"Unsupported operator: {type(node.op).__name__}")
+            left = _eval_node(node.left)
+            right = _eval_node(node.right)
+            if fn is operator.pow and isinstance(right, (int, float)) and abs(right) > _CALC_MAX_EXPONENT:
+                raise ValueError(f"Exponent too large: {right}")
+            result = fn(left, right)
+            if isinstance(result, float):
+                if result != result:
+                    raise ValueError("Result is NaN")
+                if abs(result) > _CALC_MAX_RESULT and not math.isinf(result):
+                    raise OverflowError("Result too large")
+            return result
+        if isinstance(node, ast.UnaryOp):
+            fn = _CALC_UNARY_OPS.get(type(node.op))
+            if fn is None:
+                raise TypeError(f"Unsupported unary operator: {type(node.op).__name__}")
+            return fn(_eval_node(node.operand))
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise TypeError("Only simple function names allowed")
+            name = node.func.id
+            fn = _CALC_ALLOWED_FUNCS.get(name)
+            if fn is None:
+                raise TypeError(f"Unknown function '{name}'")
+            if node.keywords:
+                raise TypeError("Keyword arguments not supported")
+            args = [_eval_node(a) for a in node.args]
+            if name == "factorial":
+                if len(args) != 1 or not isinstance(args[0], int) or args[0] < 0:
+                    raise ValueError("factorial() requires a non-negative integer")
+                if args[0] > 1000:
+                    raise ValueError("factorial() input too large")
+            return fn(*args)
+        raise TypeError(f"Unsupported expression element: {type(node).__name__}")
+
+    if not expression.strip():
+        return "Error: No expression provided."
+    try:
+        expression = expression.replace("^", "**")
+        tree = ast.parse(expression, mode="eval")
+        result = _eval_node(tree.body)
+        if isinstance(result, float) and result == int(result) and not math.isinf(result):
+            return str(int(result))
+        return str(result)
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError) as exc:
+        return f"Error: {exc}"
+    except SyntaxError:
+        return f"Error: Invalid expression syntax: {expression}"
 
 
 def tool_web_search(query: str = "", num_results: int = 0, **kwargs: Any) -> str:
     if not query:
         return "Error: No query provided."
+    try:
+        limit = int(num_results)
+    except Exception:
+        limit = 0
+    limit = limit if 1 <= limit <= 10 else SEARCH_MAX_RESULTS
 
-    limit = num_results if 1 <= num_results <= 10 else SEARCH_MAX_RESULTS
-    results = search_web_structured(query, limit=limit)
-    if not results:
+    rows = _search_candidates(query, max_sources=max(limit, 6))[:limit]
+    if not rows:
         return f"No results found for: {query}"
 
     lines = [
         f"Web search results for: {query}",
-        f"({len(results)} results via Startpage; use web_research for deeper synthesis or fetch_url for a specific page)",
+        "(Quick lookup only. For final factual/current answers, prefer web_research.)",
         "",
     ]
-
-    for i, r in enumerate(results, 1):
-        lines.append(f"{i}. {r['title']}")
-        lines.append(f"   URL: {r['url']}")
-        if r.get("snippet"):
-            lines.append(f"   {r['snippet']}")
-        if r.get("query_used") and r["query_used"] != query:
-            lines.append(f"   matched via query variant: {r['query_used']}")
+    for i, row in enumerate(rows, 1):
+        lines.append(f"{i}. {row['title']}")
+        lines.append(f"   URL: {row['url']}")
+        if row.get("snippet"):
+            lines.append(f"   {row['snippet']}")
+        if row.get("query_used") and row["query_used"] != query:
+            lines.append(f"   matched via query variant: {row['query_used']}")
         lines.append("")
-
     return "\n".join(lines).strip()[:FETCH_MAX_CHARS]
 
 
 def tool_fetch_url(url: str = "", focus_query: str = "", **kwargs: Any) -> str:
     if not url:
         return "Error: No URL provided."
-
     if not url.startswith("http"):
         url = "https://" + url
-
     url = _normalize_url(url)
-    focus_query = str(focus_query or "").strip()
 
     ok, err = _validate_url(url)
     if not ok:
         return f"Error: {err}"
 
     try:
-        try:
-            domain = urllib.parse.urlparse(url).hostname or url
-        except Exception:
-            domain = url
-
-        _PROGRESS.update(f"Fetching {truncate(domain, 35)}…")
+        _PROGRESS.update(f"Fetching {truncate(_domain_of(url) or url, 35)}…")
         title, text = _fetch_page_text(url)
         if not text:
             return f"Error: No readable text found at {url}"
 
+        focus_query = str(focus_query or "").strip()
         if focus_query:
-            _PROGRESS.update(f"Ranking excerpts for: {truncate(focus_query, 35)}")
-            excerpts = _select_best_chunks(
-                focus_query, title=title, url=url, text=text, max_chunks=4
-            )
+            excerpts = _best_excerpts(focus_query, title or url, url, text, max_chunks=4)
             if not excerpts:
-                excerpts = [text[:1600]]
+                excerpts = [text[:1800]]
 
             lines = [
                 f"Page: {title or url}",
@@ -1473,7 +1471,6 @@ def tool_fetch_url(url: str = "", focus_query: str = "", **kwargs: Any) -> str:
                 lines.append(f"[Excerpt {i}]")
                 lines.append(ex)
                 lines.append("")
-
             return "\n".join(lines).strip()[:FETCH_MAX_CHARS]
 
         header = f"Page: {title}\nURL: {url}\n\n" if title else f"URL: {url}\n\n"
@@ -1484,112 +1481,62 @@ def tool_fetch_url(url: str = "", focus_query: str = "", **kwargs: Any) -> str:
 
     except urllib.error.HTTPError as exc:
         return f"Error fetching URL: HTTP {exc.code} ({exc.reason})"
-    except ValueError as exc:
-        return f"Error: {exc}"
     except Exception as exc:
         return f"Error fetching URL: {exc}"
 
 
-def _fetch_many_pages(urls: list[str], query: str) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    lock = threading.Lock()
-    threads: list[threading.Thread] = []
-
-    def worker(url: str) -> None:
-        try:
-            title, text = _fetch_page_text(url)
-            excerpts = _select_best_chunks(query, title=title, url=url, text=text, max_chunks=3)
-            body_for_score = "\n\n".join(excerpts) if excerpts else text[:2500]
-            score = _score_text(query, title=title, url=url, body=body_for_score)
-            with lock:
-                out.append({
-                    "url": url,
-                    "title": title or url,
-                    "score": score,
-                    "excerpts": excerpts if excerpts else [text[:1200]],
-                })
-        except Exception:
-            pass
-
-    for url in urls:
-        t = threading.Thread(target=worker, args=(url,), daemon=True)
-        threads.append(t)
-        t.start()
-
-    for t in threads:
-        t.join(timeout=20)
-
-    out.sort(key=lambda x: x["score"], reverse=True)
-    return out
-
-
-def tool_web_research(query: str = "", max_sources: int = 4, **kwargs: Any) -> str:
+def tool_web_research(query: str = "", max_sources: int = RESEARCH_TARGET_SOURCES, **kwargs: Any) -> str:
     if not query:
         return "Error: No query provided."
 
     try:
         max_sources = int(max_sources)
     except Exception:
-        max_sources = 4
-    max_sources = max(1, min(max_sources, 6))
+        max_sources = RESEARCH_TARGET_SOURCES
+    max_sources = max(1, min(max_sources, RESEARCH_MAX_SOURCES))
 
-    _PROGRESS.update("Searching query variants…")
-    results = search_web_structured(query, limit=max(10, max_sources * 4))
-    if not results:
-        return f"No results found for: {query}"
-
-    selected: list[dict[str, Any]] = []
-    seen_domains: set[str] = set()
-
-    for r in results:
-        host = (urllib.parse.urlparse(r["url"]).netloc or "").lower()
-        if host in seen_domains:
-            continue
-        seen_domains.add(host)
-        selected.append(r)
-        if len(selected) >= max_sources:
-            break
-
-    if len(selected) < max_sources:
-        seen_urls = {r["url"] for r in selected}
-        for r in results:
-            if r["url"] in seen_urls:
-                continue
-            selected.append(r)
-            seen_urls.add(r["url"])
-            if len(selected) >= max_sources:
-                break
-
-    _PROGRESS.update("Fetching source pages…")
-    fetched = _fetch_many_pages([r["url"] for r in selected], query)
-    if not fetched:
-        return tool_web_search(query=query, num_results=max_sources)
-
-    selected_by_url = {r["url"]: r for r in selected}
+    _PROGRESS.update("Building candidate list…")
+    selected, failures, candidates = _research_sources(query, max_sources=max_sources)
+    if not selected:
+        return f"No research sources could be fetched for: {query}"
 
     lines = [
         f"Research results for: {query}",
-        f"Sources reviewed: {len(fetched)}",
+        f"RESEARCH_SOURCES_REVIEWED: {len(selected)}",
+        f"RESEARCH_TARGET_SOURCES: {max_sources}",
+        f"RESEARCH_FAILED_FETCHES: {len(failures)}",
+        f"Candidate URLs considered: {len(candidates)}",
         "",
     ]
 
-    for i, item in enumerate(fetched, 1):
-        meta = selected_by_url.get(item["url"], {})
+    for i, item in enumerate(selected, 1):
         lines.append(f"[{i}] {item['title']}")
         lines.append(f"URL: {item['url']}")
-        if meta.get("snippet"):
-            lines.append(f"Snippet: {truncate(meta['snippet'], 280)}")
-        if meta.get("query_used") and meta["query_used"] != query:
-            lines.append(f"Matched via query variant: {meta['query_used']}")
+        lines.append(f"Domain: {_domain_of(item['url'])}")
+        if item.get("snippet"):
+            lines.append(f"Search snippet: {truncate(item['snippet'], 280)}")
+        if item.get("query_used") and item["query_used"] != query:
+            lines.append(f"Matched via query variant: {item['query_used']}")
         lines.append("Relevant excerpts:")
-        for ex in item["excerpts"][:2]:
-            lines.append(f"- {truncate(ex, 700)}")
+        for ex in item.get("excerpts", [])[:4]:
+            lines.append(f"- {truncate(ex, 1800)}")
         lines.append("")
 
-    lines.append(
-        "Use the numbered sources above when answering. Prefer claims supported by multiple sources. "
-        "If sources conflict, say so explicitly."
-    )
+    if failures:
+        lines.append("Fetch failures:")
+        for row in failures[:10]:
+            lines.append(f"- {row['url']} :: {truncate(row['error'], 160)}")
+        lines.append("")
+
+    if len(selected) < RESEARCH_MIN_SOURCES:
+        lines.append(
+            f"WARNING: Only {len(selected)} independent sources could be reviewed. "
+            f"If possible, continue researching before finalizing the answer."
+        )
+    else:
+        lines.append(
+            "You have enough sources to answer. Prefer claims supported by multiple numbered sources above."
+        )
 
     return "\n".join(lines).strip()[:FETCH_MAX_CHARS]
 
@@ -1600,65 +1547,25 @@ def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
     if not re.fullmatch(r"[a-z]{2,5}", lang):
         lang = "en"
 
-    _PROGRESS.update(f"Searching Wikipedia: {truncate(query, 30)}")
-    search_url = (
-        f"https://{lang}.wikipedia.org/w/api.php?"
-        f"action=query&list=search"
-        f"&srsearch={urllib.parse.quote(query)}"
-        f"&srlimit=1&format=json"
-    )
     try:
+        _PROGRESS.update(f"Searching Wikipedia: {truncate(query, 30)}")
+        search_url = (
+            f"https://{lang}.wikipedia.org/w/api.php?"
+            f"action=query&list=search"
+            f"&srsearch={urllib.parse.quote(query)}"
+            f"&srlimit=1&format=json"
+        )
         req = urllib.request.Request(search_url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
 
-        results = data.get("query", {}).get("search", [])
-        if not results:
+        rows = data.get("query", {}).get("search", [])
+        if not rows:
             return f"No Wikipedia results for: {query}"
 
-        title = results[0]["title"]
-        _PROGRESS.update(f"Fetching article: {truncate(title, 30)}")
-        extract_url = (
-            f"https://{lang}.wikipedia.org/w/api.php?"
-            f"action=query&prop=extracts&explaintext=1&exlimit=1"
-            f"&titles={urllib.parse.quote(title)}&format=json"
-        )
-        req2 = urllib.request.Request(extract_url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req2, timeout=15) as resp:
-            data2 = json.loads(resp.read().decode("utf-8", errors="replace"))
-        pages = data2.get("query", {}).get("pages", {})
-        extract = ""
-        page_title = title
-        for page_id, page_data in pages.items():
-            if page_id == "-1":
-                continue
-            page_title = page_data.get("title", title)
-            extract = page_data.get("extract", "")
-            break
-
-        if not extract:
-            return f"No Wikipedia extract found for: {query}"
-
-        excerpts = _select_best_chunks(
-            query=query,
-            title=page_title,
-            url=f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(page_title.replace(' ', '_'))}",
-            text=extract,
-            max_chunks=3,
-        )
-        if not excerpts:
-            excerpts = [extract[:2000]]
-
-        lines = [
-            f"Wikipedia — {page_title}",
-            f"URL: https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(page_title.replace(' ', '_'))}",
-            "",
-        ]
-        for i, ex in enumerate(excerpts, 1):
-            lines.append(f"[Excerpt {i}]")
-            lines.append(ex)
-            lines.append("")
-        return "\n".join(lines).strip()[:FETCH_MAX_CHARS]
+        title = rows[0]["title"]
+        page_url = f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+        return tool_fetch_url(url=page_url, focus_query=query)
     except Exception as exc:
         return f"Error: {exc}"
 
@@ -1671,6 +1578,7 @@ TOOLS_REGISTRY: dict[str, Any] = {
     "fetch_url":     tool_fetch_url,
     "wikipedia":     tool_wikipedia,
 }
+
 
 OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
@@ -1685,18 +1593,11 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "calculator",
-            "description": (
-                "Evaluate a mathematical expression. Supports: +, -, *, /, //, %, ** (power), "
-                "and functions: sqrt, sin, cos, tan, asin, acos, atan, log, log2, log10, "
-                "exp, floor, ceil, factorial, gcd, abs. Constants: pi, e, tau."
-            ),
+            "description": "Evaluate a mathematical expression.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "Math expression, e.g. 'sqrt(2) * sin(pi/4)' or '5 * (3 + 2)'",
-                    },
+                    "expression": {"type": "string"},
                 },
                 "required": ["expression"],
             },
@@ -1707,14 +1608,14 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "function": {
             "name": "web_search",
             "description": (
-                "Quick web lookup via Startpage. Returns candidate results with titles, URLs, snippets, "
-                "and query variants used. Prefer web_research for answering factual/current questions."
+                "Quick web lookup via Startpage. Returns candidate results only. "
+                "Do not rely on this alone for final factual/current answers; prefer web_research."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "The search query"},
-                    "num_results": {"type": "integer", "description": "Number of results (1-10, default 6)"},
+                    "query": {"type": "string"},
+                    "num_results": {"type": "integer"},
                 },
                 "required": ["query"],
             },
@@ -1725,15 +1626,14 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "function": {
             "name": "web_research",
             "description": (
-                "Perform deeper web research for a question. Searches multiple query variants, "
-                "fetches several pages, and returns the most relevant excerpts with numbered sources. "
-                "Use this for current events, factual claims, docs, versions, pricing, comparisons, and updates."
+                "Deep web research. Searches multiple query variants, fetches multiple pages from "
+                "different domains, and returns numbered sources with relevant excerpts."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "The research question"},
-                    "max_sources": {"type": "integer", "description": "How many sources to inspect (1-6, default 4)"},
+                    "query": {"type": "string"},
+                    "max_sources": {"type": "integer"},
                 },
                 "required": ["query"],
             },
@@ -1743,15 +1643,12 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "fetch_url",
-            "description": (
-                "Fetch text from a web page. If focus_query is provided, return the most relevant excerpts "
-                "instead of only the start of the page."
-            ),
+            "description": "Fetch a specific page and extract readable text. Use focus_query for focused excerpts.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "The full HTTP/HTTPS URL to fetch"},
-                    "focus_query": {"type": "string", "description": "Optional question used to rank the best excerpts"},
+                    "url": {"type": "string"},
+                    "focus_query": {"type": "string"},
                 },
                 "required": ["url"],
             },
@@ -1761,12 +1658,12 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "wikipedia",
-            "description": "Search Wikipedia by query and return the top article's most relevant plaintext excerpts.",
+            "description": "Search Wikipedia and return the top article's relevant plaintext excerpts.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "The search query"},
-                    "lang": {"type": "string", "description": "Wikipedia language code, default 'en'"},
+                    "query": {"type": "string"},
+                    "lang": {"type": "string"},
                 },
                 "required": ["query"],
             },
@@ -1780,30 +1677,24 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
             {"name": "get_time", "description": "Get the current local time and date."},
             {
                 "name": "calculator",
-                "description": (
-                    "Evaluate a mathematical expression. Supports: +, -, *, /, //, %, ** (power), "
-                    "and functions: sqrt, sin, cos, tan, asin, acos, atan, log, log2, log10, "
-                    "exp, floor, ceil, factorial, gcd, abs. Constants: pi, e, tau."
-                ),
+                "description": "Evaluate a mathematical expression.",
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "expression": {"type": "string", "description": "Math expression"},
-                    },
+                    "properties": {"expression": {"type": "string"}},
                     "required": ["expression"],
                 },
             },
             {
                 "name": "web_search",
                 "description": (
-                    "Quick web lookup via Startpage. Returns candidate results with titles, URLs, snippets, "
-                    "and query variants used. Prefer web_research for answering factual/current questions."
+                    "Quick web lookup via Startpage. Returns candidate results only. "
+                    "Do not rely on this alone for final factual/current answers; prefer web_research."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "The search query"},
-                        "num_results": {"type": "integer", "description": "Number of results (1-10, default 6)"},
+                        "query": {"type": "string"},
+                        "num_results": {"type": "integer"},
                     },
                     "required": ["query"],
                 },
@@ -1811,42 +1702,38 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
             {
                 "name": "web_research",
                 "description": (
-                    "Perform deeper web research for a question. Searches multiple query variants, "
-                    "fetches several pages, and returns the most relevant excerpts with numbered sources. "
-                    "Use this for current events, factual claims, docs, versions, pricing, comparisons, and updates."
+                    "Deep web research. Searches multiple query variants, fetches multiple pages from "
+                    "different domains, and returns numbered sources with relevant excerpts."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "The research question"},
-                        "max_sources": {"type": "integer", "description": "How many sources to inspect (1-6, default 4)"},
+                        "query": {"type": "string"},
+                        "max_sources": {"type": "integer"},
                     },
                     "required": ["query"],
                 },
             },
             {
                 "name": "fetch_url",
-                "description": (
-                    "Fetch text from a web page. If focus_query is provided, return the most relevant excerpts "
-                    "instead of only the start of the page."
-                ),
+                "description": "Fetch a specific page and extract readable text. Use focus_query for focused excerpts.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "url": {"type": "string", "description": "The full HTTP/HTTPS URL to fetch"},
-                        "focus_query": {"type": "string", "description": "Optional question used to rank the best excerpts"},
+                        "url": {"type": "string"},
+                        "focus_query": {"type": "string"},
                     },
                     "required": ["url"],
                 },
             },
             {
                 "name": "wikipedia",
-                "description": "Search Wikipedia by query and return the top article's most relevant plaintext excerpts.",
+                "description": "Search Wikipedia and return the top article's relevant plaintext excerpts.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "The search query"},
-                        "lang": {"type": "string", "description": "Wikipedia language code, default 'en'"},
+                        "query": {"type": "string"},
+                        "lang": {"type": "string"},
                     },
                     "required": ["query"],
                 },
@@ -1860,11 +1747,11 @@ def execute_tool(name: str, arguments_json: str) -> str:
     fn = TOOLS_REGISTRY.get(name)
     if fn is None:
         return f"Error: unknown tool '{name}'"
+
     args = _args_to_obj(arguments_json)
     args = {k: v for k, v in args.items() if k}
 
     _PROGRESS.start(f"{name}…")
-
     result_box: list[Optional[str]] = [None]
     error_box: list[Optional[Exception]] = [None]
 
@@ -1914,16 +1801,7 @@ def _validate_session_data(data: Any) -> str:
             return "element is not an object"
         role = msg.get("role")
         if not role:
-            return "missing 'role' field"
-        if role in ("user", "assistant", "model", "tool", "system"):
-            has_content = isinstance(msg.get("content"), (str, list))
-            has_parts = isinstance(msg.get("parts"), list)
-            if role == "system" and not isinstance(msg.get("content"), str):
-                return "system message missing string content"
-            elif role != "system" and not has_content and not has_parts:
-                return f"message role='{role}' has no content or parts"
-        else:
-            return f"unknown role '{role}'"
+            return "missing role"
     return ""
 
 
@@ -1940,9 +1818,9 @@ def load_session(name: str) -> Optional[History]:
         return None
     err = _validate_session_data(data)
     if err:
-        eprint(f"{C.ERROR}Session is corrupt ({err}). Cannot load.{C.RESET}")
+        eprint(f"{C.ERROR}Session is corrupt ({err}).{C.RESET}")
         return None
-    cprint(f"{C.INFO}Session loaded ← {path}  ({len(data)} messages){C.RESET}")
+    cprint(f"{C.INFO}Session loaded ← {path} ({len(data)} messages){C.RESET}")
     return data
 
 
@@ -1958,11 +1836,11 @@ def clear_sessions() -> None:
     for f in files:
         cprint(f"  {f.stem}")
     try:
-        answer = input(f"{_rl(C.WARN)}Continue? (y/N): {_rl(C.RESET)}").strip().lower()
+        ans = input(f"{_rl(C.WARN)}Continue? (y/N): {_rl(C.RESET)}").strip().lower()
     except (EOFError, KeyboardInterrupt):
         cprint(f"\n{C.INFO}Cancelled.{C.RESET}")
         return
-    if answer == "y":
+    if ans == "y":
         for f in files:
             f.unlink(missing_ok=True)
         cprint(f"{C.INFO}All sessions cleared.{C.RESET}")
@@ -1971,7 +1849,7 @@ def clear_sessions() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HISTORY MANAGEMENT
+# HISTORY
 # ─────────────────────────────────────────────────────────────────────────────
 
 def init_history(is_openai_compat: bool) -> History:
@@ -1981,9 +1859,7 @@ def init_history(is_openai_compat: bool) -> History:
 
 
 def truncate_history(history: History, is_openai_compat: bool) -> History:
-    system_offset = (
-        1 if is_openai_compat and history and history[0].get("role") == "system" else 0
-    )
+    system_offset = 1 if is_openai_compat and history and history[0].get("role") == "system" else 0
     max_total = MAX_HISTORY_MESSAGES + system_offset
     if len(history) <= max_total:
         return history
@@ -1996,12 +1872,10 @@ def truncate_history(history: History, is_openai_compat: bool) -> History:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODEL FETCHING
+# MODELS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_request(
-    url: str, api_key: str, provider: str, data: Optional[bytes] = None,
-) -> urllib.request.Request:
+def _build_request(url: str, api_key: str, provider: str, data: Optional[bytes] = None) -> urllib.request.Request:
     headers: dict[str, str] = {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -2023,6 +1897,7 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
         req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
     else:
         req = _build_request(ep["models"], api_key, provider)
+
     try:
         with _request_with_retry(req, timeout=MODEL_FETCH_TIMEOUT) as resp:
             body = resp.read().decode("utf-8", errors="replace")
@@ -2033,16 +1908,13 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
     except OSError as exc:
         eprint(f"{C.ERROR}Network error fetching models: {exc}{C.RESET}")
         return None
+
     try:
         data = json.loads(body)
     except json.JSONDecodeError:
         eprint(f"{C.ERROR}Invalid JSON from model endpoint.{C.RESET}")
         return None
-    api_err = data.get("error") if isinstance(data, dict) else None
-    if api_err:
-        msg = api_err.get("message", str(api_err)) if isinstance(api_err, dict) else str(api_err)
-        eprint(f"{C.ERROR}API error: {msg}{C.RESET}")
-        return None
+
     try:
         if provider == "gemini":
             models = [
@@ -2060,15 +1932,14 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
             models = sorted(m["id"] for m in arr)
         else:
             models = sorted(m["id"] for m in data.get("data", []))
-    except (KeyError, TypeError) as exc:
+    except Exception as exc:
         eprint(f"{C.ERROR}Could not parse model list: {exc}{C.RESET}")
         return None
+
     return [m for m in models if m]
 
 
-def select_model_interactive(
-    provider: str, api_key: str, filters: list[str], current_model: str = "",
-) -> Optional[str]:
+def select_model_interactive(provider: str, api_key: str, filters: list[str], current_model: str = "") -> Optional[str]:
     cprint(f"{C.INFO}Fetching models for {provider.upper()}…{C.RESET}")
     models = fetch_models(provider, api_key)
     if not models:
@@ -2092,46 +1963,41 @@ def select_model_interactive(
         except (EOFError, KeyboardInterrupt):
             cprint(f"\n{C.INFO}Cancelled.{C.RESET}")
             return None
-        if choice.lower() in ("c", "cancel", "q"):
+        if choice.lower() in {"c", "cancel", "q"}:
             cprint(f"{C.INFO}Cancelled.{C.RESET}")
             return None
         if choice.isdigit() and 1 <= int(choice) <= len(models):
             return models[int(choice) - 1]
-        eprint(f"{C.WARN}Enter a number between 1 and {len(models)}, or 'c' to cancel.{C.RESET}")
+        eprint(f"{C.WARN}Enter a number between 1 and {len(models)}.{C.RESET}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PAYLOAD BUILDING
+# PAYLOADS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_user_message(
-    text: str, image: ImageAttachment, provider: str, is_openai_compat: bool,
-) -> Message:
-    prompt = text
+def build_user_message(text: str, image: ImageAttachment, provider: str, is_openai_compat: bool) -> Message:
     if image.attached:
         if not is_openai_compat:
             return {
                 "role": "user",
                 "parts": [
-                    {"text": prompt},
+                    {"text": text},
                     {"inlineData": {"mimeType": image.mime, "data": image.base64}},
                 ],
             }
-        elif provider == "ollama":
-            return {"role": "user", "content": prompt, "images": [image.base64]}
-        else:
-            return {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": text},
-                    {"type": "image_url", "image_url": {
-                        "url": f"data:{image.mime};base64,{image.base64}",
-                    }},
-                ],
-            }
+        if provider == "ollama":
+            return {"role": "user", "content": text, "images": [image.base64]}
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": f"data:{image.mime};base64,{image.base64}"}},
+            ],
+        }
+
     if not is_openai_compat:
-        return {"role": "user", "parts": [{"text": prompt}]}
-    return {"role": "user", "content": prompt}
+        return {"role": "user", "parts": [{"text": text}]}
+    return {"role": "user", "content": text}
 
 
 def build_payload(
@@ -2158,34 +2024,33 @@ def build_payload(
             payload["tools"] = GEMINI_TOOLS_SCHEMA
         return payload
 
-    oai_payload: dict[str, Any] = {
+    out: dict[str, Any] = {
         "model": model_id,
         "messages": history,
         "temperature": DEFAULT_TEMPERATURE,
         "stream": True,
     }
-
     if enable_tools:
-        oai_payload["tools"] = OPENAI_TOOLS_SCHEMA
+        out["tools"] = OPENAI_TOOLS_SCHEMA
 
     if provider == "ollama":
-        oai_payload["think"] = enable_thinking
-        oai_payload["options"] = {
+        out["think"] = enable_thinking
+        out["options"] = {
             "num_predict": DEFAULT_MAX_TOKENS,
             "top_p": DEFAULT_TOP_P,
         }
     elif provider == "cerebras":
-        oai_payload["max_completion_tokens"] = DEFAULT_MAX_TOKENS
-        oai_payload["top_p"] = DEFAULT_TOP_P
+        out["max_completion_tokens"] = DEFAULT_MAX_TOKENS
+        out["top_p"] = DEFAULT_TOP_P
     elif provider != "together":
-        oai_payload["max_tokens"] = DEFAULT_MAX_TOKENS
-        oai_payload["top_p"] = DEFAULT_TOP_P
+        out["max_tokens"] = DEFAULT_MAX_TOKENS
+        out["top_p"] = DEFAULT_TOP_P
 
-    return oai_payload
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SSE PARSERS
+# STREAM PARSING
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _ChunkResult:
@@ -2254,15 +2119,9 @@ def _parse_gemini_chunk(obj: dict[str, Any]) -> _ChunkResult:
             r.text += part["text"]
         if "functionCall" in part:
             fc = part["functionCall"]
-            r.tool_chunks.append({
-                "name": fc.get("name", ""),
-                "args": fc.get("args", {}),
-            })
+            r.tool_chunks.append({"name": fc.get("name", ""), "args": fc.get("args", {})})
 
     r.finish = candidate.get("finishReason", "")
-    if not r.finish or r.finish == "null":
-        if any(rating.get("blocked") for rating in candidate.get("safetyRatings", [])):
-            r.finish = "SAFETY"
     return r
 
 
@@ -2285,16 +2144,13 @@ class StreamRenderer:
     def _clear_current_block(self) -> None:
         if self._current_rows <= 0:
             return
-
         _stdout_write("\r")
         for _ in range(self._current_rows - 1):
             _stdout_write("\x1b[1A")
-
         for i in range(self._current_rows):
             _stdout_write("\033[2K")
             if i < self._current_rows - 1:
                 _stdout_write("\n")
-
         for _ in range(self._current_rows - 1):
             _stdout_write("\x1b[1A")
         _stdout_write("\r")
@@ -2303,14 +2159,8 @@ class StreamRenderer:
         if not self._used_ai_prefix:
             self._line_prefix = f"{C.AI}AI:{C.RESET}  "
             self._used_ai_prefix = True
-
-        rendered = (
-            MD_RENDERER.render_line(self._line_buffer)
-            if final else
-            MD_RENDERER.preview_line(self._line_buffer)
-        )
+        rendered = MD_RENDERER.render_line(self._line_buffer) if final else MD_RENDERER.preview_line(self._line_buffer)
         display = f"{self._line_prefix}{C.AI}{rendered}{C.RESET}"
-
         self._clear_current_block()
         _stdout_write(display)
         self._current_rows = _wrapped_rows(display)
@@ -2323,42 +2173,36 @@ class StreamRenderer:
         self._current_rows = 0
 
     def _flush_text(self, text: str) -> None:
-        to_process = text
-        while to_process:
-            nl_idx = to_process.find("\n")
-            if nl_idx != -1:
-                self._line_buffer += to_process[:nl_idx]
+        while text:
+            idx = text.find("\n")
+            if idx != -1:
+                self._line_buffer += text[:idx]
                 self._commit_current_line()
-                to_process = to_process[nl_idx + 1:]
+                text = text[idx + 1:]
             else:
-                self._line_buffer += to_process
+                self._line_buffer += text
                 self._draw_current_line(final=False)
-                to_process = ""
+                text = ""
 
     def feed_thinking(self, think_tok: str) -> None:
         if not think_tok or not self.enable_thinking:
             return
-
         if self.first_chunk:
             _stdout_write(C.CLR)
             _stdout_write(f"{C.AI}AI:{C.RESET}  ")
             self._used_ai_prefix = True
             self.first_chunk = False
-
         if not self._in_think_display:
             _stdout_write(f"{C.THINK}[Thinking] ")
             self._in_think_display = True
-
         _stdout_write(f"{C.THINK}{think_tok}{C.RESET}")
 
     def feed_text(self, text_tok: str) -> None:
         if not text_tok:
             return
-
         if self.first_chunk:
             _stdout_write(C.CLR)
             self.first_chunk = False
-
         if self._in_think_display:
             _stdout_write(f"{C.RESET}\n\n")
             self._in_think_display = False
@@ -2408,32 +2252,27 @@ class StreamRenderer:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STREAMING RESPONSE
+# STREAM RESPONSE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def stream_response(
-    provider: str, model_id: str, history: History,
-    is_openai_compat: bool, api_key: str,
-    enable_tools: bool, enable_thinking: bool,
+    provider: str,
+    model_id: str,
+    history: History,
+    is_openai_compat: bool,
+    api_key: str,
+    enable_tools: bool,
+    enable_thinking: bool,
 ) -> tuple[Optional[str], list[dict[str, Any]]]:
-    payload = build_payload(
-        provider,
-        model_id,
-        history,
-        is_openai_compat,
-        enable_tools,
-        enable_thinking,
-    )
+    payload = build_payload(provider, model_id, history, is_openai_compat, enable_tools, enable_thinking)
     payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ep = ENDPOINTS[provider]
 
     if not is_openai_compat:
-        url = (
-            f"{ep['chat_base']}{model_id}:streamGenerateContent"
-            f"?key={api_key}&alt=sse"
-        )
+        url = f"{ep['chat_base']}{model_id}:streamGenerateContent?key={api_key}&alt=sse"
         req = urllib.request.Request(
-            url, data=payload_bytes,
+            url,
+            data=payload_bytes,
             headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
             method="POST",
         )
@@ -2542,12 +2381,6 @@ def stream_response(
                     renderer.feed_thinking(cr.think)
                     renderer.feed_text(cr.text)
 
-                    if not is_openai_compat and finish_reason in ("SAFETY", "RECITATION", "OTHER"):
-                        if not renderer.full_text:
-                            error_msg = f"Stream ended (reason: {finish_reason})"
-                        done_received = True
-                        break
-
                     if provider == "ollama" and finish_reason:
                         done_received = True
                         break
@@ -2558,10 +2391,10 @@ def stream_response(
             _stdout_write(C.CLR)
         cprint(f"\n{C.WARN}(Request interrupted){C.RESET}")
     except urllib.error.HTTPError as exc:
-        err_body = exc.read().decode("utf-8", errors="replace")
+        body = exc.read().decode("utf-8", errors="replace")
         if renderer.first_chunk:
             _stdout_write(C.CLR)
-        error_msg = f"HTTP {exc.code}: {truncate(err_body, 200)}"
+        error_msg = f"HTTP {exc.code}: {truncate(body, 200)}"
     except urllib.error.URLError as exc:
         if renderer.first_chunk:
             _stdout_write(C.CLR)
@@ -2598,30 +2431,18 @@ def stream_response(
         _stdout_write(f"{C.RESET}\n")
 
     if _is_length_finish(finish_reason):
-        eprint(
-            f"{C.WARN}(Response truncated: provider hit output limit: {finish_reason}){C.RESET}"
-        )
+        eprint(f"{C.WARN}(Response truncated: output limit reached: {finish_reason}){C.RESET}")
 
     if error_msg:
         if renderer.full_text or tool_calls_out:
-            eprint(
-                f"{C.WARN}(Stream ended after partial output: {error_msg}){C.RESET}"
-            )
-            full_text = renderer.full_text
-            if len(full_text) > MAX_MESSAGE_LENGTH:
-                full_text = full_text[:MAX_MESSAGE_LENGTH]
+            eprint(f"{C.WARN}(Stream ended after partial output: {error_msg}){C.RESET}")
+            full_text = renderer.full_text[:MAX_MESSAGE_LENGTH]
             clean = strip_think_tags(full_text)
             return (clean if clean else ""), tool_calls_out
-
         cprint(f"{C.ERROR}{error_msg}{C.RESET}")
         return None, []
 
-    if interrupted and renderer.full_text:
-        eprint(f"{C.INFO}(Partial response saved){C.RESET}")
-
-    full_text = renderer.full_text
-    if len(full_text) > MAX_MESSAGE_LENGTH:
-        full_text = full_text[:MAX_MESSAGE_LENGTH]
+    full_text = renderer.full_text[:MAX_MESSAGE_LENGTH]
     clean = strip_think_tags(full_text)
     if not clean and not tool_calls_out and not interrupted:
         return None, []
@@ -2633,8 +2454,11 @@ def stream_response(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _append_assistant_turn(
-    history: History, ai_text: Optional[str],
-    tool_calls: list[dict[str, Any]], provider: str, is_openai_compat: bool,
+    history: History,
+    ai_text: Optional[str],
+    tool_calls: list[dict[str, Any]],
+    provider: str,
+    is_openai_compat: bool,
 ) -> None:
     if not is_openai_compat:
         parts: list[dict[str, Any]] = []
@@ -2673,11 +2497,14 @@ def _append_assistant_turn(
 
 
 def _append_tool_results(
-    history: History, tool_calls: list[dict[str, Any]],
-    results: list[str], provider: str, is_openai_compat: bool,
+    history: History,
+    tool_calls: list[dict[str, Any]],
+    results: list[str],
+    provider: str,
+    is_openai_compat: bool,
 ) -> None:
     if not is_openai_compat:
-        response_parts = [
+        parts = [
             {
                 "functionResponse": {
                     "name": tc["function"]["name"],
@@ -2686,7 +2513,7 @@ def _append_tool_results(
             }
             for tc, result in zip(tool_calls, results)
         ]
-        history.append({"role": "user", "parts": response_parts})
+        history.append({"role": "user", "parts": parts})
         return
 
     if provider == "ollama":
@@ -2706,12 +2533,10 @@ def _append_tool_results(
 def _extract_display_text(msg: Message) -> str:
     role = msg.get("role", "")
     if role == "tool":
-        name = msg.get("name", "tool")
-        return f"[🛠️ {name}] {truncate(msg.get('content', ''), 120)}"
+        return f"[🛠️ {msg.get('name', 'tool')}] {truncate(msg.get('content', ''), 120)}"
     if "tool_calls" in msg:
         names = [tc.get("function", tc).get("name", "?") for tc in msg["tool_calls"]]
-        base = msg.get("content") or ""
-        return (base + f" [🛠️ → {', '.join(names)}]").strip()
+        return ((msg.get("content") or "") + f" [🛠️ → {', '.join(names)}]").strip()
 
     raw = msg.get("content") or msg.get("parts", [{}])
     if isinstance(raw, str):
@@ -2723,21 +2548,53 @@ def _extract_display_text(msg: Message) -> str:
             if "functionCall" in raw[0]:
                 return f"[🛠️ → {', '.join(p['functionCall'].get('name', '?') for p in raw if 'functionCall' in p)}]"
             if "functionResponse" in raw[0]:
-                return f"[🛠️ results for {', '.join(p['functionResponse'].get('name', '?') for p in raw if 'functionResponse' in p)}]"
-            for part in raw:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    return part.get("text", "")
-            has_image = any(
-                isinstance(p, dict) and (p.get("type") == "image_url" or "inlineData" in p)
-                for p in raw
-            )
+                return f"[🛠️ results]"
+            for p in raw:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    return p.get("text", "")
+            has_image = any(isinstance(p, dict) and (p.get("type") == "image_url" or "inlineData" in p) for p in raw)
             return "[📎 image]" if has_image else "[content]"
-        return str(raw)
-    return str(raw) if raw else "[empty]"
+    return "[empty]"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MULTI-LINE INPUT
+# ENFORCEMENT HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_urls_from_tool_output(text: str) -> list[str]:
+    return re.findall(r"^URL:\s*(https?://\S+)", text or "", flags=re.M)
+
+
+def _extract_domains_from_tool_output(text: str) -> set[str]:
+    out: set[str] = set()
+    for url in _extract_urls_from_tool_output(text):
+        dom = _domain_of(url)
+        if dom:
+            out.add(dom)
+    return out
+
+
+def _question_needs_web_research(text: str) -> bool:
+    q = (text or "").strip().lower()
+    if not q:
+        return False
+    triggers = (
+        "latest", "current", "today", "recent", "now",
+        "version", "release", "pricing", "price", "cost",
+        "compare", "comparison", "vs ", "versus",
+        "benchmark", "docs", "documentation", "api",
+        "install", "error", "traceback", "issue",
+        "news", "announced", "official",
+    )
+    if any(t in q for t in triggers):
+        return True
+    if q.endswith("?") and len(q.split()) >= 6:
+        return True
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INPUT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def read_multiline_input(initial_prompt: str, cont_prompt: str = "") -> Optional[str]:
@@ -2747,6 +2604,7 @@ def read_multiline_input(initial_prompt: str, cont_prompt: str = "") -> Optional
         line = input(initial_prompt)
     except (EOFError, KeyboardInterrupt):
         return None
+
     lines: list[str] = []
     while line.endswith("\\"):
         lines.append(line[:-1])
@@ -2762,10 +2620,10 @@ def read_multiline_input(initial_prompt: str, cont_prompt: str = "") -> Optional
 def read_paste_input(prefix: str = "") -> Optional[str]:
     cprint(f"{C.INFO}Paste mode — end with {C.BOLD}---{C.RESET}{C.INFO} on its own line to send:{C.RESET}")
     lines: list[str] = []
-    paste_prompt = f"  {_rl(C.DIM)}│{_rl(C.RESET)} "
+    prompt = f"  {_rl(C.DIM)}│{_rl(C.RESET)} "
     while True:
         try:
-            line = input(paste_prompt)
+            line = input(prompt)
         except (EOFError, KeyboardInterrupt):
             cprint(f"\n{C.INFO}(Paste cancelled){C.RESET}")
             return "\n".join(lines).strip() if lines else None
@@ -2775,12 +2633,11 @@ def read_paste_input(prefix: str = "") -> Optional[str]:
     body = "\n".join(lines).strip()
     if not body:
         return None
-    cprint(f"{C.INFO}({len(lines)} lines captured){C.RESET}")
     return f"{prefix}\n\n{body}" if prefix else body
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# USAGE / HELP
+# HELP
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_usage() -> None:
@@ -2792,54 +2649,55 @@ def print_usage() -> None:
 {C.INFO}Providers:{C.RESET}
   gemini  openrouter  groq  together  cerebras  novita  ollama
 
-{C.INFO}Setup:{C.RESET}
-  Edit the {C.BOLD}API_KEYS{C.RESET} dict at the top of this script with your keys.
-  Edit the Ollama endpoints if you want localhost instead of ollama.com.
-
-{C.INFO}Chat commands:{C.RESET}
-  {C.BOLD}/history{C.RESET}            Show conversation history
-  {C.BOLD}/model{C.RESET}              Switch model
-  {C.BOLD}/save <name>{C.RESET}        Save session
-  {C.BOLD}/load <name>{C.RESET}        Load a saved session
-  {C.BOLD}/clear{C.RESET}              Delete all saved sessions
-  {C.BOLD}/upload <path>{C.RESET}      Attach an image
-  {C.BOLD}/image{C.RESET}              Show attached image info
-  {C.BOLD}/clearimage{C.RESET}         Remove attached image
-  {C.BOLD}/paste [text]{C.RESET}       Multi-line paste mode
-  {C.BOLD}/togglethinking{C.RESET}     Toggle reasoning display
-  {C.BOLD}/toggletools{C.RESET}        Toggle tool calling on/off
-  {C.BOLD}/help{C.RESET}               Show this help
-  {C.BOLD}quit{C.RESET} / {C.BOLD}exit{C.RESET}          End session
+{C.INFO}Commands:{C.RESET}
+  /history
+  /model [filter]
+  /save <name>
+  /load <name>
+  /clear
+  /upload <path>
+  /image
+  /clearimage
+  /paste [text]
+  /togglethinking
+  /toggletools
+  /help
+  quit / exit
 """)
 
 
 def print_chat_help() -> None:
     cprint(f"""{C.INFO}Commands:{C.RESET}
-  {C.BOLD}/history{C.RESET}            Show conversation
-  {C.BOLD}/model [filter]{C.RESET}     Switch model (keeps history)
-  {C.BOLD}/save <name>{C.RESET}        Save session
-  {C.BOLD}/load <name>{C.RESET}        Load session
-  {C.BOLD}/clear{C.RESET}              Delete all sessions
-  {C.BOLD}/upload <path>{C.RESET}      Attach image
-  {C.BOLD}/image{C.RESET}              Show attached image
-  {C.BOLD}/clearimage{C.RESET}         Remove image
-  {C.BOLD}/paste [text]{C.RESET}       Multi-line paste mode
-  {C.BOLD}/togglethinking{C.RESET}     Toggle reasoning display
-  {C.BOLD}/toggletools{C.RESET}        Toggle tool calling on/off
-  {C.BOLD}/help{C.RESET}               Show this help
-  {C.BOLD}quit{C.RESET} / {C.BOLD}exit{C.RESET}          End session
-{C.TOOL}Available tools:{C.RESET}
+  {C.BOLD}/history{C.RESET}
+  {C.BOLD}/model [filter]{C.RESET}
+  {C.BOLD}/save <name>{C.RESET}
+  {C.BOLD}/load <name>{C.RESET}
+  {C.BOLD}/clear{C.RESET}
+  {C.BOLD}/upload <path>{C.RESET}
+  {C.BOLD}/image{C.RESET}
+  {C.BOLD}/clearimage{C.RESET}
+  {C.BOLD}/paste [text]{C.RESET}
+  {C.BOLD}/togglethinking{C.RESET}
+  {C.BOLD}/toggletools{C.RESET}
+  {C.BOLD}/help{C.RESET}
+  {C.BOLD}quit{C.RESET} / {C.BOLD}exit{C.RESET}
+
+{C.TOOL}Tools:{C.RESET}
   get_time · calculator · web_search · web_research · fetch_url · wikipedia
 """)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN CHAT LOOP
+# CHAT LOOP
 # ─────────────────────────────────────────────────────────────────────────────
 
 def chat_loop(
-    provider: str, model_id: str, is_openai_compat: bool,
-    api_key: str, enable_tools: bool, enable_thinking: bool,
+    provider: str,
+    model_id: str,
+    is_openai_compat: bool,
+    api_key: str,
+    enable_tools: bool,
+    enable_thinking: bool,
     filters: list[str],
 ) -> None:
     if _READLINE_AVAILABLE:
@@ -2856,59 +2714,28 @@ def chat_loop(
     thinking_on = enable_thinking
     tools_on = enable_tools
 
-    def _print_banner() -> None:
+    def _banner() -> None:
         sep = "─" * 85
         cprint(f"\n{sep}")
-        cprint(f"  {C.INFO}Provider:{C.RESET}  {provider.upper()}   {C.INFO}Model:{C.RESET}  {model_id}")
-        cprint(
-            f"  {C.INFO}History:{C.RESET}   last {MAX_HISTORY_MESSAGES} turns  │  "
-            f"{C.INFO}Temp:{C.RESET} {DEFAULT_TEMPERATURE}  │  "
-            f"{C.INFO}Tokens:{C.RESET} {DEFAULT_MAX_TOKENS}  │  "
-            f"{C.INFO}TopP:{C.RESET} {DEFAULT_TOP_P}"
-        )
-        cprint(f"  {C.INFO}Max message:{C.RESET}  {MAX_MESSAGE_LENGTH:,} characters")
-        status = "active" if SYSTEM_PROMPT else "inactive (empty)"
-        cprint(f"  {C.INFO}System prompt:{C.RESET}  {status}")
-        if provider == "ollama":
-            ollama_url = ENDPOINTS["ollama"]["chat"].rsplit("/api/", 1)[0]
-            cprint(f"  {C.INFO}Ollama URL:{C.RESET}  {ollama_url}")
-        cprint(f"  {C.INFO}Rendering:{C.RESET}   Markdown + LaTeX → Unicode")
-        think_st = f"{C.BOLD}{C.THINK}enabled{C.RESET}" if thinking_on else "disabled"
-        cprint(f"  {C.INFO}Thinking output:{C.RESET}  {think_st}  (toggle: /togglethinking)")
-        tool_st = f"{C.BOLD}{C.TOOL}enabled{C.RESET}" if tools_on else "disabled"
-        cprint(f"  {C.INFO}Tool calling:{C.RESET}     {tool_st}  (toggle: /toggletools)")
-        if tools_on:
-            cprint(f"  {C.INFO}Tools:{C.RESET}           {', '.join(TOOLS_REGISTRY)}")
-            cprint(f"  {C.INFO}Search backend:{C.RESET}  Startpage HTML scrape + multi-query reranking")
-            cprint(f"  {C.INFO}Tool timeout:{C.RESET}    {TOOL_EXEC_TIMEOUT}s per call")
-            cprint(f"  {C.INFO}History mode:{C.RESET}    auto-compact (tool msgs collapsed)")
-        cprint(f"  {C.INFO}SSRF protection:{C.RESET} on")
-        cprint(f"  {C.INFO}Retry:{C.RESET}           {MAX_RETRIES}x on 429/5xx")
-        cprint(
-            f"  {C.INFO}Input:{C.RESET}   end line with {C.BOLD}\\{C.RESET} "
-            f"to continue  │  {C.BOLD}/paste{C.RESET} for multi-line"
-        )
-        cprint(
-            f"  Type {C.BOLD}quit{C.RESET} or {C.BOLD}exit{C.RESET} to end  │  "
-            f"{C.BOLD}/model{C.RESET} to switch  │  "
-            f"{C.BOLD}/help{C.RESET} for all commands"
-        )
+        cprint(f"  {C.INFO}Provider:{C.RESET} {provider.upper()}   {C.INFO}Model:{C.RESET} {model_id}")
+        cprint(f"  {C.INFO}History:{C.RESET} last {MAX_HISTORY_MESSAGES} turns  │  {C.INFO}Temp:{C.RESET} {DEFAULT_TEMPERATURE}  │  {C.INFO}Tokens:{C.RESET} {DEFAULT_MAX_TOKENS}")
+        cprint(f"  {C.INFO}Thinking:{C.RESET} {'enabled' if thinking_on else 'disabled'}  │  {C.INFO}Tools:{C.RESET} {'enabled' if tools_on else 'disabled'}")
+        cprint(f"  {C.INFO}Research:{C.RESET} target {RESEARCH_TARGET_SOURCES} sources, minimum {RESEARCH_MIN_SOURCES} when possible")
+        cprint(f"  {C.INFO}SSRF:{C.RESET} protected  │  {C.INFO}Retry:{C.RESET} {MAX_RETRIES}x on 429/5xx")
+        cprint(f"  {C.INFO}Input:{C.RESET} use trailing \\ for multi-line, or /paste")
         cprint(sep + "\n")
 
-    _print_banner()
+    _banner()
 
     while True:
-        img_tag = (
-            f"[{_rl(C.IMAGE)}📎 {Path(image.path).name}{_rl(C.RESET)}] "
-            if image.attached else ""
-        )
+        img_tag = f"[{_rl(C.IMAGE)}📎 {Path(image.path).name}{_rl(C.RESET)}] " if image.attached else ""
         prompt = f"{img_tag}{_rl(C.BOLD)}{_rl(C.USER)}You:{_rl(C.RESET)} "
         raw = read_multiline_input(prompt)
         if raw is None:
             cprint(f"\n{C.INFO}Ending session.{C.RESET}")
             break
-        user_input = raw
 
+        user_input = raw
         if user_input.lower() in ("quit", "exit"):
             break
 
@@ -2925,62 +2752,64 @@ def chat_loop(
                     handled = False
                 else:
                     cprint(f"{C.INFO}Nothing to send.{C.RESET}")
+
             elif cmd == "/help":
                 print_chat_help()
+
             elif cmd == "/model":
                 inline_filters = args.split() if args else filters
-                new_model = select_model_interactive(
-                    provider, api_key, inline_filters, current_model=model_id,
-                )
+                new_model = select_model_interactive(provider, api_key, inline_filters, current_model=model_id)
                 if new_model is not None:
-                    old_model = model_id
+                    old = model_id
                     model_id = new_model
-                    if old_model == model_id:
+                    if old == model_id:
                         cprint(f"{C.INFO}Already using {model_id}.{C.RESET}")
                     else:
-                        cprint(f"{C.INFO}Switched model: {C.DIM}{old_model}{C.RESET}{C.INFO} → {C.BOLD}{model_id}{C.RESET}")
-                        cprint(f"{C.INFO}  Conversation history ({len(history)} messages) preserved.{C.RESET}")
+                        cprint(f"{C.INFO}Switched model: {old} → {C.BOLD}{model_id}{C.RESET}")
+
             elif cmd == "/upload":
                 if not args:
                     eprint(f"{C.IMAGE}Usage: /upload <image_path>{C.RESET}")
                 else:
                     image.load(args)
+
             elif cmd == "/image":
                 if image.attached:
-                    cprint(f"{C.IMAGE}Attached: {image.path}  ({image.mime}){C.RESET}")
+                    cprint(f"{C.IMAGE}Attached: {image.path} ({image.mime}){C.RESET}")
                 else:
                     cprint(f"{C.IMAGE}No image attached.{C.RESET}")
+
             elif cmd == "/clearimage":
                 image.clear()
                 cprint(f"{C.IMAGE}Image cleared.{C.RESET}")
+
             elif cmd == "/togglethinking":
                 thinking_on = not thinking_on
-                st = f"{C.BOLD}{C.THINK}enabled{C.RESET}" if thinking_on else f"{C.BOLD}disabled{C.RESET}"
-                cprint(f"{C.INFO}Thinking output {st}.{C.RESET}")
+                cprint(f"{C.INFO}Thinking output {'enabled' if thinking_on else 'disabled'}.{C.RESET}")
+
             elif cmd == "/toggletools":
                 tools_on = not tools_on
-                st = f"{C.BOLD}{C.TOOL}enabled{C.RESET}" if tools_on else f"{C.BOLD}disabled{C.RESET}"
-                cprint(f"{C.INFO}Tool calling {st}.{C.RESET}")
-                if tools_on:
-                    cprint(f"{C.INFO}  Tools: {', '.join(TOOLS_REGISTRY)}{C.RESET}")
+                cprint(f"{C.INFO}Tool calling {'enabled' if tools_on else 'disabled'}.{C.RESET}")
+
             elif cmd == "/history":
                 cprint(f"{C.INFO}── History ({len(history)} messages) ─────────────────────{C.RESET}")
                 if not history:
                     cprint("  (empty)")
                 for msg in history:
                     role = msg.get("role", "?")
-                    text = _extract_display_text(msg)
                     colour = {
                         "user": C.USER, "assistant": C.AI, "model": C.AI,
                         "system": C.WARN, "tool": C.TOOL,
                     }.get(role, C.DIM)
-                    cprint(f"  {colour}[{role}]{C.RESET}  {truncate(text, 500)}")
+                    cprint(f"  {colour}[{role}]{C.RESET} {truncate(_extract_display_text(msg), 500)}")
                 cprint(f"{C.INFO}────────────────────────────────────────────────────{C.RESET}")
+
             elif cmd == "/save":
                 if not args:
                     eprint(f"{C.WARN}Usage: /save <name>{C.RESET}")
                 elif validate_session_name(args):
                     save_session(args, history)
+
             elif cmd == "/load":
                 if not args:
                     eprint(f"{C.WARN}Usage: /load <name>{C.RESET}")
@@ -2988,8 +2817,10 @@ def chat_loop(
                     loaded = load_session(args)
                     if loaded is not None:
                         history = loaded
+
             elif cmd == "/clear":
                 clear_sessions()
+
             else:
                 eprint(f"{C.WARN}Unknown command '{cmd}'. Type /help for a list.{C.RESET}")
 
@@ -3001,7 +2832,7 @@ def chat_loop(
         if not user_input and image.attached:
             user_input = "Describe this image in detail."
         if len(user_input) > MAX_MESSAGE_LENGTH:
-            eprint(f"{C.ERROR}Message too long ({len(user_input):,} chars, max {MAX_MESSAGE_LENGTH:,}).{C.RESET}")
+            eprint(f"{C.ERROR}Message too long ({len(user_input):,} chars).{C.RESET}")
             continue
 
         eprint(f"{C.INFO}[Sending…]{C.RESET}")
@@ -3017,43 +2848,83 @@ def chat_loop(
         tool_iter = 0
         tool_loop_ok = True
 
+        reviewed_domains: set[str] = set()
+        original_user_input = user_input
+        research_enforcements = 0
+
         try:
             while True:
                 tool_iter += 1
                 if tool_iter > MAX_TOOL_ITERATIONS:
-                    eprint(f"{C.ERROR}Tool-call loop limit ({MAX_TOOL_ITERATIONS}) reached.{C.RESET}")
+                    eprint(f"{C.ERROR}Tool loop limit reached.{C.RESET}")
                     break
+
                 history = truncate_history(history, is_openai_compat)
+
                 ai_text, tool_calls = stream_response(
                     provider, model_id, history, is_openai_compat,
                     api_key, tools_on, thinking_on,
                 )
+
                 if ai_text is None and not tool_calls:
                     if history and history[-1].get("role") == "user":
                         history.pop()
-                        eprint(f"{C.WARN}(User message rolled back due to error){C.RESET}")
                     tool_loop_ok = False
                     break
+
                 _append_assistant_turn(history, ai_text, tool_calls, provider, is_openai_compat)
+
                 if tool_calls and tools_on:
                     had_tool_calls = True
                     results: list[str] = []
+
                     for tc in tool_calls:
                         fn_name = tc["function"]["name"]
                         fn_args = tc["function"]["arguments"]
                         display = _args_display(fn_args)
+
                         cprint(f"\n{C.TOOL}⚡ Tool: {fn_name}({display}){C.RESET}")
                         result = execute_tool(fn_name, fn_args)
                         cprint(f"{C.DIM}   → {truncate(result, 300)}{C.RESET}")
+
+                        if fn_name in {"web_research", "fetch_url", "wikipedia"}:
+                            reviewed_domains.update(_extract_domains_from_tool_output(result))
+
                         results.append(result)
+
                     _append_tool_results(history, tool_calls, results, provider, is_openai_compat)
                     continue
+
                 final_ai_text = ai_text
+
+                if (
+                    tools_on
+                    and _question_needs_web_research(original_user_input)
+                    and len(reviewed_domains) < RESEARCH_MIN_SOURCES
+                    and research_enforcements < 2
+                    and tool_iter < MAX_TOOL_ITERATIONS
+                ):
+                    research_enforcements += 1
+                    reminder = (
+                        f"Do not answer yet. Continue researching until you have reviewed at least "
+                        f"{RESEARCH_MIN_SOURCES} independent web sources if possible. "
+                        f"You have reviewed {len(reviewed_domains)} so far. "
+                        f"Prefer web_research(query={json.dumps(original_user_input)}, max_sources={RESEARCH_TARGET_SOURCES}). "
+                        f"If fewer than {RESEARCH_MIN_SOURCES} sources are actually reachable, say that explicitly."
+                    )
+                    eprint(f"{C.INFO}(Research enforcement: {len(reviewed_domains)}/{RESEARCH_MIN_SOURCES} sources reviewed; asking model to continue){C.RESET}")
+                    if not is_openai_compat:
+                        history.append({"role": "user", "parts": [{"text": reminder}]})
+                    else:
+                        history.append({"role": "user", "content": reminder})
+                    final_ai_text = None
+                    continue
+
                 break
+
         except Exception as exc:
             eprint(f"{C.ERROR}Unexpected error during tool loop: {exc}{C.RESET}")
             history[:] = history_snapshot
-            eprint(f"{C.WARN}(History rolled back to pre-message state){C.RESET}")
             tool_loop_ok = False
 
         if tool_loop_ok and had_tool_calls and final_ai_text is not None:
@@ -3061,16 +2932,13 @@ def chat_loop(
                 clean_final: Message = {"role": "model", "parts": [{"text": final_ai_text}]}
             else:
                 clean_final = {"role": "assistant", "content": final_ai_text}
-            n_intermediate = len(history) - compact_from
             history[compact_from:] = [clean_final]
-            if n_intermediate > 1:
-                eprint(f"{C.DIM}(History compacted: {n_intermediate} tool messages → 1 answer){C.RESET}")
 
         cprint("")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
+# MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -3098,51 +2966,43 @@ def main() -> None:
     if not check_placeholder_key(api_key, provider):
         sys.exit(1)
 
-    is_openai_compat = (provider != "gemini")
+    is_openai_compat = provider != "gemini"
 
     enable_thinking = True
     while True:
         try:
-            ans = input(
-                f"{_rl(C.THINK)}Enable thinking/reasoning ? (Y/n): {_rl(C.RESET)}"
-            ).strip().lower()
+            ans = input(f"{_rl(C.THINK)}Enable thinking/reasoning? (Y/n): {_rl(C.RESET)}").strip().lower()
         except (EOFError, KeyboardInterrupt):
             sys.exit(0)
         if ans in ("", "y", "yes"):
             enable_thinking = True
             cprint(f"{C.THINK}Thinking enabled.{C.RESET}")
             break
-        elif ans in ("n", "no"):
+        if ans in ("n", "no"):
             enable_thinking = False
             cprint(f"{C.THINK}Thinking disabled.{C.RESET}")
             break
-        else:
-            eprint(f"{C.WARN}Please enter y or n.{C.RESET}")
+        eprint(f"{C.WARN}Please enter y or n.{C.RESET}")
 
     enable_tools = False
-    tool_names = ", ".join(TOOLS_REGISTRY)
     while True:
         try:
-            ans = input(
-                f"{_rl(C.TOOL)}Enable tool calling ({tool_names})? (y/N): {_rl(C.RESET)}"
-            ).strip().lower()
+            ans = input(f"{_rl(C.TOOL)}Enable tool calling? (y/N): {_rl(C.RESET)}").strip().lower()
         except (EOFError, KeyboardInterrupt):
             sys.exit(0)
         if ans in ("y", "yes"):
             enable_tools = True
-            cprint(f"{C.TOOL}Tool calling enabled. Search: Startpage + multi-source research │ SSRF: protected{C.RESET}")
+            cprint(f"{C.TOOL}Tool calling enabled. Deep research will try for {RESEARCH_TARGET_SOURCES} sources.{C.RESET}")
             break
-        elif ans in ("n", "no", ""):
+        if ans in ("", "n", "no"):
             break
-        else:
-            eprint(f"{C.WARN}Please enter y or n.{C.RESET}")
+        eprint(f"{C.WARN}Please enter y or n.{C.RESET}")
 
     model_id = select_model_interactive(provider, api_key, filters)
     if model_id is None:
         sys.exit(1)
 
     cprint(f"{C.INFO}Using model:{C.RESET} {model_id}\n")
-
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
     try:
