@@ -4,25 +4,37 @@ Universal Chat CLI
 Pure stdlib, Python 3.9+. Zero pip installs required.
 
 Features:
-  - Markdown rendering (bold, italic, inline code, fenced code blocks)
-  - Simple LaTeX rendering to Unicode
-  - Image attachment support
-  - Multi-line input and paste mode
-  - Multi-provider support
-  - Tool/function calling
+  - Markdown rendering (Bold, Italic, Code, Fenced code blocks)
+  - LaTeX rendering (Greek letters, superscripts, fractions → Unicode)
+  - Image attachment support (Vision models)
+  - Multi-line input (backslash continuation + /paste mode)
+  - Multi-provider support (Gemini, OpenRouter, Groq, Together, etc.)
+  - Tool/Function calling (Web search, fetch, Calculator, Time, Wikipedia)
   - Deep web research via Startpage HTML scraping
-  - Source reranking + excerpt extraction
-  - SSRF protection
   - Live tool progress spinner
-  - Live model switching
-  - Session save/load
-  - History compaction after tool use
+  - Live model switching (/model command)
+  - History compaction (tool messages auto-collapsed after each exchange)
+  - SSRF protection with DNS-pinning
 
 Usage:
-  python ai.py <provider> [filter]...
+    python ai.py <provider> [filter]...
 
-Providers:
-  gemini, openrouter, groq, together, cerebras, novita, ollama
+Providers: gemini, openrouter, groq, together, cerebras, novita, ollama
+
+Chat commands:
+    /history            Show conversation history
+    /model              Switch to a different model mid-chat
+    /save <name>        Save session to ~/.chat_sessions/<name>.json
+    /load <name>        Load a saved session
+    /clear              Delete all saved sessions
+    /upload <path>      Attach an image to your next message
+    /image              Show currently attached image
+    /clearimage         Remove the attached image
+    /paste [text]       Multi-line paste mode (end with ---)
+    /togglethinking     Toggle reasoning/thinking output display
+    /toggletools        Toggle tool calling on/off
+    /help               Show available commands
+    quit / exit         End the session
 """
 
 import sys
@@ -70,6 +82,9 @@ except ImportError:
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
+##############################################################################
+#                   !!! EDIT YOUR API KEYS HERE !!!                          #
+##############################################################################
 API_KEYS: dict[str, str] = {
     "gemini":     "",
     "openrouter": "",
@@ -816,16 +831,15 @@ _STOPWORDS = {
     "many", "much", "very",
 }
 
+
 def _tokenize(text: str) -> list[str]:
     raw = (text or "").strip()
     tokens = re.findall(r"[a-z0-9]{2,}", raw.lower())
-
-    # Keep all tokens for short or quoted queries
     if len(tokens) <= 3 or '"' in raw:
         return tokens
-
     filtered = [t for t in tokens if t not in _STOPWORDS]
     return filtered or tokens
+
 
 def _domain_of(url: str) -> str:
     try:
@@ -2548,7 +2562,7 @@ def _extract_display_text(msg: Message) -> str:
             if "functionCall" in raw[0]:
                 return f"[🛠️ → {', '.join(p['functionCall'].get('name', '?') for p in raw if 'functionCall' in p)}]"
             if "functionResponse" in raw[0]:
-                return f"[🛠️ results]"
+                return "[🛠️ results]"
             for p in raw:
                 if isinstance(p, dict) and p.get("type") == "text":
                     return p.get("text", "")
@@ -2717,12 +2731,51 @@ def chat_loop(
     def _banner() -> None:
         sep = "─" * 85
         cprint(f"\n{sep}")
-        cprint(f"  {C.INFO}Provider:{C.RESET} {provider.upper()}   {C.INFO}Model:{C.RESET} {model_id}")
-        cprint(f"  {C.INFO}History:{C.RESET} last {MAX_HISTORY_MESSAGES} turns  │  {C.INFO}Temp:{C.RESET} {DEFAULT_TEMPERATURE}  │  {C.INFO}Tokens:{C.RESET} {DEFAULT_MAX_TOKENS}")
-        cprint(f"  {C.INFO}Thinking:{C.RESET} {'enabled' if thinking_on else 'disabled'}  │  {C.INFO}Tools:{C.RESET} {'enabled' if tools_on else 'disabled'}")
-        cprint(f"  {C.INFO}Research:{C.RESET} target {RESEARCH_TARGET_SOURCES} sources, minimum {RESEARCH_MIN_SOURCES} when possible")
-        cprint(f"  {C.INFO}SSRF:{C.RESET} protected  │  {C.INFO}Retry:{C.RESET} {MAX_RETRIES}x on 429/5xx")
-        cprint(f"  {C.INFO}Input:{C.RESET} use trailing \\ for multi-line, or /paste")
+        cprint(f"  {C.INFO}Provider:{C.RESET}  {provider.upper()}   {C.INFO}Model:{C.RESET}  {model_id}")
+        cprint(
+            f"  {C.INFO}History:{C.RESET}   last {MAX_HISTORY_MESSAGES} turns  │  "
+            f"{C.INFO}Temp:{C.RESET} {DEFAULT_TEMPERATURE}  │  "
+            f"{C.INFO}Tokens:{C.RESET} {DEFAULT_MAX_TOKENS}  │  "
+            f"{C.INFO}TopP:{C.RESET} {DEFAULT_TOP_P}"
+        )
+        cprint(f"  {C.INFO}Max message:{C.RESET}  {MAX_MESSAGE_LENGTH:,} characters")
+
+        status = "active" if SYSTEM_PROMPT else "inactive (empty)"
+        cprint(f"  {C.INFO}System prompt:{C.RESET}  {status}")
+
+        if provider == "ollama":
+            ollama_url = ENDPOINTS["ollama"]["chat"].rsplit("/api/", 1)[0]
+            cprint(f"  {C.INFO}Ollama URL:{C.RESET}  {ollama_url}")
+
+        cprint(f"  {C.INFO}Rendering:{C.RESET}   Markdown + LaTeX → Unicode")
+
+        think_st = f"{C.BOLD}{C.THINK}enabled{C.RESET}" if thinking_on else "disabled"
+        cprint(f"  {C.INFO}Thinking output:{C.RESET}  {think_st}  (toggle: /togglethinking)")
+
+        tool_st = f"{C.BOLD}{C.TOOL}enabled{C.RESET}" if tools_on else "disabled"
+        cprint(f"  {C.INFO}Tool calling:{C.RESET}     {tool_st}  (toggle: /toggletools)")
+
+        if tools_on:
+            cprint(f"  {C.INFO}Tools:{C.RESET}           {', '.join(TOOLS_REGISTRY)}")
+            cprint(f"  {C.INFO}Search backend:{C.RESET}  Startpage + multi-query reranking + deep fetch")
+            cprint(
+                f"  {C.INFO}Research mode:{C.RESET}   target {RESEARCH_TARGET_SOURCES} sources, "
+                f"minimum {RESEARCH_MIN_SOURCES} when possible"
+            )
+            cprint(f"  {C.INFO}Tool timeout:{C.RESET}    {TOOL_EXEC_TIMEOUT}s per call")
+            cprint(f"  {C.INFO}History mode:{C.RESET}    auto-compact (tool msgs collapsed)")
+
+        cprint(f"  {C.INFO}SSRF protection:{C.RESET} on (DNS-pinned)")
+        cprint(f"  {C.INFO}Retry:{C.RESET}           {MAX_RETRIES}x on 429/5xx")
+        cprint(
+            f"  {C.INFO}Input:{C.RESET}   end line with {C.BOLD}\\{C.RESET} "
+            f"to continue  │  {C.BOLD}/paste{C.RESET} for multi-line"
+        )
+        cprint(
+            f"  Type {C.BOLD}quit{C.RESET} or {C.BOLD}exit{C.RESET} to end  │  "
+            f"{C.BOLD}/model{C.RESET} to switch  │  "
+            f"{C.BOLD}/help{C.RESET} for all commands"
+        )
         cprint(sep + "\n")
 
     _banner()
