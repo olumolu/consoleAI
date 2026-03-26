@@ -284,6 +284,26 @@ _URL_OPENER = urllib.request.build_opener(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TERMINAL MATH (CACHED FOR PERFORMANCE)
+# ─────────────────────────────────────────────────────────────────────────────
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+def _visible_len(text: str) -> int:
+    return len(_ANSI_RE.sub("", text))
+
+# Cache the width to prevent ioctl OS spam during high-speed token streaming
+_TERM_COLS = max(shutil.get_terminal_size((80, 24)).columns, 20)
+
+def _wrapped_rows(text: str) -> int:
+    rows = 0
+    # Safely account for any \n characters that sneak into the renderer
+    for line in text.split("\n"):
+        vis = max(_visible_len(line), 1)
+        rows += (vis - 1) // _TERM_COLS + 1
+    return rows
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # RENDERERS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -359,15 +379,17 @@ class MarkdownRenderer:
             new_state = not in_code_block
             lang = stripped[3:].strip()
             
-            term_cols = shutil.get_terminal_size((80, 24)).columns
-            bar_len = min(term_cols - 4, 60)
+            # Using cached _TERM_COLS instead of an OS call on every token
+            bar_len = min(_TERM_COLS - 4, 60)
             
             if new_state: # Opening a code block
                 lbl = lang.upper() or 'CODE'
                 dashes = max(1, bar_len - 17 - len(lbl))
-                return f"\n{C.DIM}╭{'─' * 15} {lbl} {'─' * dashes}{C.RESET}", new_state
+                # Removed \n to prevent layout stutter
+                return f"{C.DIM}╭{'─' * 15} {lbl} {'─' * dashes}{C.RESET}", new_state
             else:         # Closing a code block
-                return f"{C.DIM}╰{'─' * bar_len}{C.RESET}\n", new_state
+                # Removed \n to prevent layout stutter
+                return f"{C.DIM}╰{'─' * bar_len}{C.RESET}", new_state
 
         if in_code_block:
             return f"{C.CODE}{line}{C.RESET}", in_code_block
@@ -540,19 +562,6 @@ def _args_display(arguments: str) -> str:
     if not obj:
         return ""
     return json.dumps(obj, ensure_ascii=False, separators=(", ", ": "))
-
-
-_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-
-
-def _visible_len(text: str) -> int:
-    return len(_ANSI_RE.sub("", text))
-
-
-def _wrapped_rows(text: str) -> int:
-    cols = max(shutil.get_terminal_size((80, 24)).columns, 20)
-    vis = max(_visible_len(text), 1)
-    return (vis - 1) // cols + 1
 
 
 def _decompress(data: bytes, encoding: str) -> bytes:
