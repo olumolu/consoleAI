@@ -148,7 +148,6 @@ RESEARCH_MAX_CANDIDATES = 30
 SYSTEM_PROMPT = """You are a highly helpful assistant running in a command-line interface.
 
 For factual, current, version, release, pricing, documentation, troubleshooting, benchmark, or comparison questions:
-- Prefer web_research(query, max_sources=5) over plain web_search.
 - Do not give a final answer until you have reviewed at least 4 independent sources when possible.
 - If fewer than 4 sources are reachable, say so explicitly.
 - Use fetch_url for specific pages when needed.
@@ -1906,7 +1905,7 @@ def truncate_history(history: History, is_openai_compat: bool) -> History:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODELS
+# MODELS INTERACTIVE MODEL PICKER
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_request(url: str, api_key: str, provider: str, data: Optional[bytes] = None) -> urllib.request.Request:
@@ -3202,7 +3201,7 @@ def chat_loop(
             return f"│ {left}{' ' * pad}{right} │"
 
         cprint(f"\n╭{'─' * (width - 2)}╮")
-        cprint(_line(f"{C.BOLD}Universal Chat CLI{C.RESET}"))
+        cprint(_line(f"{C.BOLD}AI Chat CLI{C.RESET}"))
         cprint(f"├{'─' * (width - 2)}┤")
 
         cprint(_line(f"{C.INFO}Provider:{C.RESET} {provider.upper()}", f"{C.INFO}Model:{C.RESET} {model_id}"))
