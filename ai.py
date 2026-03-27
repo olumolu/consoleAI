@@ -15,6 +15,7 @@ Features:
   - Live model switching (/model command)
   - History compaction (tool messages auto-collapsed after each exchange)
   - SSRF protection with DNS-pinning
+  - Interactive UI for settings and model selection
 
 Usage:
     python ai.py <provider> [filter]...
@@ -30,7 +31,7 @@ Chat commands:
     /upload <path>      Attach an image to your next message
     /image              Show currently attached image
     /clearimage         Remove the attached image
-    /paste [text]       Multi-line paste mode (end with ---)
+    /paste[text]       Multi-line paste mode (end with ---)
     /togglethinking     Toggle reasoning/thinking output display
     /toggletools        Toggle tool calling on/off
     /help               Show available commands
@@ -385,10 +386,8 @@ class MarkdownRenderer:
             if new_state: # Opening a code block
                 lbl = lang.upper() or 'CODE'
                 dashes = max(1, bar_len - 17 - len(lbl))
-                # Removed \n to prevent layout stutter
                 return f"{C.DIM}╭{'─' * 15} {lbl} {'─' * dashes}{C.RESET}", new_state
             else:         # Closing a code block
-                # Removed \n to prevent layout stutter
                 return f"{C.DIM}╰{'─' * bar_len}{C.RESET}", new_state
 
         if in_code_block:
@@ -623,7 +622,7 @@ class TextExtractor(HTMLParser):
     def get_text(self) -> str:
         raw = "".join(self.parts)
         lines =[re.sub(r"[ \t]+", " ", line.strip()) for line in raw.split("\n")]
-        lines = [line for line in lines if line]
+        lines =[line for line in lines if line]
         return "\n\n".join(lines)
 
 
@@ -1251,7 +1250,7 @@ def _search_candidates(query: str, max_sources: int) -> list[dict[str, Any]]:
 
     all_rows.sort(key=lambda x: x["score"], reverse=True)
 
-    primary: list[dict[str, Any]] = []
+    primary: list[dict[str, Any]] =[]
     fallback: list[dict[str, Any]] =[]
     seen_domains: set[str] = set()
 
@@ -1267,7 +1266,7 @@ def _search_candidates(query: str, max_sources: int) -> list[dict[str, Any]]:
 
 
 def _fetch_source_batch(batch: list[dict[str, Any]], query: str) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    ok_rows: list[dict[str, Any]] = []
+    ok_rows: list[dict[str, Any]] =[]
     bad_rows: list[dict[str, str]] =[]
     lock = threading.Lock()
     threads: list[threading.Thread] =[]
@@ -1319,7 +1318,7 @@ def _research_sources(query: str, max_sources: int) -> tuple[list[dict[str, Any]
     max_sources = max(1, min(max_sources, RESEARCH_MAX_SOURCES))
     candidates = _search_candidates(query, max_sources=max_sources)
     if not candidates:
-        return [], [], []
+        return [], [],[]
 
     fetched_raw: list[dict[str, Any]] =[]
     failures: list[dict[str, str]] =[]
@@ -1340,7 +1339,7 @@ def _research_sources(query: str, max_sources: int) -> tuple[list[dict[str, Any]
     fetched_raw.sort(key=lambda x: x["score"], reverse=True)
 
     selected: list[dict[str, Any]] =[]
-    leftovers: list[dict[str, Any]] = []
+    leftovers: list[dict[str, Any]] =[]
     seen_domains: set[str] = set()
 
     for item in fetched_raw:
@@ -1795,7 +1794,7 @@ def execute_tool(name: str, arguments_json: str) -> str:
 
     _PROGRESS.start(f"{name}…")
     result_box: list[Optional[str]] = [None]
-    error_box: list[Optional[Exception]] = [None]
+    error_box: list[Optional[Exception]] =[None]
 
     def _run() -> None:
         try:
@@ -1909,12 +1908,12 @@ def truncate_history(history: History, is_openai_compat: bool) -> History:
     if not is_openai_compat and to_remove % 2 == 1:
         to_remove += 1
     if system_offset:
-        return [history[0]] + history[1 + to_remove:]
+        return[history[0]] + history[1 + to_remove:]
     return history[to_remove:]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODELS INTERACTIVE MODEL PICKER
+# MODELS INTERACTIVE UI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_request(url: str, api_key: str, provider: str, data: Optional[bytes] = None) -> urllib.request.Request:
@@ -2140,6 +2139,62 @@ def _read_picker_key() -> str:
                 return ""
 
 
+def _interactive_confirm(prompt: str, default: bool = True, color: str = C.INFO) -> bool:
+    """Inline interactive Yes/No selector."""
+    use_picker = (
+        sys.stdin.isatty()
+        and sys.stdout.isatty()
+        and (
+            (os.name == "nt" and msvcrt is not None)
+            or (os.name != "nt" and termios is not None and tty is not None)
+        )
+    )
+    if not use_picker:
+        while True:
+            try:
+                ans = input(f"{_rl(color)}{prompt} (Y/n): {_rl(C.RESET)}").strip().lower()
+                if ans in ("", "y", "yes"): return True
+                if ans in ("n", "no"): return False
+            except (EOFError, KeyboardInterrupt):
+                sys.exit(0)
+
+    selected = default
+    _stdout_write("\033[?25l")  # Hide cursor safely
+    
+    try:
+        with _RawTerminal():
+            while True:
+                yes_str = f"{_PICK_SEL_BG}{_PICK_SEL_FG} Yes {C.RESET}" if selected else " Yes "
+                no_str  = f"{_PICK_SEL_BG}{_PICK_SEL_FG} No {C.RESET}" if not selected else " No "
+                
+                # Write inline prompt
+                _stdout_write(f"\r{C.CLR}{color}✦ {prompt}{C.RESET}  {yes_str} {no_str}")
+                
+                key = _read_picker_key()
+                if key in ("LEFT", "UP", "RIGHT", "DOWN", "h", "l", "j", "k"):
+                    selected = not selected
+                elif key in ("y", "Y"):
+                    selected = True
+                    break
+                elif key in ("n", "N"):
+                    selected = False
+                    break
+                elif key == "ENTER":
+                    break
+                elif key == "ESC":
+                    sys.exit(0)
+            
+            ans_str = "Yes" if selected else "No"
+            _stdout_write(f"\r{C.CLR}{color}✓ {prompt}{C.RESET} {C.BOLD}{ans_str}{C.RESET}\n")
+            return selected
+            
+    except KeyboardInterrupt:
+        _stdout_write("\r")
+        sys.exit(0)
+    finally:
+        _stdout_write("\033[?25h")  # ALWAYS restore cursor
+
+
 def _render_model_picker(
     provider: str,
     all_models: list[str],
@@ -2156,8 +2211,6 @@ def _render_model_picker(
     panel_width = min(100, max(60, int(term_cols * 0.72)))
     inner_width = panel_width - 2
 
-    # Dynamically size height based on visible models to remove wasted space
-    # 9 rows are needed for header + search + hints + footer
     max_needed_height = 9 + len(visible)
     panel_height = min(term_rows - 4, max_needed_height)
     panel_height = max(panel_height, 12)
@@ -2221,7 +2274,6 @@ def _render_model_picker(
             model_name = _truncate_plain(visible[idx], name_space)
             row = f"{num:>3}. {model_name}{current_suffix_col}"
 
-            # Visual Scrollbar calculation
             scroll_char = "│"
             if len(visible) > list_rows:
                 thumb_pos = int((start / max(1, len(visible) - list_rows)) * (list_rows - 1))
@@ -2260,7 +2312,7 @@ def _select_model_numeric_fallback(
 
     cprint(f"{C.INFO}Available models for {provider.upper()}:{C.RESET}")
     for i, m in enumerate(models, 1):
-        marker = " [current]" if m == current_model else ""
+        marker = "[current]" if m == current_model else ""
         cprint(f"  {i:3}. {m}{marker}")
 
     while True:
@@ -2476,7 +2528,7 @@ def build_user_message(text: str, image: ImageAttachment, provider: str, is_open
         }
 
     if not is_openai_compat:
-        return {"role": "user", "parts": [{"text": text}]}
+        return {"role": "user", "parts":[{"text": text}]}
     return {"role": "user", "content": text}
 
 
@@ -3436,7 +3488,7 @@ def chat_loop(
                 clean_final: Message = {"role": "model", "parts":[{"text": final_ai_text}]}
             else:
                 clean_final = {"role": "assistant", "content": final_ai_text}
-            history[compact_from:] = [clean_final]
+            history[compact_from:] =[clean_final]
 
         cprint("")
 
@@ -3472,35 +3524,9 @@ def main() -> None:
 
     is_openai_compat = provider != "gemini"
 
-    enable_thinking = True
-    while True:
-        try:
-            ans = input(f"{_rl(C.THINK)}Enable thinking/reasoning? (Y/n): {_rl(C.RESET)}").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            sys.exit(0)
-        if ans in ("", "y", "yes"):
-            enable_thinking = True
-            cprint(f"{C.THINK}Thinking enabled.{C.RESET}")
-            break
-        if ans in ("n", "no"):
-            enable_thinking = False
-            cprint(f"{C.THINK}Thinking disabled.{C.RESET}")
-            break
-        eprint(f"{C.WARN}Please enter y or n.{C.RESET}")
-
-    enable_tools = False
-    while True:
-        try:
-            ans = input(f"{_rl(C.TOOL)}Enable tool calling? (y/N): {_rl(C.RESET)}").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            sys.exit(0)
-        if ans in ("y", "yes"):
-            enable_tools = True
-            cprint(f"{C.TOOL}Tool calling enabled. Deep research will try for {RESEARCH_TARGET_SOURCES} sources.{C.RESET}")
-            break
-        if ans in ("", "n", "no"):
-            break
-        eprint(f"{C.WARN}Please enter y or n.{C.RESET}")
+    # Interactive Selectors
+    enable_thinking = _interactive_confirm("Enable thinking/reasoning?", default=True, color=C.THINK)
+    enable_tools = _interactive_confirm("Enable tool calling?", default=False, color=C.TOOL)
 
     model_id = select_model_interactive(provider, api_key, filters)
     if model_id is None:
