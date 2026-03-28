@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI Chat CLI
+Universal Chat CLI
 Pure stdlib, Python 3.9+. Zero pip installs required.
 
 Features:
