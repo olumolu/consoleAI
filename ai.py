@@ -292,15 +292,25 @@ _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 def _visible_len(text: str) -> int:
     return len(_ANSI_RE.sub("", text))
 
-# Cache the width to prevent ioctl OS spam during high-speed token streaming
-_TERM_COLS = max(shutil.get_terminal_size((80, 24)).columns, 20)
+_LAST_TERM_COLS = 80
+_LAST_COLS_CHECK = 0.0
+
+def _get_term_cols() -> int:
+    global _LAST_TERM_COLS, _LAST_COLS_CHECK
+    now = time.monotonic()
+    # Update terminal size at most every 0.2 seconds to prevent OS spam
+    if now - _LAST_COLS_CHECK > 0.2:
+        _LAST_TERM_COLS = max(shutil.get_terminal_size((80, 24)).columns, 20)
+        _LAST_COLS_CHECK = now
+    return _LAST_TERM_COLS
 
 def _wrapped_rows(text: str) -> int:
     rows = 0
+    term_cols = _get_term_cols()
     # Safely account for any \n characters that sneak into the renderer
     for line in text.split("\n"):
         vis = max(_visible_len(line), 1)
-        rows += (vis - 1) // _TERM_COLS + 1
+        rows += (vis - 1) // term_cols + 1
     return rows
 
 
@@ -380,8 +390,9 @@ class MarkdownRenderer:
             new_state = not in_code_block
             lang = stripped[3:].strip()
             
-            # Using cached _TERM_COLS instead of an OS call on every token
-            bar_len = min(_TERM_COLS - 4, 60)
+            # Use dynamic cached width to respect terminal resizes
+            term_cols = _get_term_cols()
+            bar_len = min(term_cols - 4, 60)
             
             if new_state: # Opening a code block
                 lbl = lang.upper() or 'CODE'
