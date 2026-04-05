@@ -18,9 +18,9 @@ Features:
   - Interactive UI for settings and model selection
 
 Usage:
-    python ai.py <provider> [filter]...
+    python ai.py <provider> [filter]... or ./ai.py <provider> [filter] make ai.py executable 
 
-Providers: gemini, openrouter, groq, together, cerebras, novita, ollama
+Providers: gemini, openrouter, groq, together, cerebras, novita, cloudflare, ollama
 
 Chat commands:
     /history            Show conversation history
@@ -107,6 +107,7 @@ API_KEYS: dict[str, str] = {
     "cerebras":   "",   # https://cloud.cerebras.ai/
     "novita":     "",   # https://novita.ai/
     "ollama":     "",   # https://ollama.com/ (leave blank for local)
+    "cloudflare": ":",   # https://dash.cloudflare.com Format: YOUR_ACCOUNT_ID:YOUR_API_TOKEN
 }
 
 MAX_HISTORY_MESSAGES = 20
@@ -369,8 +370,8 @@ class LatexRenderer:
         for cmd, sym in {
             "\\cdot": "·", "\\times": "×", "\\div": "÷", "\\sqrt": "√",
             "\\infty": "∞", "\\pm": "±", "\\neq": "≠", "\\leq": "≤",
-            "\\geq": "≥", "\\approx": "≈", "\\sum": "Σ", "\\prod": "Π",
-            "\\int": "∫",
+            "\\approx": "≈", "\\sum": "Σ", "\\prod": "Π",
+            "\\int": "∫", "\\geq": "≥",
         }.items():
             tex = tex.replace(cmd, sym)
         return tex
@@ -457,6 +458,10 @@ ENDPOINTS: dict[str, dict[str, str]] = {
         "chat":   "https://api.novita.ai/v3/openai/chat/completions",
         "models": "https://api.novita.ai/v3/openai/models",
     },
+    "cloudflare": {
+        "chat":   "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions",
+        "models": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search",
+    },
     "ollama": {
         "chat":   "https://ollama.com/api/chat",
         "models": "https://ollama.com/api/tags",
@@ -500,6 +505,9 @@ def check_placeholder_key(key: str, provider: str) -> bool:
         bad = "is an incomplete OpenRouter key"
     elif provider == "groq" and key.startswith("gsk_") and len(key) < 10:
         bad = "looks incomplete"
+    elif provider == "cloudflare" and ":" not in key:
+        bad = "is missing the Account ID (Format must be ACCOUNT_ID:API_TOKEN)"
+    
     if bad:
         eprint(f"{C.WARN}WARNING: API key for {provider.upper()} {bad}.{C.RESET}")
         return False
@@ -1570,7 +1578,7 @@ def tool_web_research(query: str = "", max_sources: int = RESEARCH_TARGET_SOURCE
         if item.get("query_used") and item["query_used"] != query:
             lines.append(f"Matched via query variant: {item['query_used']}")
         lines.append("Relevant excerpts:")
-        for ex in item.get("excerpts", [])[:4]:
+        for ex in item.get("excerpts",[])[:4]:
             lines.append(f"- {truncate(ex, 1800)}")
         lines.append("")
 
@@ -1804,7 +1812,7 @@ def execute_tool(name: str, arguments_json: str) -> str:
     args = {k: v for k, v in args.items() if k}
 
     _PROGRESS.start(f"{name}…")
-    result_box: list[Optional[str]] = [None]
+    result_box: list[Optional[str]] =[None]
     error_box: list[Optional[Exception]] =[None]
 
     def _run() -> None:
@@ -1944,11 +1952,21 @@ def _build_request(url: str, api_key: str, provider: str, data: Optional[bytes] 
 
 def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
     ep = ENDPOINTS[provider]
+    models_url = ep["models"]
+
+    if provider == "cloudflare":
+        if ":" not in api_key:
+            eprint(f"{C.ERROR}Cloudflare API key must be in format ACCOUNT_ID:API_TOKEN{C.RESET}")
+            return None
+        acc_id, token = api_key.split(":", 1)
+        models_url = models_url.replace("{account_id}", acc_id)
+        api_key = token
+
     if provider == "gemini":
-        url = f"{ep['models']}?key={api_key}"
+        url = f"{models_url}?key={api_key}"
         req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
     else:
-        req = _build_request(ep["models"], api_key, provider)
+        req = _build_request(models_url, api_key, provider)
 
     try:
         with _request_with_retry(req, timeout=MODEL_FETCH_TIMEOUT) as resp:
@@ -1982,6 +2000,11 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
         elif provider == "together":
             arr = data if isinstance(data, list) else data.get("data", [])
             models = sorted(m["id"] for m in arr)
+        elif provider == "cloudflare":
+            models = sorted(
+                m["name"] for m in data.get("result",[])
+                if m.get("task", {}).get("name") == "Text Generation" or "task" not in m
+            )
         else:
             models = sorted(m["id"] for m in data.get("data",[]))
     except Exception as exc:
@@ -2059,7 +2082,7 @@ def _center_block(lines: list[str], term_cols: int, term_rows: int) -> str:
     top = max(0, (term_rows - block_h) // 2)
     left = max(0, (term_cols - block_w) // 2)
 
-    out: list[str] = []
+    out: list[str] =[]
     out.extend([""] * top)
 
     prefix = " " * left
@@ -2113,13 +2136,13 @@ def _read_picker_key() -> str:
         return "BACKSPACE"
 
     if b == b"\x1b":
-        if _select.select([fd], [], [], 0.05)[0]:
+        if _select.select([fd], [],[], 0.05)[0]:
             nxt = os.read(fd, 1)
             if nxt in (b"[", b"O"):
-                if _select.select([fd], [], [], 0.05)[0]:
+                if _select.select([fd], [],[], 0.05)[0]:
                     nxt2 = os.read(fd, 1)
                     if nxt == b"[" and nxt2.isdigit():
-                        if _select.select([fd], [], [], 0.05)[0]:
+                        if _select.select([fd],[], [], 0.05)[0]:
                             nxt3 = os.read(fd, 1)
                             seq = nxt2 + nxt3
                             return {
@@ -2817,8 +2840,18 @@ def stream_response(
     payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ep = ENDPOINTS[provider]
 
+    chat_url = ep.get("chat_base", "") if not is_openai_compat else ep["chat"]
+
+    if provider == "cloudflare":
+        if ":" not in api_key:
+            cprint(f"{C.ERROR}Cloudflare API key must be in format ACCOUNT_ID:API_TOKEN{C.RESET}")
+            return None,[]
+        acc_id, token = api_key.split(":", 1)
+        chat_url = chat_url.replace("{account_id}", acc_id)
+        api_key = token
+
     if not is_openai_compat:
-        url = f"{ep['chat_base']}{model_id}:streamGenerateContent?key={api_key}&alt=sse"
+        url = f"{chat_url}{model_id}:streamGenerateContent?key={api_key}&alt=sse"
         req = urllib.request.Request(
             url,
             data=payload_bytes,
@@ -2826,7 +2859,7 @@ def stream_response(
             method="POST",
         )
     else:
-        req = _build_request(ep["chat"], api_key, provider, data=payload_bytes)
+        req = _build_request(chat_url, api_key, provider, data=payload_bytes)
 
     _stdout_write(f"{C.AI}AI:{C.RESET} {C.INFO}(💬 Waiting…){C.RESET}")
 
@@ -3087,7 +3120,7 @@ def _extract_display_text(msg: Message) -> str:
         names =[tc.get("function", tc).get("name", "?") for tc in msg["tool_calls"]]
         return ((msg.get("content") or "") + f"[🛠️ → {', '.join(names)}]").strip()
 
-    raw = msg.get("content") or msg.get("parts", [{}])
+    raw = msg.get("content") or msg.get("parts",[{}])
     if isinstance(raw, str):
         return raw
     if isinstance(raw, list) and raw:
@@ -3196,7 +3229,7 @@ def print_usage() -> None:
   python {me} <provider>[filter]...
 
 {C.INFO}Providers:{C.RESET}
-  gemini  openrouter  groq  together  cerebras  novita  ollama
+  gemini  openrouter  groq  together  cerebras  novita  cloudflare  ollama
 
 {C.INFO}Commands:{C.RESET}
   /history
