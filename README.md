@@ -92,6 +92,7 @@ A versatile **Python CLI** for interacting with various Large Language Models (L
        "cerebras":   "",   # https://cloud.cerebras.ai/
        "novita":     "",   # https://novita.ai/
        "ollama":     "",   # Leave blank for local Ollama
+       "cloudflare": "",   # https://dash.cloudflare.com Format: ACCOUNT_ID:API_TOKEN
    }
    ```
 
