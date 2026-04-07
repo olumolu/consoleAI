@@ -107,7 +107,7 @@ API_KEYS: dict[str, str] = {
     "cerebras":   "",   # https://cloud.cerebras.ai/
     "novita":     "",   # https://novita.ai/
     "ollama":     "",   # https://ollama.com/ (leave blank for local)
-    "cloudflare": ":",   # https://dash.cloudflare.com Format: YOUR_ACCOUNT_ID:YOUR_API_TOKEN
+    "cloudflare": "",   # https://dash.cloudflare.com Format: YOUR_ACCOUNT_ID:YOUR_API_TOKEN
 }
 
 MAX_HISTORY_MESSAGES = 20
