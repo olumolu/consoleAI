@@ -86,18 +86,18 @@ except ImportError:
 #                   !!! EDIT YOUR API KEYS HERE !!!                          #
 ##############################################################################
 API_KEYS: dict[str, str] = {
-    "gemini":     "",
-    "openrouter": "",
-    "groq":       "",
-    "together":   "",
-    "cerebras":   "",
-    "novita":     "",
-    "ollama":     "",
+    "gemini":     "",   # https://aistudio.google.com/app/apikey
+    "openrouter": "",   # https://openrouter.ai/keys
+    "groq":       "",   # https://console.groq.com/keys
+    "together":   "",   # https://api.together.ai/settings/api-keys
+    "cerebras":   "",   # https://cloud.cerebras.ai/
+    "novita":     "",   # https://novita.ai/
+    "ollama":     "",   # https://ollama.com/ (leave blank for local)
 }
 
 MAX_HISTORY_MESSAGES = 20
 MAX_MESSAGE_LENGTH = 50_000
-DEFAULT_TEMPERATURE = 0.7
+DEFAULT_TEMPERATURE = 0.9
 DEFAULT_MAX_TOKENS = 3000
 DEFAULT_TOP_P = 1.0
 
@@ -105,7 +105,7 @@ SESSION_DIR = Path.home() / ".chat_sessions"
 HISTORY_FILE = Path.home() / ".ai_cli_history"
 
 MAX_IMAGE_SIZE_MB = 20
-SUPPORTED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+SUPPORTED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/jxl", "image/avif", "image/heic", "image/heif", "image/tiff"}
 
 FETCH_MAX_CHARS = 30_000
 FETCH_MAX_BYTES = 5 * 1024 * 1024
@@ -135,7 +135,6 @@ RESEARCH_MAX_CANDIDATES = 30
 SYSTEM_PROMPT = """You are a highly helpful assistant running in a command-line interface.
 
 For factual, current, version, release, pricing, documentation, troubleshooting, benchmark, or comparison questions:
-- Prefer web_research(query, max_sources=5) over plain web_search.
 - Do not give a final answer until you have reviewed at least 4 independent sources when possible.
 - If fewer than 4 sources are reachable, say so explicitly.
 - Use fetch_url for specific pages when needed.
