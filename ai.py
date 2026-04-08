@@ -18,7 +18,7 @@ Features:
   - Interactive UI for settings and model selection
 
 Usage:
-    python ai.py <provider> [filter]... or ./ai.py <provider> [filter] make ai.py executable 
+    python ai.py <provider> [filter]...
 
 Providers: gemini, openrouter, groq, together, cerebras, novita, cloudflare, ollama
 
@@ -107,7 +107,7 @@ API_KEYS: dict[str, str] = {
     "cerebras":   "",   # https://cloud.cerebras.ai/
     "novita":     "",   # https://novita.ai/
     "ollama":     "",   # https://ollama.com/ (leave blank for local)
-    "cloudflare": "",   # https://dash.cloudflare.com Format: YOUR_ACCOUNT_ID:YOUR_API_TOKEN
+    "cloudflare": "",   # https://dash.cloudflare.com -> Format: ACCOUNT_ID:API_TOKEN
 }
 
 MAX_HISTORY_MESSAGES = 20
@@ -120,7 +120,7 @@ SESSION_DIR = Path.home() / ".chat_sessions"
 HISTORY_FILE = Path.home() / ".ai_cli_history"
 
 MAX_IMAGE_SIZE_MB = 20
-SUPPORTED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+SUPPORTED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/jxl", "image/avif", "image/heic", "image/heif", "image/tiff"}
 
 FETCH_MAX_CHARS = 30_000
 FETCH_MAX_BYTES = 5 * 1024 * 1024
