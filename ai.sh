@@ -27,7 +27,7 @@ CURRENT_IMAGE_PATH=""
 CURRENT_IMAGE_BASE64=""
 CURRENT_IMAGE_MIME=""
 MAX_IMAGE_SIZE_MB=20
-SUPPORTED_IMAGE_TYPES=("image/jpeg" "image/png" "image/webp" "image/gif")
+SUPPORTED_IMAGE_TYPES=("image/jpeg" "image/png" "image/webp" "image/gif" "image/avif" "image/heic" "image/heif" "image/jxl" "image/tiff")
 
 # --- Thinking Output Configuration ---
 ENABLE_THINKING_OUTPUT=true   # Set to false to disable thinking output display
@@ -99,6 +99,10 @@ NOVITA_API_KEY=""
 # Ollama Cloud: https://ollama.com/
 OLLAMA_API_KEY=""
 
+# Cloudflare AI: https://developers.cloudflare.com/workers-ai/
+CLOUDFLARE_API_TOKEN=""
+CLOUDFLARE_ACCOUNT_ID=""
+
 # --- API Endpoints ---
 # Chat Endpoints
 GEMINI_CHAT_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models/"
@@ -111,6 +115,10 @@ OLLAMA_CHAT_URL="https://ollama.com/api/chat"
 # Ollama to localhost. If using Ollama Cloud, uncomment the next line to use local.
 # OLLAMA_CHAT_URL="http://localhost:11434/api/chat"
 
+# Cloudflare AI API endpoints
+CLOUDFLARE_CHAT_URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run"
+CLOUDFLARE_MODELS_URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/models"
+
 # Model Listing Endpoints
 GEMINI_MODELS_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
@@ -119,6 +127,7 @@ TOGETHER_MODELS_URL="https://api.together.ai/v1/models"
 CEREBRAS_MODELS_URL="https://api.cerebras.ai/v1/models"
 NOVITA_MODELS_URL="https://api.novita.ai/v3/openai/models"
 OLLAMA_MODELS_URL="https://ollama.com/api/tags"
+CLOUDFLARE_MODELS_URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/models"
 # Ollama to localhost. If using Ollama Cloud, uncomment the next line to use local.
 #OLLAMA_MODELS_URL="http://localhost:11434/api/tags"
 
@@ -157,7 +166,7 @@ function print_usage() {
   echo -e "  Now with thinking output support for reasoning models!"
   echo -e ""
   echo -e "${COLOR_INFO}Supported Providers:${COLOR_RESET}"
-  echo -e "  gemini, openrouter, groq, together, cerebras, novita, ollama"
+  echo -e "  gemini, openrouter, groq, together, cerebras, novita, ollama, cloudflare"
   echo -e ""
   echo -e "${COLOR_INFO}Chat Commands:${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}/history${COLOR_RESET}         - Show conversation history"
@@ -178,6 +187,7 @@ function print_usage() {
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Cerebras:${COLOR_RESET}   https://cloud.cerebras.ai"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Novita:${COLOR_RESET}     https://docs.novita.ai"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Ollama:${COLOR_RESET}     https://ollama.com/library"
+  echo -e "    ${COLOR_BOLD}${COLOR_USER}Cloudflare:${COLOR_RESET} https://developers.cloudflare.com/workers-ai/models"
   echo -e ""
   echo -e "${COLOR_BOLD}${COLOR_INFO}Example Commands:${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 gemini${COLOR_RESET}"
@@ -187,6 +197,7 @@ function print_usage() {
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 cerebras${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 novita${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 ollama${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 cloudflare${COLOR_RESET}"
   echo -e ""
   echo -e "${COLOR_IMAGE}Image Support:${COLOR_RESET}"
   echo -e "  Supports JPEG, PNG, GIF, WebP, BMP. Max ${MAX_IMAGE_SIZE_MB}MB per image."
@@ -241,6 +252,9 @@ check_placeholder_key() {
         placeholder_found=true
         message="appears to be too short to be a valid key"
     elif [[ "$provider_name" == "ollama" && ${#key_value} -lt 10 ]]; then
+        placeholder_found=true
+        message="appears to be too short to be a valid key"
+    elif [[ "$provider_name" == "cloudflare" && ${#key_value} -lt 10 ]]; then
         placeholder_found=true
         message="appears to be too short to be a valid key"
     fi
@@ -392,8 +406,27 @@ case "$PROVIDER" in
     cerebras)   API_KEY="$CEREBRAS_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
     novita)     API_KEY="$NOVITA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
     ollama)     API_KEY="$OLLAMA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
+    cloudflare)
+        # Cloudflare needs both token and account ID
+        if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
+            echo -e "${COLOR_WARN}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${COLOR_RESET}" >&2
+            echo -e "${COLOR_WARN}!! WARNING: API Token for provider 'CLOUDFLARE' is empty.${COLOR_RESET}" >&2
+            echo -e "${COLOR_WARN}!! Please edit the script ($0) and replace CLOUDFLARE_API_TOKEN with your actual token.${COLOR_RESET}" >&2
+            echo -e "${COLOR_WARN}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${COLOR_RESET}" >&2
+            key_check_status=1
+        elif [[ -z "$CLOUDFLARE_ACCOUNT_ID" ]]; then
+            echo -e "${COLOR_WARN}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${COLOR_RESET}" >&2
+            echo -e "${COLOR_WARN}!! WARNING: Account ID for provider 'CLOUDFLARE' is empty.${COLOR_RESET}" >&2
+            echo -e "${COLOR_WARN}!! Please edit the script ($0) and replace CLOUDFLARE_ACCOUNT_ID with your actual account ID.${COLOR_RESET}" >&2
+            echo -e "${COLOR_WARN}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${COLOR_RESET}" >&2
+            key_check_status=1
+        else
+            API_KEY="$CLOUDFLARE_API_TOKEN"
+            check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$?
+        fi
+        ;;
     *)
-        echo -e "${COLOR_ERROR}Error: Unknown provider '$PROVIDER'. Choose from: gemini, openrouter, groq, together, cerebras, novita, ollama${COLOR_RESET}" >&2
+        echo -e "${COLOR_ERROR}Error: Unknown provider '$PROVIDER'. Choose from: gemini, openrouter, groq, together, cerebras, novita, ollama, cloudflare${COLOR_RESET}" >&2
         print_usage
         exit 1
         ;;
@@ -449,6 +482,11 @@ case "$PROVIDER" in
             MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
         fi
         JQ_QUERY='.models[] | .name'
+        ;;
+    cloudflare)
+        MODELS_URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/models"
+        MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
+        JQ_QUERY='.result | sort_by(.id) | .[].id'
         ;;
 esac
 
@@ -620,9 +658,12 @@ case "$PROVIDER" in
             together)   CHAT_API_URL="$TOGETHER_CHAT_URL" ;;
             cerebras)   CHAT_API_URL="$CEREBRAS_CHAT_URL" ;;
             novita)     CHAT_API_URL="$NOVITA_CHAT_URL" ;;
-            ollama)     
+            ollama)
                 CHAT_API_URL="$OLLAMA_CHAT_URL"
                 PROVIDER_SUPPORTS_THINKING=true # Ollama supports native thinking field
+                ;;
+            cloudflare)
+                CHAT_API_URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run"
                 ;;
         esac
         ;;
@@ -1052,7 +1093,20 @@ while true; do
                     }
                 }'
             )
-            
+
+         # Cloudflare AI uses model ID in URL path
+         elif [[ "$PROVIDER" == "cloudflare" ]]; then
+            json_payload=$(echo "$base_payload" | jq -c \
+                --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
+                --arg top_p_str "$DEFAULT_OAI_TOP_P" \
+                '. + {
+                    max_tokens: ($max_tokens_str | tonumber),
+                    top_p: ($top_p_str | tonumber)
+                }'
+            )
+            # Update URL to include model ID
+            CHAT_API_URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${MODEL_ID}"
+
          # Conditionally add parameters for providers that support them.
          # TogetherAI, for example, can be sensitive to extra parameters on some models.
          elif [[ "$PROVIDER" != "together" ]]; then
