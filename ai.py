@@ -107,7 +107,7 @@ API_KEYS: dict[str, str] = {
     "cerebras":   "",   # https://cloud.cerebras.ai/
     "novita":     "",   # https://novita.ai/
     "ollama":     "",   # https://ollama.com/ (leave blank for local)
-    "cloudflare": "",   # https://dash.cloudflare.com -> Format: ACCOUNT_ID:API_TOKEN
+    "cloudflare": "",   # https://dash.cloudflare.com Format: ACCOUNT_ID:API_TOKEN
 }
 
 MAX_HISTORY_MESSAGES = 20
@@ -342,7 +342,7 @@ class LatexRenderer:
         )
         self._display_pat = re.compile(r'\$\$(.+?)\$\$|\\\[(.+?)\\\]', re.DOTALL)
         self._inline_pat = re.compile(r'\$(.+?)\$')
-        self._frac_inner = re.compile(r'\\frac\{([^{}]+)\}\{([^{}]+)\}')
+        self._frac_inner = re.compile(r'\\frac\{((?:[^{}]|\{[^{}]*\})+)\}\{((?:[^{}]|\{[^{}]*\})+)\}')
         self._frac_outer = re.compile(r'\\frac\{([^}]+)\}\{([^}]+)\}')
         self._sup_brace = re.compile(r'\^\{([^}]+)\}')
         self._sup_single = re.compile(r'\^([a-zA-Z0-9])')
@@ -515,23 +515,12 @@ def check_placeholder_key(key: str, provider: str) -> bool:
 
 
 def strip_think_tags(text: str) -> str:
-    result, remaining = "", text
-    while remaining:
-        start = remaining.find("<think")
-        if start == -1:
-            result += remaining
-            break
-        result += remaining[:start]
-        after_open = remaining[start + 6:]
-        bracket = after_open.find(">")
-        remaining = after_open[bracket + 1:] if bracket != -1 else ""
-        close = remaining.find("</think")
-        if close == -1:
-            break
-        after_close = remaining[close + 7:]
-        bracket2 = after_close.find(">")
-        remaining = after_close[bracket2 + 1:] if bracket2 != -1 else ""
-    return result
+    # Use re.I for "case-insensitive" and .*? for "non-greedy" matching
+    # This handles <think>, <THINK>, and even <think extra_info>
+    text = re.sub(r"<think.*?>.*?</think.*?>", "", text, flags=re.DOTALL | re.I)
+    # This catches a <think> block that started but never finished
+    text = re.sub(r"<think.*?>.*$", "", text, flags=re.DOTALL | re.I)
+    return text.strip()
 
 
 def filter_models(models: list[str], filters: list[str]) -> list[str]:
@@ -571,8 +560,9 @@ def _args_to_obj(arguments: str) -> dict[str, Any]:
     try:
         obj = json.loads(arguments)
         return obj if isinstance(obj, dict) else {}
-    except (json.JSONDecodeError, TypeError):
-        return {}
+    except (json.JSONDecodeError, TypeError) as e:
+        # Pass the error back so the AI knows it made a mistake and can fix it!
+        return {"error": f"Invalid JSON format: {str(e)}"}
 
 
 def _args_display(arguments: str) -> str:
@@ -778,14 +768,18 @@ def _fetch_page(url: str, timeout: int = 20) -> str:
     for headers in (_FETCH_HEADERS_PRIMARY, _FETCH_HEADERS_FALLBACK):
         req = urllib.request.Request(url, headers=headers)
         try:
-            with _URL_OPENER.open(req, timeout=timeout) as resp:
+            # Create a fresh, clean cookie jar for every single website visit
+            fresh_opener = _make_opener()
+            with fresh_opener.open(req, timeout=timeout) as resp:
                 cl = resp.headers.get("Content-Length")
                 if cl:
                     try:
-                        if int(cl) > FETCH_MAX_BYTES:
-                            raise ValueError("Response too large")
+                        cl_int = int(cl)
                     except ValueError:
-                        pass
+                        cl_int = 0
+                    
+                    if cl_int > FETCH_MAX_BYTES:
+                        raise RuntimeError(f"Response too large: {cl_int} bytes")
                 raw = resp.read(FETCH_MAX_BYTES + 1)
                 if len(raw) > FETCH_MAX_BYTES:
                     raw = raw[:FETCH_MAX_BYTES]
@@ -1093,32 +1087,15 @@ def _best_excerpts(query: str, title: str, url: str, text: str, max_chunks: int 
             break
     return out
 
-
 def _extract_title_and_text(raw_html: str) -> tuple[str, str]:
     title = ""
     m = re.search(r"<title[^>]*>(.*?)</title>", raw_html, flags=re.I | re.S)
     if m:
         title = re.sub(r"\s+", " ", _clean_html(m.group(1))).strip()
 
-    candidates: list[str] =[]
-    patterns =[
-        r"<article[^>]*>(.*?)</article>",
-        r"<main[^>]*>(.*?)</main>",
-        r"<section[^>]*>(.*?)</section>",
-        r'<div[^>]+(?:id|class)=["\'][^"\']*(?:article|content|post|entry|body|main|markdown|docs?|story)[^"\']*["\'][^>]*>(.*?)</div>',
-    ]
-    for pat in patterns:
-        for mm in re.finditer(pat, raw_html, flags=re.I | re.S):
-            cleaned = _clean_html(mm.group(1))
-            if len(cleaned) > 200:
-                candidates.append(cleaned)
-
-    whole = _clean_html(raw_html)
-    if whole:
-        candidates.append(whole)
-
-    best = max(candidates, key=len) if candidates else ""
-    return title, best
+    # Rely entirely on the robust TextExtractor (HTMLParser) instead of regex
+    best_text = _clean_html(raw_html)
+    return title, best_text
 
 
 def _fetch_page_text(url: str) -> tuple[str, str]:
@@ -1457,7 +1434,10 @@ def tool_calculator(expression: str = "", **kwargs: Any) -> str:
     if not expression.strip():
         return "Error: No expression provided."
     try:
-        expression = expression.replace("^", "**")
+        # Only replace ^ if it's not being used as a valid Python BitXor operator
+        if "^" in expression and "**" not in expression:
+            expression = expression.replace("^", "**")
+            
         tree = ast.parse(expression, mode="eval")
         result = _eval_node(tree.body)
         if isinstance(result, float) and result == int(result) and not math.isinf(result):
