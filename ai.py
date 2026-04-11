@@ -15,11 +15,12 @@ Features:
   - Live model switching (/model command)
   - History compaction (tool messages auto-collapsed after each exchange)
   - SSRF protection with DNS-pinning
+  - Interactive UI for settings and model selection
 
 Usage:
     python ai.py <provider> [filter]...
 
-Providers: gemini, openrouter, groq, together, cerebras, novita, ollama
+Providers: gemini, openrouter, groq, together, cerebras, novita, cloudflare, ollama
 
 Chat commands:
     /history            Show conversation history
@@ -30,7 +31,7 @@ Chat commands:
     /upload <path>      Attach an image to your next message
     /image              Show currently attached image
     /clearimage         Remove the attached image
-    /paste [text]       Multi-line paste mode (end with ---)
+    /paste[text]       Multi-line paste mode (end with ---)
     /togglethinking     Toggle reasoning/thinking output display
     /toggletools        Toggle tool calling on/off
     /help               Show available commands
@@ -61,6 +62,7 @@ import urllib.parse
 import html as _html
 import mimetypes
 import atexit
+import select as _select
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Optional
@@ -76,6 +78,18 @@ try:
     _READLINE_AVAILABLE = True
 except ImportError:
     _READLINE_AVAILABLE = False
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None
+    tty = None
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,6 +107,7 @@ API_KEYS: dict[str, str] = {
     "cerebras":   "",   # https://cloud.cerebras.ai/
     "novita":     "",   # https://novita.ai/
     "ollama":     "",   # https://ollama.com/ (leave blank for local)
+    "cloudflare": "",   # https://dash.cloudflare.com -> Format: ACCOUNT_ID:API_TOKEN
 }
 
 MAX_HISTORY_MESSAGES = 20
@@ -271,6 +286,36 @@ _URL_OPENER = urllib.request.build_opener(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TERMINAL MATH (CACHED FOR PERFORMANCE)
+# ─────────────────────────────────────────────────────────────────────────────
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+def _visible_len(text: str) -> int:
+    return len(_ANSI_RE.sub("", text))
+
+_LAST_TERM_COLS = 80
+_LAST_COLS_CHECK = 0.0
+
+def _get_term_cols() -> int:
+    global _LAST_TERM_COLS, _LAST_COLS_CHECK
+    now = time.monotonic()
+    # Update terminal size at most every 0.2 seconds to prevent OS spam
+    if now - _LAST_COLS_CHECK > 0.2:
+        _LAST_TERM_COLS = max(shutil.get_terminal_size((80, 24)).columns, 20)
+        _LAST_COLS_CHECK = now
+    return _LAST_TERM_COLS
+
+def _wrapped_rows(text: str) -> int:
+    rows = 0
+    term_cols = _get_term_cols()
+    # Safely account for any \n characters that sneak into the renderer
+    for line in text.split("\n"):
+        vis = max(_visible_len(line), 1)
+        rows += (vis - 1) // term_cols + 1
+    return rows
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # RENDERERS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -325,8 +370,8 @@ class LatexRenderer:
         for cmd, sym in {
             "\\cdot": "·", "\\times": "×", "\\div": "÷", "\\sqrt": "√",
             "\\infty": "∞", "\\pm": "±", "\\neq": "≠", "\\leq": "≤",
-            "\\geq": "≥", "\\approx": "≈", "\\sum": "Σ", "\\prod": "Π",
-            "\\int": "∫",
+            "\\approx": "≈", "\\sum": "Σ", "\\prod": "Π",
+            "\\int": "∫", "\\geq": "≥",
         }.items():
             tex = tex.replace(cmd, sym)
         return tex
@@ -345,9 +390,17 @@ class MarkdownRenderer:
         if stripped.startswith("```"):
             new_state = not in_code_block
             lang = stripped[3:].strip()
-            if new_state:
-                return f"{C.DIM}{'─' * 40} {lang}{C.RESET}", new_state
-            return f"{C.DIM}{'─' * 40}{C.RESET}", new_state
+            
+            # Use dynamic cached width to respect terminal resizes
+            term_cols = _get_term_cols()
+            bar_len = min(term_cols - 4, 60)
+            
+            if new_state: # Opening a code block
+                lbl = lang.upper() or 'CODE'
+                dashes = max(1, bar_len - 17 - len(lbl))
+                return f"{C.DIM}╭{'─' * 15} {lbl} {'─' * dashes}{C.RESET}", new_state
+            else:         # Closing a code block
+                return f"{C.DIM}╰{'─' * bar_len}{C.RESET}", new_state
 
         if in_code_block:
             return f"{C.CODE}{line}{C.RESET}", in_code_block
@@ -405,6 +458,10 @@ ENDPOINTS: dict[str, dict[str, str]] = {
         "chat":   "https://api.novita.ai/v3/openai/chat/completions",
         "models": "https://api.novita.ai/v3/openai/models",
     },
+    "cloudflare": {
+        "chat":   "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions",
+        "models": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search",
+    },
     "ollama": {
         "chat":   "https://ollama.com/api/chat",
         "models": "https://ollama.com/api/tags",
@@ -448,6 +505,9 @@ def check_placeholder_key(key: str, provider: str) -> bool:
         bad = "is an incomplete OpenRouter key"
     elif provider == "groq" and key.startswith("gsk_") and len(key) < 10:
         bad = "looks incomplete"
+    elif provider == "cloudflare" and ":" not in key:
+        bad = "is missing the Account ID (Format must be ACCOUNT_ID:API_TOKEN)"
+    
     if bad:
         eprint(f"{C.WARN}WARNING: API key for {provider.upper()} {bad}.{C.RESET}")
         return False
@@ -477,7 +537,7 @@ def strip_think_tags(text: str) -> str:
 def filter_models(models: list[str], filters: list[str]) -> list[str]:
     if not filters:
         return models
-    out: list[str] = []
+    out: list[str] =[]
     for model in models:
         ml = model.lower()
         if all(re.search(r"(?:^|[^a-z0-9])" + re.escape(f.lower()) + r"(?:[^a-z0-9]|$)", ml) for f in filters):
@@ -522,19 +582,6 @@ def _args_display(arguments: str) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(", ", ": "))
 
 
-_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-
-
-def _visible_len(text: str) -> int:
-    return len(_ANSI_RE.sub("", text))
-
-
-def _wrapped_rows(text: str) -> int:
-    cols = max(shutil.get_terminal_size((80, 24)).columns, 20)
-    vis = max(_visible_len(text), 1)
-    return (vis - 1) // cols + 1
-
-
 def _decompress(data: bytes, encoding: str) -> bytes:
     enc = (encoding or "").lower()
     try:
@@ -565,7 +612,7 @@ def _make_opener() -> urllib.request.OpenerDirector:
 class TextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
+        self.parts: list[str] =[]
         self.skip_tags = {'script', 'style', 'noscript', 'svg', 'iframe', 'template'}
         self.block_tags = {
             'div', 'p', 'br', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
@@ -593,8 +640,8 @@ class TextExtractor(HTMLParser):
 
     def get_text(self) -> str:
         raw = "".join(self.parts)
-        lines = [re.sub(r"[ \t]+", " ", line.strip()) for line in raw.split("\n")]
-        lines = [line for line in lines if line]
+        lines =[re.sub(r"[ \t]+", " ", line.strip()) for line in raw.split("\n")]
+        lines =[line for line in lines if line]
         return "\n\n".join(lines)
 
 
@@ -836,7 +883,7 @@ def _tokenize(text: str) -> list[str]:
     tokens = re.findall(r"[a-z0-9]{2,}", raw.lower())
     if len(tokens) <= 3 or '"' in raw:
         return tokens
-    filtered = [t for t in tokens if t not in _STOPWORDS]
+    filtered =[t for t in tokens if t not in _STOPWORDS]
     return filtered or tokens
 
 
@@ -863,7 +910,7 @@ def _normalize_url(url: str) -> str:
     if path != "/":
         path = path.rstrip("/")
     qs = urllib.parse.parse_qsl(p.query, keep_blank_values=False)
-    qs = [
+    qs =[
         (k, v) for k, v in qs
         if not (
             k.lower().startswith("utm_")
@@ -967,7 +1014,7 @@ def _score_text(query: str, title: str = "", snippet: str = "", url: str = "", b
 def _query_variants(query: str) -> list[str]:
     q = (query or "").strip()
     if not q:
-        return []
+        return[]
 
     year = datetime.datetime.now().year
     ql = q.lower()
@@ -982,7 +1029,7 @@ def _query_variants(query: str) -> list[str]:
     if len(q.split()) >= 3:
         out.append(f"\"{q}\"")
 
-    dedup: list[str] = []
+    dedup: list[str] =[]
     seen: set[str] = set()
     for item in out:
         k = item.lower()
@@ -993,8 +1040,8 @@ def _query_variants(query: str) -> list[str]:
 
 
 def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> list[str]:
-    paras = [p.strip() for p in re.split(r"\n{2,}", text or "") if p.strip()]
-    chunks: list[str] = []
+    paras =[p.strip() for p in re.split(r"\n{2,}", text or "") if p.strip()]
+    chunks: list[str] =[]
     cur = ""
 
     def push(buf: str) -> None:
@@ -1032,7 +1079,7 @@ def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> list[s
 def _best_excerpts(query: str, title: str, url: str, text: str, max_chunks: int = 4) -> list[str]:
     chunks = _chunk_text(text)
     if not chunks:
-        return []
+        return[]
     ranked = sorted(chunks, key=lambda ch: _score_text(query, title=title, url=url, body=ch), reverse=True)
     out: list[str] = []
     seen: set[str] = set()
@@ -1053,8 +1100,8 @@ def _extract_title_and_text(raw_html: str) -> tuple[str, str]:
     if m:
         title = re.sub(r"\s+", " ", _clean_html(m.group(1))).strip()
 
-    candidates: list[str] = []
-    patterns = [
+    candidates: list[str] =[]
+    patterns =[
         r"<article[^>]*>(.*?)</article>",
         r"<main[^>]*>(.*?)</main>",
         r"<section[^>]*>(.*?)</section>",
@@ -1140,13 +1187,13 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
             raw = _decompress(raw, resp.headers.get("Content-Encoding", ""))
             html_text = raw.decode("utf-8", errors="replace")
     except Exception:
-        return []
+        return[]
 
     if "captcha" in html_text.lower():
-        return []
+        return[]
 
     _PROGRESS.update("Parsing results…")
-    found: list[tuple[str, str, str]] = []
+    found: list[tuple[str, str, str]] =[]
 
     for m in re.finditer(
         r'<a[^>]+class="[^"]*result-title[^"]*"[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
@@ -1171,7 +1218,7 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
         ):
             found.append((m.group(1), re.sub(r"\s+", " ", _clean_html(m.group(2))).strip(), ""))
 
-    out: list[dict[str, Any]] = []
+    out: list[dict[str, Any]] =[]
     seen_urls: set[str] = set()
     for href, title, snippet in found:
         url = _normalize_url(_unwrap_result_url(href))
@@ -1200,7 +1247,7 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
 
 def _search_candidates(query: str, max_sources: int) -> list[dict[str, Any]]:
     variants = _query_variants(query)[:4]
-    all_rows: list[dict[str, Any]] = []
+    all_rows: list[dict[str, Any]] =[]
     seen_urls: set[str] = set()
 
     per_variant = max(10, max_sources * 5)
@@ -1222,8 +1269,8 @@ def _search_candidates(query: str, max_sources: int) -> list[dict[str, Any]]:
 
     all_rows.sort(key=lambda x: x["score"], reverse=True)
 
-    primary: list[dict[str, Any]] = []
-    fallback: list[dict[str, Any]] = []
+    primary: list[dict[str, Any]] =[]
+    fallback: list[dict[str, Any]] =[]
     seen_domains: set[str] = set()
 
     for item in all_rows:
@@ -1238,10 +1285,10 @@ def _search_candidates(query: str, max_sources: int) -> list[dict[str, Any]]:
 
 
 def _fetch_source_batch(batch: list[dict[str, Any]], query: str) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    ok_rows: list[dict[str, Any]] = []
-    bad_rows: list[dict[str, str]] = []
+    ok_rows: list[dict[str, Any]] =[]
+    bad_rows: list[dict[str, str]] =[]
     lock = threading.Lock()
-    threads: list[threading.Thread] = []
+    threads: list[threading.Thread] =[]
 
     def worker(candidate: dict[str, Any]) -> None:
         url = candidate["url"]
@@ -1290,10 +1337,10 @@ def _research_sources(query: str, max_sources: int) -> tuple[list[dict[str, Any]
     max_sources = max(1, min(max_sources, RESEARCH_MAX_SOURCES))
     candidates = _search_candidates(query, max_sources=max_sources)
     if not candidates:
-        return [], [], []
+        return [], [],[]
 
-    fetched_raw: list[dict[str, Any]] = []
-    failures: list[dict[str, str]] = []
+    fetched_raw: list[dict[str, Any]] =[]
+    failures: list[dict[str, str]] =[]
     cursor = 0
 
     while cursor < len(candidates):
@@ -1310,8 +1357,8 @@ def _research_sources(query: str, max_sources: int) -> tuple[list[dict[str, Any]
 
     fetched_raw.sort(key=lambda x: x["score"], reverse=True)
 
-    selected: list[dict[str, Any]] = []
-    leftovers: list[dict[str, Any]] = []
+    selected: list[dict[str, Any]] =[]
+    leftovers: list[dict[str, Any]] =[]
     seen_domains: set[str] = set()
 
     for item in fetched_raw:
@@ -1398,7 +1445,7 @@ def tool_calculator(expression: str = "", **kwargs: Any) -> str:
                 raise TypeError(f"Unknown function '{name}'")
             if node.keywords:
                 raise TypeError("Keyword arguments not supported")
-            args = [_eval_node(a) for a in node.args]
+            args =[_eval_node(a) for a in node.args]
             if name == "factorial":
                 if len(args) != 1 or not isinstance(args[0], int) or args[0] < 0:
                     raise ValueError("factorial() requires a non-negative integer")
@@ -1435,7 +1482,7 @@ def tool_web_search(query: str = "", num_results: int = 0, **kwargs: Any) -> str
     if not rows:
         return f"No results found for: {query}"
 
-    lines = [
+    lines =[
         f"Web search results for: {query}",
         "(Quick lookup only. For final factual/current answers, prefer web_research.)",
         "",
@@ -1474,7 +1521,7 @@ def tool_fetch_url(url: str = "", focus_query: str = "", **kwargs: Any) -> str:
             if not excerpts:
                 excerpts = [text[:1800]]
 
-            lines = [
+            lines =[
                 f"Page: {title or url}",
                 f"URL: {url}",
                 f"Focus query: {focus_query}",
@@ -1513,7 +1560,7 @@ def tool_web_research(query: str = "", max_sources: int = RESEARCH_TARGET_SOURCE
     if not selected:
         return f"No research sources could be fetched for: {query}"
 
-    lines = [
+    lines =[
         f"Research results for: {query}",
         f"RESEARCH_SOURCES_REVIEWED: {len(selected)}",
         f"RESEARCH_TARGET_SOURCES: {max_sources}",
@@ -1531,7 +1578,7 @@ def tool_web_research(query: str = "", max_sources: int = RESEARCH_TARGET_SOURCE
         if item.get("query_used") and item["query_used"] != query:
             lines.append(f"Matched via query variant: {item['query_used']}")
         lines.append("Relevant excerpts:")
-        for ex in item.get("excerpts", [])[:4]:
+        for ex in item.get("excerpts",[])[:4]:
             lines.append(f"- {truncate(ex, 1800)}")
         lines.append("")
 
@@ -1572,7 +1619,7 @@ def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
 
-        rows = data.get("query", {}).get("search", [])
+        rows = data.get("query", {}).get("search",[])
         if not rows:
             return f"No Wikipedia results for: {query}"
 
@@ -1593,7 +1640,7 @@ TOOLS_REGISTRY: dict[str, Any] = {
 }
 
 
-OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
+OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] =[
     {
         "type": "function",
         "function": {
@@ -1648,7 +1695,7 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                     "query": {"type": "string"},
                     "max_sources": {"type": "integer"},
                 },
-                "required": ["query"],
+                "required":["query"],
             },
         },
     },
@@ -1684,9 +1731,9 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
     },
 ]
 
-GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
+GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] =[
     {
-        "functionDeclarations": [
+        "functionDeclarations":[
             {"name": "get_time", "description": "Get the current local time and date."},
             {
                 "name": "calculator",
@@ -1736,7 +1783,7 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                         "url": {"type": "string"},
                         "focus_query": {"type": "string"},
                     },
-                    "required": ["url"],
+                    "required":["url"],
                 },
             },
             {
@@ -1765,8 +1812,8 @@ def execute_tool(name: str, arguments_json: str) -> str:
     args = {k: v for k, v in args.items() if k}
 
     _PROGRESS.start(f"{name}…")
-    result_box: list[Optional[str]] = [None]
-    error_box: list[Optional[Exception]] = [None]
+    result_box: list[Optional[str]] =[None]
+    error_box: list[Optional[Exception]] =[None]
 
     def _run() -> None:
         try:
@@ -1867,8 +1914,8 @@ def clear_sessions() -> None:
 
 def init_history(is_openai_compat: bool) -> History:
     if SYSTEM_PROMPT and is_openai_compat:
-        return [{"role": "system", "content": SYSTEM_PROMPT}]
-    return []
+        return[{"role": "system", "content": SYSTEM_PROMPT}]
+    return[]
 
 
 def truncate_history(history: History, is_openai_compat: bool) -> History:
@@ -1880,12 +1927,12 @@ def truncate_history(history: History, is_openai_compat: bool) -> History:
     if not is_openai_compat and to_remove % 2 == 1:
         to_remove += 1
     if system_offset:
-        return [history[0]] + history[1 + to_remove:]
+        return[history[0]] + history[1 + to_remove:]
     return history[to_remove:]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODELS
+# MODELS INTERACTIVE UI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_request(url: str, api_key: str, provider: str, data: Optional[bytes] = None) -> urllib.request.Request:
@@ -1905,11 +1952,21 @@ def _build_request(url: str, api_key: str, provider: str, data: Optional[bytes] 
 
 def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
     ep = ENDPOINTS[provider]
+    models_url = ep["models"]
+
+    if provider == "cloudflare":
+        if ":" not in api_key:
+            eprint(f"{C.ERROR}Cloudflare API key must be in format ACCOUNT_ID:API_TOKEN{C.RESET}")
+            return None
+        acc_id, token = api_key.split(":", 1)
+        models_url = models_url.replace("{account_id}", acc_id)
+        api_key = token
+
     if provider == "gemini":
-        url = f"{ep['models']}?key={api_key}"
+        url = f"{models_url}?key={api_key}"
         req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
     else:
-        req = _build_request(ep["models"], api_key, provider)
+        req = _build_request(models_url, api_key, provider)
 
     try:
         with _request_with_retry(req, timeout=MODEL_FETCH_TIMEOUT) as resp:
@@ -1932,56 +1989,552 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
         if provider == "gemini":
             models = [
                 m["name"].replace("models/", "")
-                for m in data.get("models", [])
+                for m in data.get("models",[])
                 if (
-                    any("generateContent" in method for method in m.get("supportedGenerationMethods", []))
+                    any("generateContent" in method for method in m.get("supportedGenerationMethods",[]))
                     and not m["name"].startswith("models/embedding")
                 )
             ]
         elif provider == "ollama":
-            models = [m["name"] for m in data.get("models", [])]
+            models = [m["name"] for m in data.get("models",[])]
         elif provider == "together":
             arr = data if isinstance(data, list) else data.get("data", [])
             models = sorted(m["id"] for m in arr)
+        elif provider == "cloudflare":
+            models = sorted(
+                m["name"] for m in data.get("result",[])
+                if m.get("task", {}).get("name") == "Text Generation" or "task" not in m
+            )
         else:
-            models = sorted(m["id"] for m in data.get("data", []))
+            models = sorted(m["id"] for m in data.get("data",[]))
     except Exception as exc:
         eprint(f"{C.ERROR}Could not parse model list: {exc}{C.RESET}")
         return None
 
-    return [m for m in models if m]
+    return[m for m in models if m]
 
 
-def select_model_interactive(provider: str, api_key: str, filters: list[str], current_model: str = "") -> Optional[str]:
-    cprint(f"{C.INFO}Fetching models for {provider.upper()}…{C.RESET}")
-    models = fetch_models(provider, api_key)
-    if not models:
-        eprint(f"{C.ERROR}No models returned by {provider.upper()}.{C.RESET}")
-        return None
-    if filters:
-        models = filter_models(models, filters)
-    if not models:
-        eprint(f"{C.ERROR}No models matched filter: {' '.join(filters)}{C.RESET}")
-        return None
+_PICK_SEL_BG = "\033[48;5;215m"
+_PICK_SEL_FG = "\033[38;5;16m"
+
+
+class _RawTerminal:
+    def __init__(self) -> None:
+        self.fd: Optional[int] = None
+        self.old: Any = None
+
+    def __enter__(self) -> "_RawTerminal":
+        if os.name != "nt" and termios and tty and sys.stdin.isatty():
+            self.fd = sys.stdin.fileno()
+            self.old = termios.tcgetattr(self.fd)
+            tty.setraw(self.fd)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.fd is not None and self.old is not None and termios:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+
+def _truncate_plain(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    return text[:width - 1] + "…"
+
+
+def _picker_filter_models(models: list[str], query: str) -> list[str]:
+    q = (query or "").strip().lower()
+    if not q:
+        return list(models)
+
+    parts =[p for p in q.split() if p]
+    if not parts:
+        return list(models)
+
+    out: list[str] =[]
+    for model in models:
+        ml = model.lower()
+        if all(part in ml for part in parts):
+            out.append(model)
+    return out
+
+
+def _tty_join(lines: list[str]) -> str:
+    return "\r\n".join(lines)
+
+
+def _ansi_pad(text: str, width: int) -> str:
+    pad = max(0, width - _visible_len(text))
+    return text + (" " * pad)
+
+
+def _panel_line(content: str, inner_width: int) -> str:
+    return f"│{_ansi_pad(content, inner_width)}│"
+
+
+def _center_block(lines: list[str], term_cols: int, term_rows: int) -> str:
+    block_h = len(lines)
+    block_w = max((_visible_len(line) for line in lines), default=0)
+
+    top = max(0, (term_rows - block_h) // 2)
+    left = max(0, (term_cols - block_w) // 2)
+
+    out: list[str] =[]
+    out.extend([""] * top)
+
+    prefix = " " * left
+    for line in lines:
+        out.append(prefix + line)
+
+    return "\033[H\033[2J" + _tty_join(out)
+
+
+def _read_picker_key() -> str:
+    if os.name == "nt" and msvcrt is not None:
+        ch = msvcrt.getwch()
+
+        if ch in ("\x00", "\xe0"):
+            ch2 = msvcrt.getwch()
+            return {
+                "H": "UP",
+                "P": "DOWN",
+                "K": "LEFT",
+                "M": "RIGHT",
+                "G": "HOME",
+                "O": "END",
+                "I": "PGUP",
+                "Q": "PGDN",
+            }.get(ch2, "")
+
+        if ch in ("\r", "\n"):
+            return "ENTER"
+        if ch == "\x1b":
+            return "ESC"
+        if ch in ("\x08", "\x7f"):
+            return "BACKSPACE"
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        return ch
+
+    # Unbuffered posix read (avoids crashing on arrow keys when python buffers inputs)
+    try:
+        fd = sys.stdin.fileno()
+        b = os.read(fd, 1)
+    except OSError:
+        return ""
+
+    if not b:
+        return ""
+    if b == b"\x03":
+        raise KeyboardInterrupt
+    if b in (b"\r", b"\n"):
+        return "ENTER"
+    if b in (b"\x7f", b"\x08"):
+        return "BACKSPACE"
+
+    if b == b"\x1b":
+        if _select.select([fd], [],[], 0.05)[0]:
+            nxt = os.read(fd, 1)
+            if nxt in (b"[", b"O"):
+                if _select.select([fd], [],[], 0.05)[0]:
+                    nxt2 = os.read(fd, 1)
+                    if nxt == b"[" and nxt2.isdigit():
+                        if _select.select([fd],[], [], 0.05)[0]:
+                            nxt3 = os.read(fd, 1)
+                            seq = nxt2 + nxt3
+                            return {
+                                b"5~": "PGUP",
+                                b"6~": "PGDN",
+                            }.get(seq, "ESC")
+                    return {
+                        b"A": "UP",
+                        b"B": "DOWN",
+                        b"C": "RIGHT",
+                        b"D": "LEFT",
+                        b"H": "HOME",
+                        b"F": "END",
+                    }.get(nxt2, "ESC")
+            return "ESC"
+        return "ESC"
+
+    buf = b
+    while True:
+        try:
+            return buf.decode("utf-8")
+        except UnicodeDecodeError:
+            if len(buf) >= 4:
+                return ""
+            if _select.select([fd], [],[], 0.05)[0]:
+                buf += os.read(fd, 1)
+            else:
+                return ""
+
+
+def _interactive_confirm(prompt: str, default: bool = True, color: str = C.INFO) -> bool:
+    """Inline interactive Yes/No selector."""
+    use_picker = (
+        sys.stdin.isatty()
+        and sys.stdout.isatty()
+        and (
+            (os.name == "nt" and msvcrt is not None)
+            or (os.name != "nt" and termios is not None and tty is not None)
+        )
+    )
+    if not use_picker:
+        while True:
+            try:
+                ans = input(f"{_rl(color)}{prompt} (Y/n): {_rl(C.RESET)}").strip().lower()
+                if ans in ("", "y", "yes"): return True
+                if ans in ("n", "no"): return False
+            except (EOFError, KeyboardInterrupt):
+                sys.exit(0)
+
+    selected = default
+    _stdout_write("\033[?25l")  # Hide cursor safely
+    
+    try:
+        with _RawTerminal():
+            while True:
+                yes_str = f"{_PICK_SEL_BG}{_PICK_SEL_FG} Yes {C.RESET}" if selected else " Yes "
+                no_str  = f"{_PICK_SEL_BG}{_PICK_SEL_FG} No {C.RESET}" if not selected else " No "
+                
+                # Write inline prompt
+                _stdout_write(f"\r{C.CLR}{color}✦ {prompt}{C.RESET}  {yes_str} {no_str}")
+                
+                key = _read_picker_key()
+                if key in ("LEFT", "UP", "RIGHT", "DOWN", "h", "l", "j", "k"):
+                    selected = not selected
+                elif key in ("y", "Y"):
+                    selected = True
+                    break
+                elif key in ("n", "N"):
+                    selected = False
+                    break
+                elif key == "ENTER":
+                    break
+                elif key == "ESC":
+                    sys.exit(0)
+            
+            ans_str = "Yes" if selected else "No"
+            _stdout_write(f"\r{C.CLR}{color}✓ {prompt}{C.RESET} {C.BOLD}{ans_str}{C.RESET}\n")
+            return selected
+            
+    except KeyboardInterrupt:
+        _stdout_write("\r")
+        sys.exit(0)
+    finally:
+        _stdout_write("\033[?25h")  # ALWAYS restore cursor
+
+
+def _render_model_picker(
+    provider: str,
+    all_models: list[str],
+    visible: list[str],
+    selected: int,
+    query: str,
+    current_model: str,
+    number_buffer: str,
+) -> None:
+    term_cols, term_rows = shutil.get_terminal_size((100, 30))
+    term_cols = max(term_cols, 60)
+    term_rows = max(term_rows, 16)
+
+    panel_width = min(100, max(60, int(term_cols * 0.72)))
+    inner_width = panel_width - 2
+
+    max_needed_height = 9 + len(visible)
+    panel_height = min(term_rows - 4, max_needed_height)
+    panel_height = max(panel_height, 12)
+
+    fixed_rows = 9
+    list_rows = max(4, panel_height - fixed_rows)
+
+    if visible:
+        selected = max(0, min(selected, len(visible) - 1))
+        start = max(0, selected - (list_rows // 2))
+        start = min(start, max(0, len(visible) - list_rows))
+        end = min(len(visible), start + list_rows)
+    else:
+        start = 0
+        end = 0
+
+    title_left = f"{C.BOLD}{provider.upper()}{C.RESET} {C.DIM}({provider}){C.RESET}"
+    title_right = f"{C.DIM}esc cancel{C.RESET}"
+    title_gap = max(1, inner_width - _visible_len(title_left) - _visible_len(title_right))
+    title_line = title_left + (" " * title_gap) + title_right
+
+    search_plain = query if query else "type to filter models..."
+    search_plain = _truncate_plain(search_plain, max(8, inner_width - 10))
+    if query:
+        search_body = search_plain
+    else:
+        search_body = f"{C.DIM}{search_plain}{C.RESET}"
+    search_line = f"{C.WARN}Search:{C.RESET} {search_body}{C.DIM}█{C.RESET}"
+
+    hint_plain = "↑/↓ move • Enter select • digits jump • Backspace delete"
+    if number_buffer:
+        hint_plain += f"[jump: {number_buffer}]"
+    hint = f"{C.DIM}{_truncate_plain(hint_plain, inner_width)}{C.RESET}"
+
+    header = (
+        f"{C.TOOL}{provider.upper()} models{C.RESET} "
+        f"{C.DIM}({len(visible)} shown / {len(all_models)} total){C.RESET}"
+    )
+
+    lines: list[str] =[]
+    lines.append("┌" + "─" * inner_width + "┐")
+    lines.append(_panel_line(title_line, inner_width))
+    lines.append(_panel_line("", inner_width))
+    lines.append(_panel_line(search_line, inner_width))
+    lines.append(_panel_line(hint, inner_width))
+    lines.append(_panel_line("", inner_width))
+    lines.append(_panel_line(header, inner_width))
+
+    if not visible:
+        lines.append(_panel_line(f"{C.ERROR}No models match your search.{C.RESET}", inner_width))
+        for _ in range(list_rows - 1):
+            lines.append(_panel_line("", inner_width))
+    else:
+        for idx in range(start, end):
+            num = idx + 1
+            is_current = visible[idx] == current_model
+            current_suffix_plain = " [current]" if is_current else ""
+            current_suffix_col = f" {C.DIM}[current]{C.RESET}" if is_current else ""
+
+            name_space = max(8, inner_width - 6 - len(current_suffix_plain))
+            model_name = _truncate_plain(visible[idx], name_space)
+            row = f"{num:>3}. {model_name}{current_suffix_col}"
+
+            scroll_char = "│"
+            if len(visible) > list_rows:
+                thumb_pos = int((start / max(1, len(visible) - list_rows)) * (list_rows - 1))
+                current_pos = idx - start
+                scroll_char = f"{C.DIM}█{C.RESET}" if current_pos == thumb_pos else f"{C.DIM}│{C.RESET}"
+
+            if idx == selected:
+                lines.append(f"│{_PICK_SEL_BG}{_PICK_SEL_FG}{_ansi_pad(row, inner_width)}{C.RESET}{scroll_char}")
+            else:
+                lines.append(f"│{_ansi_pad(row, inner_width)}{scroll_char}")
+
+        for _ in range(list_rows - (end - start)):
+            lines.append(_panel_line("", inner_width))
+
+    footer_left = f"{C.DIM}Enter select{C.RESET}"
+    footer_right = f"{C.DIM}{selected + 1 if visible else 0}/{len(visible)}{C.RESET}"
+    footer_gap = max(1, inner_width - _visible_len(footer_left) - _visible_len(footer_right))
+    footer = footer_left + (" " * footer_gap) + footer_right
+
+    lines.append(_panel_line("", inner_width))
+    lines.append(_panel_line(footer, inner_width))
+    lines.append("└" + "─" * inner_width + "┘")
+
+    screen = _center_block(lines, term_cols, term_rows)
+    _stdout_write(screen)
+
+
+def _select_model_numeric_fallback(
+    provider: str,
+    models: list[str],
+    current_model: str = "",
+) -> Optional[str]:
     if len(models) == 1:
         cprint(f"{C.INFO}Auto-selected:{C.RESET} {models[0]}")
         return models[0]
+
     cprint(f"{C.INFO}Available models for {provider.upper()}:{C.RESET}")
     for i, m in enumerate(models, 1):
-        marker = f"  {C.BOLD}{C.AI}◉{C.RESET}" if m == current_model else "   "
-        cprint(f"{marker}{C.BOLD}{i:3}{C.RESET}. {m}")
+        marker = "[current]" if m == current_model else ""
+        cprint(f"  {i:3}. {m}{marker}")
+
     while True:
         try:
             choice = input(f"{_rl(C.INFO)}Select model number (or 'c' to cancel): {_rl(C.RESET)}").strip()
         except (EOFError, KeyboardInterrupt):
             cprint(f"\n{C.INFO}Cancelled.{C.RESET}")
             return None
+
         if choice.lower() in {"c", "cancel", "q"}:
             cprint(f"{C.INFO}Cancelled.{C.RESET}")
             return None
-        if choice.isdigit() and 1 <= int(choice) <= len(models):
-            return models[int(choice) - 1]
+
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(models):
+                return models[idx - 1]
+
         eprint(f"{C.WARN}Enter a number between 1 and {len(models)}.{C.RESET}")
+
+
+def select_model_interactive(
+    provider: str,
+    api_key: str,
+    filters: list[str],
+    current_model: str = "",
+) -> Optional[str]:
+    cprint(f"{C.INFO}Fetching models for {provider.upper()}…{C.RESET}")
+    models = fetch_models(provider, api_key)
+    if not models:
+        eprint(f"{C.ERROR}No models returned by {provider.upper()}.{C.RESET}")
+        return None
+
+    initial_query = " ".join(filters).strip()
+    initially_filtered = _picker_filter_models(models, initial_query)
+
+    use_picker = (
+        sys.stdin.isatty()
+        and sys.stdout.isatty()
+        and (
+            (os.name == "nt" and msvcrt is not None)
+            or (os.name != "nt" and termios is not None and tty is not None)
+        )
+    )
+
+    if not use_picker:
+        if initial_query and not initially_filtered:
+            eprint(f"{C.ERROR}No models matched filter: {' '.join(filters)}{C.RESET}")
+            return None
+        return _select_model_numeric_fallback(
+            provider,
+            initially_filtered if initial_query else models,
+            current_model=current_model,
+        )
+
+    if len(initially_filtered) == 1:
+        cprint(f"{C.INFO}Auto-selected:{C.RESET} {initially_filtered[0]}")
+        return initially_filtered[0]
+
+    query = initial_query
+    visible = _picker_filter_models(models, query)
+
+    if visible and current_model in visible:
+        selected = visible.index(current_model)
+    elif not query and current_model in models:
+        selected = models.index(current_model)
+    else:
+        selected = 0
+
+    number_buffer = ""
+
+    try:
+        _stdout_write("\033[?1049h\033[?25l")
+
+        with _RawTerminal():
+            while True:
+                visible = _picker_filter_models(models, query)
+
+                if visible:
+                    selected = max(0, min(selected, len(visible) - 1))
+                    if number_buffer:
+                        try:
+                            idx = int(number_buffer) - 1
+                            if 0 <= idx < len(visible):
+                                selected = idx
+                        except ValueError:
+                            number_buffer = ""
+                else:
+                    selected = 0
+
+                _render_model_picker(
+                    provider=provider,
+                    all_models=models,
+                    visible=visible,
+                    selected=selected,
+                    query=query,
+                    current_model=current_model,
+                    number_buffer=number_buffer,
+                )
+
+                key = _read_picker_key()
+                if not key:
+                    continue
+
+                if key == "UP":
+                    number_buffer = ""
+                    if visible:
+                        selected = (selected - 1) % len(visible)
+
+                elif key == "DOWN":
+                    number_buffer = ""
+                    if visible:
+                        selected = (selected + 1) % len(visible)
+
+                elif key == "HOME":
+                    number_buffer = ""
+                    if visible:
+                        selected = 0
+
+                elif key == "END":
+                    number_buffer = ""
+                    if visible:
+                        selected = len(visible) - 1
+
+                elif key == "PGUP":
+                    number_buffer = ""
+                    if visible:
+                        selected = max(0, selected - 10)
+
+                elif key == "PGDN":
+                    number_buffer = ""
+                    if visible:
+                        selected = min(len(visible) - 1, selected + 10)
+
+                elif key == "BACKSPACE":
+                    if number_buffer:
+                        number_buffer = number_buffer[:-1]
+                    elif query:
+                        query = query[:-1]
+                        selected = 0
+
+                elif key == "ENTER":
+                    if not visible:
+                        continue
+
+                    if number_buffer:
+                        try:
+                            idx = int(number_buffer) - 1
+                        except ValueError:
+                            idx = -1
+                        number_buffer = ""
+                        if 0 <= idx < len(visible):
+                            return visible[idx]
+                        continue
+
+                    return visible[selected]
+
+                elif key == "ESC":
+                    return None
+
+                elif len(key) == 1 and key.isdigit():
+                    if query:
+                        number_buffer = ""
+                        query += key
+                        selected = 0
+                    else:
+                        if len(visible) <= 9:
+                            idx = int(key) - 1
+                            if 0 <= idx < len(visible):
+                                return visible[idx]
+                        if len(number_buffer) < 4:
+                            number_buffer += key
+                        try:
+                            idx = int(number_buffer) - 1
+                            if 0 <= idx < len(visible):
+                                selected = idx
+                        except ValueError:
+                            number_buffer = ""
+
+                elif len(key) == 1 and key.isprintable():
+                    number_buffer = ""
+                    query += key
+                    selected = 0
+
+    except KeyboardInterrupt:
+        return None
+    finally:
+        _stdout_write("\033[?25h\033[?1049l")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1993,7 +2546,7 @@ def build_user_message(text: str, image: ImageAttachment, provider: str, is_open
         if not is_openai_compat:
             return {
                 "role": "user",
-                "parts": [
+                "parts":[
                     {"text": text},
                     {"inlineData": {"mimeType": image.mime, "data": image.base64}},
                 ],
@@ -2002,14 +2555,14 @@ def build_user_message(text: str, image: ImageAttachment, provider: str, is_open
             return {"role": "user", "content": text, "images": [image.base64]}
         return {
             "role": "user",
-            "content": [
+            "content":[
                 {"type": "text", "text": text},
                 {"type": "image_url", "image_url": {"url": f"data:{image.mime};base64,{image.base64}"}},
             ],
         }
 
     if not is_openai_compat:
-        return {"role": "user", "parts": [{"text": text}]}
+        return {"role": "user", "parts":[{"text": text}]}
     return {"role": "user", "content": text}
 
 
@@ -2022,7 +2575,7 @@ def build_payload(
     enable_thinking: bool,
 ) -> dict[str, Any]:
     if not is_openai_compat:
-        contents = [m for m in history if m.get("role") != "system"]
+        contents =[m for m in history if m.get("role") != "system"]
         payload: dict[str, Any] = {
             "contents": contents,
             "generationConfig": {
@@ -2074,7 +2627,7 @@ class _ChunkResult:
         self.think = ""
         self.finish = ""
         self.error = ""
-        self.tool_chunks: list[dict[str, Any]] = []
+        self.tool_chunks: list[dict[str, Any]] =[]
 
 
 def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
@@ -2086,7 +2639,7 @@ def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
         r.think = msg_obj.get("thinking") or ""
         if obj.get("done") is True:
             r.finish = obj.get("done_reason") or "stop"
-        for tc in msg_obj.get("tool_calls", []):
+        for tc in msg_obj.get("tool_calls",[]):
             fn = tc.get("function", {})
             args_raw = fn.get("arguments", "")
             if isinstance(args_raw, dict):
@@ -2105,7 +2658,7 @@ def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
     r.text = delta.get("content") or ""
     r.think = delta.get("reasoning") or ""
     r.finish = choice.get("finish_reason") or ""
-    for tc_chunk in delta.get("tool_calls", []):
+    for tc_chunk in delta.get("tool_calls",[]):
         r.tool_chunks.append({
             "index": tc_chunk.get("index", 0),
             "id": tc_chunk.get("id"),
@@ -2127,7 +2680,7 @@ def _parse_gemini_chunk(obj: dict[str, Any]) -> _ChunkResult:
         return r
 
     content_obj = candidate.get("content", {})
-    for part in content_obj.get("parts", []):
+    for part in content_obj.get("parts",[]):
         if "text" in part:
             r.text += part["text"]
         if "functionCall" in part:
@@ -2206,9 +2759,17 @@ class StreamRenderer:
             self._used_ai_prefix = True
             self.first_chunk = False
         if not self._in_think_display:
-            _stdout_write(f"{C.THINK}[Thinking] ")
+            _stdout_write(f"{C.THINK}[Thinking]\n┃ {C.RESET}{C.THINK}")
             self._in_think_display = True
-        _stdout_write(f"{C.THINK}{think_tok}{C.RESET}")
+            
+        indented_think = think_tok.replace("\n", f"\n{C.THINK}┃ {C.RESET}{C.THINK}")
+        _stdout_write(f"{C.THINK}{indented_think}{C.RESET}")
+
+    def _write_think(self, text: str) -> None:
+        if not self.enable_thinking:
+            return
+        indented = text.replace("\n", f"\n{C.THINK}┃ {C.RESET}{C.THINK}")
+        _stdout_write(f"{C.THINK}{indented}{C.RESET}")
 
     def feed_text(self, text_tok: str) -> None:
         if not text_tok:
@@ -2227,8 +2788,7 @@ class StreamRenderer:
             if self.is_thinking:
                 close = remaining.find("</think")
                 if close != -1:
-                    if self.enable_thinking:
-                        _stdout_write(f"{C.THINK}{remaining[:close]}{C.RESET}")
+                    self._write_think(remaining[:close])
                     _stdout_write(f"{C.RESET}\n\n")
                     self.is_thinking = False
                     self._in_think_display = False
@@ -2236,8 +2796,7 @@ class StreamRenderer:
                     b = after.find(">")
                     remaining = after[b + 1:] if b != -1 else ""
                 else:
-                    if self.enable_thinking:
-                        _stdout_write(f"{C.THINK}{remaining}{C.RESET}")
+                    self._write_think(remaining)
                     remaining = ""
             else:
                 open_idx = remaining.find("<think")
@@ -2248,7 +2807,7 @@ class StreamRenderer:
                     if self._line_buffer:
                         self._commit_current_line()
                     if self.enable_thinking:
-                        _stdout_write(f"{C.THINK}[Thinking] ")
+                        _stdout_write(f"{C.THINK}[Thinking]\n┃ {C.RESET}{C.THINK}")
                         self._in_think_display = True
                     self.is_thinking = True
                     after = remaining[open_idx + 6:]
@@ -2281,8 +2840,18 @@ def stream_response(
     payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ep = ENDPOINTS[provider]
 
+    chat_url = ep.get("chat_base", "") if not is_openai_compat else ep["chat"]
+
+    if provider == "cloudflare":
+        if ":" not in api_key:
+            cprint(f"{C.ERROR}Cloudflare API key must be in format ACCOUNT_ID:API_TOKEN{C.RESET}")
+            return None,[]
+        acc_id, token = api_key.split(":", 1)
+        chat_url = chat_url.replace("{account_id}", acc_id)
+        api_key = token
+
     if not is_openai_compat:
-        url = f"{ep['chat_base']}{model_id}:streamGenerateContent?key={api_key}&alt=sse"
+        url = f"{chat_url}{model_id}:streamGenerateContent?key={api_key}&alt=sse"
         req = urllib.request.Request(
             url,
             data=payload_bytes,
@@ -2290,7 +2859,7 @@ def stream_response(
             method="POST",
         )
     else:
-        req = _build_request(ep["chat"], api_key, provider, data=payload_bytes)
+        req = _build_request(chat_url, api_key, provider, data=payload_bytes)
 
     _stdout_write(f"{C.AI}AI:{C.RESET} {C.INFO}(💬 Waiting…){C.RESET}")
 
@@ -2301,7 +2870,7 @@ def stream_response(
     done_received = False
 
     oai_tool_calls: dict[int, dict[str, Any]] = {}
-    gem_tool_calls: list[dict[str, Any]] = []
+    gem_tool_calls: list[dict[str, Any]] =[]
 
     try:
         with _request_with_retry(req, timeout=REQUEST_TIMEOUT) as resp:
@@ -2419,7 +2988,7 @@ def stream_response(
 
     renderer.finalize()
 
-    tool_calls_out: list[dict[str, Any]] = []
+    tool_calls_out: list[dict[str, Any]] =[]
     if is_openai_compat:
         for idx in sorted(oai_tool_calls):
             tool_calls_out.append(oai_tool_calls[idx])
@@ -2453,12 +3022,12 @@ def stream_response(
             clean = strip_think_tags(full_text)
             return (clean if clean else ""), tool_calls_out
         cprint(f"{C.ERROR}{error_msg}{C.RESET}")
-        return None, []
+        return None,[]
 
     full_text = renderer.full_text[:MAX_MESSAGE_LENGTH]
     clean = strip_think_tags(full_text)
     if not clean and not tool_calls_out and not interrupted:
-        return None, []
+        return None,[]
     return (clean if clean else ""), tool_calls_out
 
 
@@ -2474,7 +3043,7 @@ def _append_assistant_turn(
     is_openai_compat: bool,
 ) -> None:
     if not is_openai_compat:
-        parts: list[dict[str, Any]] = []
+        parts: list[dict[str, Any]] =[]
         if ai_text:
             parts.append({"text": ai_text})
         for tc in tool_calls:
@@ -2491,7 +3060,7 @@ def _append_assistant_turn(
     if provider == "ollama":
         asst_msg: Message = {"role": "assistant", "content": ai_text or ""}
         if tool_calls:
-            asst_msg["tool_calls"] = [
+            asst_msg["tool_calls"] =[
                 {
                     "function": {
                         "name": tc["function"]["name"],
@@ -2517,7 +3086,7 @@ def _append_tool_results(
     is_openai_compat: bool,
 ) -> None:
     if not is_openai_compat:
-        parts = [
+        parts =[
             {
                 "functionResponse": {
                     "name": tc["function"]["name"],
@@ -2548,10 +3117,10 @@ def _extract_display_text(msg: Message) -> str:
     if role == "tool":
         return f"[🛠️ {msg.get('name', 'tool')}] {truncate(msg.get('content', ''), 120)}"
     if "tool_calls" in msg:
-        names = [tc.get("function", tc).get("name", "?") for tc in msg["tool_calls"]]
-        return ((msg.get("content") or "") + f" [🛠️ → {', '.join(names)}]").strip()
+        names =[tc.get("function", tc).get("name", "?") for tc in msg["tool_calls"]]
+        return ((msg.get("content") or "") + f"[🛠️ → {', '.join(names)}]").strip()
 
-    raw = msg.get("content") or msg.get("parts", [{}])
+    raw = msg.get("content") or msg.get("parts",[{}])
     if isinstance(raw, str):
         return raw
     if isinstance(raw, list) and raw:
@@ -2618,7 +3187,7 @@ def read_multiline_input(initial_prompt: str, cont_prompt: str = "") -> Optional
     except (EOFError, KeyboardInterrupt):
         return None
 
-    lines: list[str] = []
+    lines: list[str] =[]
     while line.endswith("\\"):
         lines.append(line[:-1])
         try:
@@ -2632,7 +3201,7 @@ def read_multiline_input(initial_prompt: str, cont_prompt: str = "") -> Optional
 
 def read_paste_input(prefix: str = "") -> Optional[str]:
     cprint(f"{C.INFO}Paste mode — end with {C.BOLD}---{C.RESET}{C.INFO} on its own line to send:{C.RESET}")
-    lines: list[str] = []
+    lines: list[str] =[]
     prompt = f"  {_rl(C.DIM)}│{_rl(C.RESET)} "
     while True:
         try:
@@ -2657,10 +3226,10 @@ def print_usage() -> None:
     me = Path(sys.argv[0]).name
     cprint(f"""
 {C.INFO}Usage:{C.RESET}
-  python {me} <provider> [filter]...
+  python {me} <provider>[filter]...
 
 {C.INFO}Providers:{C.RESET}
-  gemini  openrouter  groq  together  cerebras  novita  ollama
+  gemini  openrouter  groq  together  cerebras  novita  cloudflare  ollama
 
 {C.INFO}Commands:{C.RESET}
   /history
@@ -2728,54 +3297,33 @@ def chat_loop(
     tools_on = enable_tools
 
     def _banner() -> None:
-        sep = "─" * 85
-        cprint(f"\n{sep}")
-        cprint(f"  {C.INFO}Provider:{C.RESET}  {provider.upper()}   {C.INFO}Model:{C.RESET}  {model_id}")
-        cprint(
-            f"  {C.INFO}History:{C.RESET}   last {MAX_HISTORY_MESSAGES} turns  │  "
-            f"{C.INFO}Temp:{C.RESET} {DEFAULT_TEMPERATURE}  │  "
-            f"{C.INFO}Tokens:{C.RESET} {DEFAULT_MAX_TOKENS}  │  "
-            f"{C.INFO}TopP:{C.RESET} {DEFAULT_TOP_P}"
-        )
-        cprint(f"  {C.INFO}Max message:{C.RESET}  {MAX_MESSAGE_LENGTH:,} characters")
+        term_cols, _ = shutil.get_terminal_size((85, 24))
+        width = min(term_cols - 2, 90)
 
-        status = "active" if SYSTEM_PROMPT else "inactive (empty)"
-        cprint(f"  {C.INFO}System prompt:{C.RESET}  {status}")
+        def _line(left: str, right: str = "") -> str:
+            vis_len = _visible_len(left) + _visible_len(right)
+            pad = max(1, width - vis_len - 4)
+            return f"│ {left}{' ' * pad}{right} │"
 
-        if provider == "ollama":
-            ollama_url = ENDPOINTS["ollama"]["chat"].rsplit("/api/", 1)[0]
-            cprint(f"  {C.INFO}Ollama URL:{C.RESET}  {ollama_url}")
+        cprint(f"\n╭{'─' * (width - 2)}╮")
+        cprint(_line(f"{C.BOLD}AI Chat CLI{C.RESET}"))
+        cprint(f"├{'─' * (width - 2)}┤")
 
-        cprint(f"  {C.INFO}Rendering:{C.RESET}   Markdown + LaTeX → Unicode")
+        cprint(_line(f"{C.INFO}Provider:{C.RESET} {provider.upper()}", f"{C.INFO}Model:{C.RESET} {model_id}"))
+        cprint(_line(f"{C.INFO}History:{C.RESET}  last {MAX_HISTORY_MESSAGES} turns", f"{C.INFO}Tokens:{C.RESET} {DEFAULT_MAX_TOKENS}  {C.INFO}Temp:{C.RESET} {DEFAULT_TEMPERATURE}"))
+
+        status = f"{C.AI}active{C.RESET}" if SYSTEM_PROMPT else "inactive"
+        cprint(_line(f"{C.INFO}System prompt:{C.RESET} {status}"))
 
         think_st = f"{C.BOLD}{C.THINK}enabled{C.RESET}" if thinking_on else "disabled"
-        cprint(f"  {C.INFO}Thinking output:{C.RESET}  {think_st}  (toggle: /togglethinking)")
+        cprint(_line(f"{C.INFO}Thinking output:{C.RESET} {think_st}", f"{C.DIM}/togglethinking{C.RESET}"))
 
         tool_st = f"{C.BOLD}{C.TOOL}enabled{C.RESET}" if tools_on else "disabled"
-        cprint(f"  {C.INFO}Tool calling:{C.RESET}     {tool_st}  (toggle: /toggletools)")
+        cprint(_line(f"{C.INFO}Tool calling:{C.RESET}    {tool_st}", f"{C.DIM}/toggletools{C.RESET}"))
 
-        if tools_on:
-            cprint(f"  {C.INFO}Tools:{C.RESET}           {', '.join(TOOLS_REGISTRY)}")
-            cprint(f"  {C.INFO}Search backend:{C.RESET}  Startpage + multi-query reranking + deep fetch")
-            cprint(
-                f"  {C.INFO}Research mode:{C.RESET}   target {RESEARCH_TARGET_SOURCES} sources, "
-                f"minimum {RESEARCH_MIN_SOURCES} when possible"
-            )
-            cprint(f"  {C.INFO}Tool timeout:{C.RESET}    {TOOL_EXEC_TIMEOUT}s per call")
-            cprint(f"  {C.INFO}History mode:{C.RESET}    auto-compact (tool msgs collapsed)")
-
-        cprint(f"  {C.INFO}SSRF protection:{C.RESET} on (DNS-pinned)")
-        cprint(f"  {C.INFO}Retry:{C.RESET}           {MAX_RETRIES}x on 429/5xx")
-        cprint(
-            f"  {C.INFO}Input:{C.RESET}   end line with {C.BOLD}\\{C.RESET} "
-            f"to continue  │  {C.BOLD}/paste{C.RESET} for multi-line"
-        )
-        cprint(
-            f"  Type {C.BOLD}quit{C.RESET} or {C.BOLD}exit{C.RESET} to end  │  "
-            f"{C.BOLD}/model{C.RESET} to switch  │  "
-            f"{C.BOLD}/help{C.RESET} for all commands"
-        )
-        cprint(sep + "\n")
+        cprint(f"├{'─' * (width - 2)}┤")
+        cprint(_line(f"{C.DIM}Type {C.BOLD}quit{C.RESET}{C.DIM} to exit • {C.BOLD}/model{C.RESET}{C.DIM} to switch • {C.BOLD}/help{C.RESET}{C.DIM} for commands{C.RESET}"))
+        cprint(f"╰{'─' * (width - 2)}╯\n")
 
     _banner()
 
@@ -2928,7 +3476,7 @@ def chat_loop(
 
                 if tool_calls and tools_on:
                     had_tool_calls = True
-                    results: list[str] = []
+                    results: list[str] =[]
 
                     for tc in tool_calls:
                         fn_name = tc["function"]["name"]
@@ -2981,10 +3529,10 @@ def chat_loop(
 
         if tool_loop_ok and had_tool_calls and final_ai_text is not None:
             if not is_openai_compat:
-                clean_final: Message = {"role": "model", "parts": [{"text": final_ai_text}]}
+                clean_final: Message = {"role": "model", "parts":[{"text": final_ai_text}]}
             else:
                 clean_final = {"role": "assistant", "content": final_ai_text}
-            history[compact_from:] = [clean_final]
+            history[compact_from:] =[clean_final]
 
         cprint("")
 
@@ -2994,7 +3542,7 @@ def chat_loop(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    for name, val, lo, hi in [
+    for name, val, lo, hi in[
         ("DEFAULT_TEMPERATURE", DEFAULT_TEMPERATURE, 0, 2),
         ("DEFAULT_TOP_P", DEFAULT_TOP_P, 0, 1),
         ("DEFAULT_MAX_TOKENS", DEFAULT_MAX_TOKENS, 1, 1_000_000),
@@ -3020,35 +3568,9 @@ def main() -> None:
 
     is_openai_compat = provider != "gemini"
 
-    enable_thinking = True
-    while True:
-        try:
-            ans = input(f"{_rl(C.THINK)}Enable thinking/reasoning? (Y/n): {_rl(C.RESET)}").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            sys.exit(0)
-        if ans in ("", "y", "yes"):
-            enable_thinking = True
-            cprint(f"{C.THINK}Thinking enabled.{C.RESET}")
-            break
-        if ans in ("n", "no"):
-            enable_thinking = False
-            cprint(f"{C.THINK}Thinking disabled.{C.RESET}")
-            break
-        eprint(f"{C.WARN}Please enter y or n.{C.RESET}")
-
-    enable_tools = False
-    while True:
-        try:
-            ans = input(f"{_rl(C.TOOL)}Enable tool calling? (y/N): {_rl(C.RESET)}").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            sys.exit(0)
-        if ans in ("y", "yes"):
-            enable_tools = True
-            cprint(f"{C.TOOL}Tool calling enabled. Deep research will try for {RESEARCH_TARGET_SOURCES} sources.{C.RESET}")
-            break
-        if ans in ("", "n", "no"):
-            break
-        eprint(f"{C.WARN}Please enter y or n.{C.RESET}")
+    # Interactive Selectors
+    enable_thinking = _interactive_confirm("Enable thinking/reasoning?", default=True, color=C.THINK)
+    enable_tools = _interactive_confirm("Enable tool calling?", default=False, color=C.TOOL)
 
     model_id = select_model_interactive(provider, api_key, filters)
     if model_id is None:
