@@ -485,7 +485,7 @@ def check_placeholder_key(key: str, provider: str) -> bool:
     bad = ""
     if not key:
         bad = "is empty"
-    elif key.startswith("YOUR_") or key.endswith("-HERE") or "" in key:
+    elif key.startswith("YOUR_") or key.endswith("-HERE") or "..." in key:
         bad = "appears to be a placeholder"
     elif provider == "gemini" and key == "-":
         bad = "is the default placeholder '-'"
