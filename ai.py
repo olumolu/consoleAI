@@ -480,25 +480,14 @@ def validate_session_name(name: str) -> bool:
     return True
 
 def check_placeholder_key(key: str, provider: str) -> bool:
+    """Check if an API key is present. Flags if missing."""
     if provider == "ollama":
         return True
-    bad = ""
-    if not key:
-        bad = "is empty"
-    elif key.startswith("YOUR_") or key.endswith("-HERE") or "..." in key:
-        bad = "appears to be a placeholder"
-    elif provider == "gemini" and key == "-":
-        bad = "is the default placeholder '-'"
-    elif provider == "openrouter" and key == "sk-or-v1-":
-        bad = "is an incomplete OpenRouter key"
-    elif provider == "groq" and key.startswith("gsk_") and len(key) < 10:
-        bad = "looks incomplete"
-    elif provider == "cloudflare" and ":" not in key:
-        bad = "is missing the Account ID (Format must be ACCOUNT_ID:API_TOKEN)"
     
-    if bad:
-        eprint(f"{C.WARN}WARNING: API key for {provider.upper()} {bad}.{C.RESET}")
+    if not key or not key.strip():
+        eprint(f"{C.WARN}WARNING: API key for {provider.upper()} is not set.{C.RESET}")
         return False
+        
     return True
 
 def strip_think_tags(text: str) -> str:
