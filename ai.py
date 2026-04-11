@@ -15,10 +15,10 @@ Features:
   - Live model switching (/model command)
   - History compaction (tool messages auto-collapsed after each exchange)
   - SSRF protection with DNS-pinning
-  - Interactive UI for settings and model selection
+  - Interactive UI for settings, provider, and model selection
 
 Usage:
-    python ai.py <provider> [filter]...
+    python ai.py [provider] [filter]...
 
 Providers: gemini, openrouter, groq, together, cerebras, novita, cloudflare, ollama
 
@@ -2252,6 +2252,104 @@ def _interactive_confirm(prompt: str, default: bool = True, color: str = C.INFO)
         _stdout_write("\033[?25h")  # ALWAYS restore cursor
 
 
+def _render_provider_picker(providers: list[str], selected: int) -> None:
+    term_cols, term_rows = shutil.get_terminal_size((100, 30))
+    panel_width = min(60, max(44, int(term_cols * 0.5)))
+    inner_width = panel_width - 2
+
+    title_left = f"{C.BOLD}SELECT PROVIDER{C.RESET}"
+    title_right = f"{C.DIM}esc cancel{C.RESET}"
+    title_gap = max(1, inner_width - _visible_len(title_left) - _visible_len(title_right))
+    title_line = title_left + (" " * title_gap) + title_right
+
+    lines: list[str] = []
+    lines.append("┌" + "─" * inner_width + "┐")
+    lines.append(_panel_line(title_line, inner_width))
+    lines.append(_panel_line("", inner_width))
+
+    for idx, p in enumerate(providers):
+        num = idx + 1
+        display_name = {
+            "openrouter": "OpenRouter",
+            "cloudflare": "Cloudflare",
+            "gemini": "Gemini",
+            "groq": "Groq",
+            "together": "Together",
+            "cerebras": "Cerebras",
+            "novita": "Novita",
+            "ollama": "Ollama"
+        }.get(p, p.title())
+        
+        row = f"  {num}. {display_name}"
+        if idx == selected:
+            lines.append(f"│{_PICK_SEL_BG}{_PICK_SEL_FG}{_ansi_pad(row, inner_width)}{C.RESET}│")
+        else:
+            lines.append(_panel_line(row, inner_width))
+
+    lines.append(_panel_line("", inner_width))
+    hint = f"{C.DIM}↑/↓ move • Enter select • digits jump{C.RESET}"
+    lines.append(_panel_line(hint, inner_width))
+    lines.append("└" + "─" * inner_width + "┘")
+
+    screen = _center_block(lines, term_cols, term_rows)
+    _stdout_write(screen)
+
+
+def select_provider_interactive(providers: list[str]) -> Optional[str]:
+    use_picker = (
+        sys.stdin.isatty()
+        and sys.stdout.isatty()
+        and (
+            (os.name == "nt" and msvcrt is not None)
+            or (os.name != "nt" and termios is not None and tty is not None)
+        )
+    )
+
+    if not use_picker:
+        cprint(f"{C.INFO}Available Providers:{C.RESET}")
+        for i, p in enumerate(providers, 1):
+            cprint(f"  {i}. {p}")
+        while True:
+            try:
+                choice = input(f"{_rl(C.INFO)}Select provider number (or 'c' to cancel): {_rl(C.RESET)}").strip()
+                if choice.lower() in ("c", "q", "cancel", "quit"):
+                    return None
+                if choice.isdigit():
+                    idx = int(choice)
+                    if 1 <= idx <= len(providers):
+                        return providers[idx - 1]
+                eprint(f"{C.WARN}Enter a number between 1 and {len(providers)}.{C.RESET}")
+            except (EOFError, KeyboardInterrupt):
+                cprint(f"\n{C.INFO}Cancelled.{C.RESET}")
+                return None
+
+    selected = 0
+    try:
+        _stdout_write("\033[?1049h\033[?25l")
+        with _RawTerminal():
+            while True:
+                _render_provider_picker(providers, selected)
+                key = _read_picker_key()
+                if not key:
+                    continue
+                if key == "UP":
+                    selected = (selected - 1) % len(providers)
+                elif key == "DOWN":
+                    selected = (selected + 1) % len(providers)
+                elif key == "ENTER":
+                    return providers[selected]
+                elif key == "ESC":
+                    return None
+                elif len(key) == 1 and key.isdigit():
+                    idx = int(key) - 1
+                    if 0 <= idx < len(providers):
+                        return providers[idx]
+    except KeyboardInterrupt:
+        return None
+    finally:
+        _stdout_write("\033[?25h\033[?1049l")
+
+
 def _render_model_picker(
     provider: str,
     all_models: list[str],
@@ -3243,7 +3341,7 @@ def print_usage() -> None:
     me = Path(sys.argv[0]).name
     cprint(f"""
 {C.INFO}Usage:{C.RESET}
-  python {me} <provider>[filter]...
+  python {me} [provider] [filter]...
 
 {C.INFO}Providers:{C.RESET}
   gemini  openrouter  groq  together  cerebras  novita  cloudflare  ollama
@@ -3568,16 +3666,22 @@ def main() -> None:
             sys.exit(f"Config error: {name}={val} must be between {lo} and {hi}")
 
     argv = sys.argv[1:]
-    if not argv or argv[0] in ("-h", "--help"):
+    if argv and argv[0] in ("-h", "--help"):
         print_usage()
         sys.exit(0)
 
-    provider = argv[0].lower()
-    filters = argv[1:]
-
-    if provider not in VALID_PROVIDERS:
-        cprint(f"{C.ERROR}Unknown provider '{provider}'. Choose from: {', '.join(VALID_PROVIDERS)}{C.RESET}")
-        sys.exit(1)
+    if not argv:
+        provider = select_provider_interactive(VALID_PROVIDERS)
+        if not provider:
+            cprint(f"{C.WARN}No provider selected. Exiting.{C.RESET}")
+            sys.exit(0)
+        filters = []
+    else:
+        provider = argv[0].lower()
+        filters = argv[1:]
+        if provider not in VALID_PROVIDERS:
+            cprint(f"{C.ERROR}Unknown provider '{provider}'. Choose from: {', '.join(VALID_PROVIDERS)}{C.RESET}")
+            sys.exit(1)
 
     api_key = API_KEYS.get(provider, "")
     if not check_placeholder_key(api_key, provider):
