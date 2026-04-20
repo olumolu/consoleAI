@@ -2778,7 +2778,7 @@ def build_payload(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _ChunkResult:
-    __slots__ = ("text", "think", "finish", "error", "tool_chunks")
+    __slots__ = ("text", "think", "finish", "error", "tool_chunks", "usage")
 
     def __init__(self) -> None:
         self.text = ""
@@ -2786,6 +2786,7 @@ class _ChunkResult:
         self.finish = ""
         self.error = ""
         self.tool_chunks: list[dict[str, Any]] =[]
+        self.usage: dict[str, int] = {}
 
 
 def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
@@ -2797,6 +2798,12 @@ def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
         r.think = msg_obj.get("thinking") or ""
         if obj.get("done") is True:
             r.finish = obj.get("done_reason") or "stop"
+            # Ollama reports token counts in the final done message
+            if obj.get("prompt_eval_count") or obj.get("eval_count"):
+                r.usage = {
+                    "prompt_tokens": obj.get("prompt_eval_count", 0),
+                    "completion_tokens": obj.get("eval_count", 0),
+                }
         for tc in msg_obj.get("tool_calls",[]):
             fn = tc.get("function", {})
             args_raw = fn.get("arguments", "")
@@ -2825,6 +2832,13 @@ def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
                 "arguments": tc_chunk.get("function", {}).get("arguments", ""),
             },
         })
+    # OpenAI-compat providers send usage in the final chunk
+    usage_obj = obj.get("usage")
+    if usage_obj and isinstance(usage_obj, dict):
+        r.usage = {
+            "prompt_tokens": usage_obj.get("prompt_tokens", 0),
+            "completion_tokens": usage_obj.get("completion_tokens", 0),
+        }
     return r
 
 def _parse_gemini_chunk(obj: dict[str, Any]) -> _ChunkResult:
@@ -2845,6 +2859,13 @@ def _parse_gemini_chunk(obj: dict[str, Any]) -> _ChunkResult:
             r.tool_chunks.append({"name": fc.get("name", ""), "args": fc.get("args", {})})
 
     r.finish = candidate.get("finishReason", "")
+    # Gemini reports usage metadata
+    usage_meta = obj.get("usageMetadata")
+    if usage_meta and isinstance(usage_meta, dict):
+        r.usage = {
+            "prompt_tokens": usage_meta.get("promptTokenCount", 0),
+            "completion_tokens": usage_meta.get("candidatesTokenCount", 0),
+        }
     return r
 
 
@@ -3039,7 +3060,7 @@ def stream_response(
     api_key: str,
     enable_tools: bool,
     enable_thinking: bool,
-) -> tuple[Optional[str], list[dict[str, Any]]]:
+) -> tuple[Optional[str], list[dict[str, Any]], dict[str, int]]:
     payload = build_payload(provider, model_id, history, is_openai_compat, enable_tools, enable_thinking)
     payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ep = ENDPOINTS[provider]
@@ -3072,6 +3093,7 @@ def stream_response(
     error_msg = ""
     interrupted = False
     done_received = False
+    response_usage: dict[str, int] = {}
 
     oai_tool_calls: dict[int, dict[str, Any]] = {}
     gem_tool_calls: list[dict[str, Any]] =[]
@@ -3164,6 +3186,9 @@ def stream_response(
                     if cr.finish and not finish_reason:
                         finish_reason = cr.finish
 
+                    if cr.usage:
+                        response_usage = cr.usage
+
                     renderer.feed_thinking(cr.think)
                     renderer.feed_text(cr.text)
 
@@ -3224,15 +3249,15 @@ def stream_response(
             eprint(f"{C.WARN}(Stream ended after partial output: {error_msg}){C.RESET}")
             full_text = renderer.full_text[:MAX_MESSAGE_LENGTH]
             clean = strip_think_tags(full_text)
-            return (clean if clean else ""), tool_calls_out
+            return (clean if clean else ""), tool_calls_out, response_usage
         cprint(f"{C.ERROR}{error_msg}{C.RESET}")
-        return None,[]
+        return None, [], response_usage
 
     full_text = renderer.full_text[:MAX_MESSAGE_LENGTH]
     clean = strip_think_tags(full_text)
     if not clean and not tool_calls_out and not interrupted:
-        return None,[]
-    return (clean if clean else ""), tool_calls_out
+        return None, [], response_usage
+    return (clean if clean else ""), tool_calls_out, response_usage
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3442,6 +3467,7 @@ def print_usage() -> None:
   /paste [text]
   /togglethinking
   /toggletools
+  /stats
   /help
   quit / exit
 """)
@@ -3460,6 +3486,7 @@ def print_chat_help() -> None:
   {C.BOLD}/paste [text]{C.RESET}
   {C.BOLD}/togglethinking{C.RESET}
   {C.BOLD}/toggletools{C.RESET}
+  {C.BOLD}/stats{C.RESET}                Show session token usage statistics
   {C.BOLD}/help{C.RESET}
   {C.BOLD}quit{C.RESET} / {C.BOLD}exit{C.RESET}
 
@@ -3494,6 +3521,11 @@ def chat_loop(
     attached_file = FileAttachment()
     thinking_on = enable_thinking
     tools_on = enable_tools
+
+    # Session-wide token usage tracking
+    session_prompt_tokens = 0
+    session_completion_tokens = 0
+    session_requests = 0
 
     def _banner() -> None:
         term_cols, _ = shutil.get_terminal_size((85, 24))
@@ -3590,6 +3622,17 @@ def chat_loop(
                 tools_on = not tools_on
                 cprint(f"{C.INFO}Tool calling {'enabled' if tools_on else 'disabled'}.{C.RESET}")
 
+            elif cmd == "/stats":
+                total = session_prompt_tokens + session_completion_tokens
+                cprint(f"{C.INFO}── Session Token Usage ──────────────────────────────{C.RESET}")
+                cprint(f"  {C.INFO}API requests:{C.RESET}      {session_requests}")
+                cprint(f"  {C.INFO}Prompt tokens:{C.RESET}     {session_prompt_tokens:,}")
+                cprint(f"  {C.INFO}Completion tokens:{C.RESET} {session_completion_tokens:,}")
+                cprint(f"  {C.INFO}Total tokens:{C.RESET}      {total:,}")
+                if not total:
+                    cprint(f"  {C.DIM}(Provider may not report usage in streaming mode){C.RESET}")
+                cprint(f"{C.INFO}────────────────────────────────────────────────────{C.RESET}")
+
             elif cmd == "/history":
                 cprint(f"{C.INFO}── History ({len(history)} messages) ─────────────────────{C.RESET}")
                 if not history:
@@ -3650,6 +3693,7 @@ def chat_loop(
         reviewed_domains: set[str] = set()
         original_user_input = user_input
         research_enforcements = 0
+        usage: dict[str, int] = {}
 
         try:
             while True:
@@ -3663,10 +3707,16 @@ def chat_loop(
                 if len(history) < old_history_len:
                     compact_from = max(0, compact_from - (old_history_len - len(history)))
 
-                ai_text, tool_calls = stream_response(
+                ai_text, tool_calls, usage = stream_response(
                     provider, model_id, history, is_openai_compat,
                     api_key, tools_on, thinking_on,
                 )
+
+                # Accumulate token usage
+                if usage:
+                    session_prompt_tokens += usage.get("prompt_tokens", 0)
+                    session_completion_tokens += usage.get("completion_tokens", 0)
+                session_requests += 1
 
                 if ai_text is None and not tool_calls:
                     if history and history[-1].get("role") == "user":
@@ -3724,6 +3774,10 @@ def chat_loop(
 
                 break
 
+        except KeyboardInterrupt:
+            eprint(f"\n{C.WARN}(Interrupted — rolling back to last stable state){C.RESET}")
+            history[:] = history_snapshot
+            tool_loop_ok = False
         except Exception as exc:
             eprint(f"{C.ERROR}Unexpected error during tool loop: {exc}{C.RESET}")
             history[:] = history_snapshot
@@ -3735,6 +3789,12 @@ def chat_loop(
             else:
                 clean_final = {"role": "assistant", "content": final_ai_text}
             history[compact_from:] =[clean_final]
+
+        # Show per-response token usage inline if available
+        if usage and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
+            pt = usage.get("prompt_tokens", 0)
+            ct = usage.get("completion_tokens", 0)
+            eprint(f"{C.DIM}[tokens: {pt:,} prompt + {ct:,} completion = {pt + ct:,} total]{C.RESET}")
 
         cprint("")
 
