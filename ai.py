@@ -28,9 +28,9 @@ Chat commands:
     /save <name>        Save session to ~/.chat_sessions/<name>.json
     /load <name>        Load a saved session
     /clear              Delete all saved sessions
-    /upload <path>      Attach an image to your next message
-    /image              Show currently attached image
-    /clearimage         Remove the attached image
+    /upload <path>      Attach a file (image, pdf, txt) to your next message
+    /file               Show currently attached file
+    /clearfile          Remove the attached file
     /paste[text]       Multi-line paste mode (end with ---)
     /togglethinking     Toggle reasoning/thinking output display
     /toggletools        Toggle tool calling on/off
@@ -854,20 +854,26 @@ def _fetch_page(url: str, timeout: int = 20) -> str:
 # IMAGE
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ImageAttachment:
+class FileAttachment:
     def __init__(self) -> None:
         self.path = ""
         self.base64 = ""
         self.mime = ""
+        self.text_content = ""
+        self.is_image = False
+        self.is_pdf = False
 
     def clear(self) -> None:
         self.path = ""
         self.base64 = ""
         self.mime = ""
+        self.text_content = ""
+        self.is_image = False
+        self.is_pdf = False
 
     @property
     def attached(self) -> bool:
-        return bool(self.base64)
+        return bool(self.base64 or self.text_content)
 
     def load(self, raw_path: str) -> bool:
         path = Path(raw_path.strip("'\""))
@@ -877,21 +883,43 @@ class ImageAttachment:
 
         size_mb = path.stat().st_size / (1024 * 1024)
         if size_mb > MAX_IMAGE_SIZE_MB:
-            eprint(f"{C.ERROR}Error: Image too large ({size_mb:.1f} MB). Max {MAX_IMAGE_SIZE_MB} MB.{C.RESET}")
+            eprint(f"{C.ERROR}Error: File too large ({size_mb:.1f} MB). Max {MAX_IMAGE_SIZE_MB} MB.{C.RESET}")
             return False
 
         mime, _ = mimetypes.guess_type(str(path))
+        ext = path.suffix.lower()
         if not mime:
             mime = {
                 ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                 ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
-            }.get(path.suffix.lower(), "")
+                ".pdf": "application/pdf",
+                ".txt": "text/plain", ".md": "text/plain", ".py": "text/plain", 
+                ".json": "application/json", ".csv": "text/csv", ".html": "text/html",
+            }.get(ext, "")
 
-        if mime not in SUPPORTED_MIME_TYPES:
+        if mime and (mime.startswith("text/") or mime in {"application/json", "application/xml"}) or ext in {".txt", ".md", ".py", ".json", ".csv", ".log", ".html"}:
+            try:
+                self.text_content = path.read_text(encoding="utf-8")
+                self.mime = mime or "text/plain"
+                self.path = str(path)
+                eprint(f"{C.INFO}✓ Attached text file: {path.name} ({len(self.text_content)} chars){C.RESET}")
+                return True
+            except UnicodeDecodeError:
+                eprint(f"{C.ERROR}Error: Text file is not valid UTF-8.{C.RESET}")
+                return False
+            except OSError as exc:
+                eprint(f"{C.ERROR}Error reading file: {exc}{C.RESET}")
+                return False
+
+        if mime == "application/pdf":
+            self.is_pdf = True
+        elif mime in SUPPORTED_MIME_TYPES:
+            self.is_image = True
+        else:
             eprint(f"{C.ERROR}Error: Unsupported type '{mime}'.{C.RESET}")
             return False
 
-        eprint(f"{C.IMAGE}Encoding image…{C.RESET}")
+        eprint(f"{C.IMAGE}Encoding file…{C.RESET}")
         try:
             raw = path.read_bytes()
             self.base64 = base64.b64encode(raw).decode("ascii")
@@ -900,7 +928,7 @@ class ImageAttachment:
             eprint(f"{C.IMAGE}✓ Attached: {path.name} ({mime}, {len(raw)//1024} KB){C.RESET}")
             return True
         except OSError as exc:
-            eprint(f"{C.ERROR}Error reading image: {exc}{C.RESET}")
+            eprint(f"{C.ERROR}Error reading file: {exc}{C.RESET}")
             return False
 
 
@@ -2662,23 +2690,32 @@ def select_model_interactive(
 # PAYLOADS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_user_message(text: str, image: ImageAttachment, provider: str, is_openai_compat: bool) -> Message:
-    if image.attached:
+def build_user_message(text: str, file: FileAttachment, provider: str, is_openai_compat: bool) -> Message:
+    if file.text_content:
+        full_text = f"{text}\n\n[Attached File: {Path(file.path).name}]\n```\n{file.text_content}\n```" if text else f"[Attached File: {Path(file.path).name}]\n```\n{file.text_content}\n```"
+        if not is_openai_compat:
+            return {"role": "user", "parts": [{"text": full_text}]}
+        return {"role": "user", "content": full_text}
+
+    if file.attached and (file.is_image or file.is_pdf):
+        if file.is_pdf and is_openai_compat:
+            eprint(f"{C.WARN}Warning: PDF attachments are natively supported only by Gemini. This may cause an API error with {provider}.{C.RESET}")
+
         if not is_openai_compat:
             return {
                 "role": "user",
                 "parts":[
                     {"text": text},
-                    {"inlineData": {"mimeType": image.mime, "data": image.base64}},
+                    {"inlineData": {"mimeType": file.mime, "data": file.base64}},
                 ],
             }
         if provider == "ollama":
-            return {"role": "user", "content": text, "images": [image.base64]}
+            return {"role": "user", "content": text, "images": [file.base64]}
         return {
             "role": "user",
             "content":[
                 {"type": "text", "text": text},
-                {"type": "image_url", "image_url": {"url": f"data:{image.mime};base64,{image.base64}"}},
+                {"type": "image_url", "image_url": {"url": f"data:{file.mime};base64,{file.base64}"}},
             ],
         }
 
@@ -2826,6 +2863,7 @@ class StreamRenderer:
         self._current_rows = 0
         self._used_ai_prefix = False
         self.first_chunk = True
+        self._text_buffer = ""
 
     def _clear_current_block(self) -> None:
         if self._current_rows <= 0:
@@ -2879,6 +2917,8 @@ class StreamRenderer:
             self._used_ai_prefix = True
             self.first_chunk = False
         if not self._in_think_display:
+            if self._line_buffer:
+                self._commit_current_line()
             _stdout_write(f"{C.THINK}[Thinking]\n┃ {C.RESET}{C.THINK}")
             self._in_think_display = True
             
@@ -2888,6 +2928,11 @@ class StreamRenderer:
     def _write_think(self, text: str) -> None:
         if not self.enable_thinking:
             return
+        if not self._in_think_display:
+            if self._line_buffer:
+                self._commit_current_line()
+            _stdout_write(f"{C.THINK}[Thinking]\n┃ {C.RESET}{C.THINK}")
+            self._in_think_display = True
         indented = text.replace("\n", f"\n{C.THINK}┃ {C.RESET}{C.THINK}")
         _stdout_write(f"{C.THINK}{indented}{C.RESET}")
 
@@ -2897,47 +2942,86 @@ class StreamRenderer:
         if self.first_chunk:
             _stdout_write(C.CLR)
             self.first_chunk = False
+
+        self.full_text += text_tok
+        self._text_buffer += text_tok
+
+        while self._text_buffer:
+            if self.is_thinking:
+                close = self._text_buffer.find("</think")
+                if close != -1:
+                    self._write_think(self._text_buffer[:close])
+                    if self._in_think_display:
+                        _stdout_write(f"{C.RESET}\n\n")
+                        self._in_think_display = False
+                    self.is_thinking = False
+                    
+                    after = self._text_buffer[close + 7:]
+                    b = after.find(">")
+                    if b != -1:
+                        self._text_buffer = after[b + 1:]
+                    else:
+                        self._text_buffer = "</think" + after
+                        break
+                else:
+                    partial = False
+                    for i in range(7, 0, -1):
+                        if self._text_buffer.endswith("</think"[:i]):
+                            split_at = len(self._text_buffer) - i
+                            self._write_think(self._text_buffer[:split_at])
+                            self._text_buffer = self._text_buffer[split_at:]
+                            partial = True
+                            break
+                    if not partial:
+                        self._write_think(self._text_buffer)
+                        self._text_buffer = ""
+                    else:
+                        break
+            else:
+                if self._in_think_display and not self._text_buffer.startswith("<think"):
+                    _stdout_write(f"{C.RESET}\n\n")
+                    self._in_think_display = False
+
+                open_idx = self._text_buffer.find("<think")
+                if open_idx != -1:
+                    before = self._text_buffer[:open_idx]
+                    if before:
+                        self._flush_text(before)
+                    self.is_thinking = True
+                    after = self._text_buffer[open_idx + 6:]
+                    b = after.find(">")
+                    if b != -1:
+                        self._text_buffer = after[b + 1:]
+                    else:
+                        self._text_buffer = "<think" + after
+                        break
+                else:
+                    partial = False
+                    for i in range(6, 0, -1):
+                        if self._text_buffer.endswith("<think"[:i]):
+                            split_at = len(self._text_buffer) - i
+                            self._flush_text(self._text_buffer[:split_at])
+                            self._text_buffer = self._text_buffer[split_at:]
+                            partial = True
+                            break
+                    if not partial:
+                        self._flush_text(self._text_buffer)
+                        self._text_buffer = ""
+                    else:
+                        break
+
+    def finalize(self) -> None:
+        if self._text_buffer:
+            if self.is_thinking:
+                self._write_think(self._text_buffer)
+            else:
+                self._flush_text(self._text_buffer)
+            self._text_buffer = ""
+            
         if self._in_think_display:
             _stdout_write(f"{C.RESET}\n\n")
             self._in_think_display = False
-
-        self.full_text += text_tok
-        remaining = text_tok
-
-        while remaining:
-            if self.is_thinking:
-                close = remaining.find("</think")
-                if close != -1:
-                    self._write_think(remaining[:close])
-                    _stdout_write(f"{C.RESET}\n\n")
-                    self.is_thinking = False
-                    self._in_think_display = False
-                    after = remaining[close + 7:]
-                    b = after.find(">")
-                    remaining = after[b + 1:] if b != -1 else ""
-                else:
-                    self._write_think(remaining)
-                    remaining = ""
-            else:
-                open_idx = remaining.find("<think")
-                if open_idx != -1:
-                    before = remaining[:open_idx]
-                    if before:
-                        self._flush_text(before)
-                    if self._line_buffer:
-                        self._commit_current_line()
-                    if self.enable_thinking:
-                        _stdout_write(f"{C.THINK}[Thinking]\n┃ {C.RESET}{C.THINK}")
-                        self._in_think_display = True
-                    self.is_thinking = True
-                    after = remaining[open_idx + 6:]
-                    b = after.find(">")
-                    remaining = after[b + 1:] if b != -1 else ""
-                else:
-                    self._flush_text(remaining)
-                    remaining = ""
-
-    def finalize(self) -> None:
+            
         if self._line_buffer:
             self._commit_current_line()
         MD_RENDERER.in_code_block = False
@@ -3353,8 +3437,8 @@ def print_usage() -> None:
   /load <name>
   /clear
   /upload <path>
-  /image
-  /clearimage
+  /file
+  /clearfile
   /paste [text]
   /togglethinking
   /toggletools
@@ -3371,8 +3455,8 @@ def print_chat_help() -> None:
   {C.BOLD}/load <name>{C.RESET}
   {C.BOLD}/clear{C.RESET}
   {C.BOLD}/upload <path>{C.RESET}
-  {C.BOLD}/image{C.RESET}
-  {C.BOLD}/clearimage{C.RESET}
+  {C.BOLD}/file{C.RESET}
+  {C.BOLD}/clearfile{C.RESET}
   {C.BOLD}/paste [text]{C.RESET}
   {C.BOLD}/togglethinking{C.RESET}
   {C.BOLD}/toggletools{C.RESET}
@@ -3407,7 +3491,7 @@ def chat_loop(
         atexit.register(_save_readline_history)
 
     history: History = init_history(is_openai_compat)
-    image = ImageAttachment()
+    attached_file = FileAttachment()
     thinking_on = enable_thinking
     tools_on = enable_tools
 
@@ -3443,7 +3527,7 @@ def chat_loop(
     _banner()
 
     while True:
-        img_tag = f"[{_rl(C.IMAGE)}📎 {Path(image.path).name}{_rl(C.RESET)}] " if image.attached else ""
+        img_tag = f"[{_rl(C.IMAGE)}📎 {Path(attached_file.path).name}{_rl(C.RESET)}] " if attached_file.attached else ""
         prompt = f"{img_tag}{_rl(C.BOLD)}{_rl(C.USER)}You:{_rl(C.RESET)} "
         raw = read_multiline_input(prompt)
         if raw is None:
@@ -3484,19 +3568,19 @@ def chat_loop(
 
             elif cmd == "/upload":
                 if not args:
-                    eprint(f"{C.IMAGE}Usage: /upload <image_path>{C.RESET}")
+                    eprint(f"{C.IMAGE}Usage: /upload <file_path>{C.RESET}")
                 else:
-                    image.load(args)
+                    attached_file.load(args)
 
-            elif cmd == "/image":
-                if image.attached:
-                    cprint(f"{C.IMAGE}Attached: {image.path} ({image.mime}){C.RESET}")
+            elif cmd == "/file":
+                if attached_file.attached:
+                    cprint(f"{C.IMAGE}Attached: {attached_file.path} ({attached_file.mime}){C.RESET}")
                 else:
-                    cprint(f"{C.IMAGE}No image attached.{C.RESET}")
+                    cprint(f"{C.IMAGE}No file attached.{C.RESET}")
 
-            elif cmd == "/clearimage":
-                image.clear()
-                cprint(f"{C.IMAGE}Image cleared.{C.RESET}")
+            elif cmd == "/clearfile":
+                attached_file.clear()
+                cprint(f"{C.IMAGE}File cleared.{C.RESET}")
 
             elif cmd == "/togglethinking":
                 thinking_on = not thinking_on
@@ -3542,17 +3626,17 @@ def chat_loop(
             if handled:
                 continue
 
-        if not user_input and not image.attached:
+        if not user_input and not attached_file.attached:
             continue
-        if not user_input and image.attached:
-            user_input = "Describe this image in detail."
+        if not user_input and attached_file.attached:
+            user_input = "Please review the attached file."
         if len(user_input) > MAX_MESSAGE_LENGTH:
             eprint(f"{C.ERROR}Message too long ({len(user_input):,} chars).{C.RESET}")
             continue
 
         eprint(f"{C.INFO}[Sending…]{C.RESET}")
-        user_msg = build_user_message(user_input, image, provider, is_openai_compat)
-        image.clear()
+        user_msg = build_user_message(user_input, attached_file, provider, is_openai_compat)
+        attached_file.clear()
 
         history_snapshot = list(history)
         history.append(user_msg)
@@ -3574,7 +3658,10 @@ def chat_loop(
                     eprint(f"{C.ERROR}Tool loop limit reached.{C.RESET}")
                     break
 
+                old_history_len = len(history)
                 history = truncate_history(history, is_openai_compat)
+                if len(history) < old_history_len:
+                    compact_from = max(0, compact_from - (old_history_len - len(history)))
 
                 ai_text, tool_calls = stream_response(
                     provider, model_id, history, is_openai_compat,
