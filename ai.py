@@ -15,10 +15,10 @@ Features:
   - Live model switching (/model command)
   - History compaction (tool messages auto-collapsed after each exchange)
   - SSRF protection with DNS-pinning
-  - Interactive UI for settings and model selection
+  - Interactive UI for settings, provider, and model selection
 
 Usage:
-    python ai.py <provider> [filter]...
+    python ai.py [provider] [filter]...
 
 Providers: gemini, openrouter, groq, together, cerebras, novita, cloudflare, ollama
 
@@ -91,7 +91,6 @@ try:
 except ImportError:
     msvcrt = None
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,7 +106,7 @@ API_KEYS: dict[str, str] = {
     "cerebras":   "",   # https://cloud.cerebras.ai/
     "novita":     "",   # https://novita.ai/
     "ollama":     "",   # https://ollama.com/ (leave blank for local)
-    "cloudflare": "",   # https://dash.cloudflare.com -> Format: ACCOUNT_ID:API_TOKEN
+    "cloudflare": "",   # https://dash.cloudflare.com Format: ACCOUNT_ID:API_TOKEN
 }
 
 MAX_HISTORY_MESSAGES = 20
@@ -176,7 +175,6 @@ class C:
     TOOL   = "\033[38;5;141m"
     CLR    = "\033[2K\r"
 
-
 def _rl(code: str) -> str:
     return f"\001{code}\002"
 
@@ -187,24 +185,20 @@ def _rl(code: str) -> str:
 
 _STDOUT_LOCK = threading.Lock()
 
-
 def cprint(msg: str, end: str = "\n") -> None:
     with _STDOUT_LOCK:
         sys.stdout.write(msg + end)
         sys.stdout.flush()
-
 
 def eprint(msg: str) -> None:
     with _STDOUT_LOCK:
         sys.stderr.write(msg + "\n")
         sys.stderr.flush()
 
-
 def _stdout_write(text: str) -> None:
     with _STDOUT_LOCK:
         sys.stdout.write(text)
         sys.stdout.flush()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SSRF PROTECTION
@@ -226,7 +220,6 @@ def _is_ip_blocked(ip_str: str) -> bool:
     if isinstance(addr, ipaddress.IPv6Address) and addr.is_site_local:
         return True
     return False
-
 
 def _resolve_and_validate(hostname: str) -> str:
     blocked_hosts = {
@@ -251,7 +244,6 @@ def _resolve_and_validate(hostname: str) -> str:
 
     raise ValueError(f"All IPs for {hostname} resolve to private/reserved addresses")
 
-
 def _validate_url(url: str) -> tuple[bool, str]:
     try:
         parsed = urllib.parse.urlparse(url)
@@ -266,7 +258,6 @@ def _validate_url(url: str) -> tuple[bool, str]:
     except ValueError as exc:
         return False, str(exc)
     return True, ""
-
 
 class _SSRFSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(
@@ -342,7 +333,7 @@ class LatexRenderer:
         )
         self._display_pat = re.compile(r'\$\$(.+?)\$\$|\\\[(.+?)\\\]', re.DOTALL)
         self._inline_pat = re.compile(r'\$(.+?)\$')
-        self._frac_inner = re.compile(r'\\frac\{([^{}]+)\}\{([^{}]+)\}')
+        self._frac_inner = re.compile(r'\\frac\{((?:[^{}]|\{[^{}]*\})+)\}\{((?:[^{}]|\{[^{}]*\})+)\}')
         self._frac_outer = re.compile(r'\\frac\{([^}]+)\}\{([^}]+)\}')
         self._sup_brace = re.compile(r'\^\{([^}]+)\}')
         self._sup_single = re.compile(r'\^([a-zA-Z0-9])')
@@ -375,7 +366,6 @@ class LatexRenderer:
         }.items():
             tex = tex.replace(cmd, sym)
         return tex
-
 
 class MarkdownRenderer:
     def __init__(self) -> None:
@@ -480,7 +470,6 @@ def truncate(s: str, n: int) -> str:
         return ""
     return s[:n - 3] + "..." if len(s) > n else s
 
-
 def validate_session_name(name: str) -> bool:
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
         eprint(f"{C.ERROR}Error: Session name may only contain letters, numbers, dash, underscore.{C.RESET}")
@@ -489,7 +478,6 @@ def validate_session_name(name: str) -> bool:
         eprint(f"{C.ERROR}Error: Session name too long (max 100 chars).{C.RESET}")
         return False
     return True
-
 
 def check_placeholder_key(key: str, provider: str) -> bool:
     if provider == "ollama":
@@ -513,26 +501,13 @@ def check_placeholder_key(key: str, provider: str) -> bool:
         return False
     return True
 
-
 def strip_think_tags(text: str) -> str:
-    result, remaining = "", text
-    while remaining:
-        start = remaining.find("<think")
-        if start == -1:
-            result += remaining
-            break
-        result += remaining[:start]
-        after_open = remaining[start + 6:]
-        bracket = after_open.find(">")
-        remaining = after_open[bracket + 1:] if bracket != -1 else ""
-        close = remaining.find("</think")
-        if close == -1:
-            break
-        after_close = remaining[close + 7:]
-        bracket2 = after_close.find(">")
-        remaining = after_close[bracket2 + 1:] if bracket2 != -1 else ""
-    return result
-
+    # Use re.I for "case-insensitive" and .*? for "non-greedy" matching
+    # This handles <think>, <THINK>, and even <think extra_info>
+    text = re.sub(r"<think.*?>.*?</think.*?>", "", text, flags=re.DOTALL | re.I)
+    # This catches a <think> block that started but never finished
+    text = re.sub(r"<think.*?>.*$", "", text, flags=re.DOTALL | re.I)
+    return text.strip()
 
 def filter_models(models: list[str], filters: list[str]) -> list[str]:
     if not filters:
@@ -544,17 +519,14 @@ def filter_models(models: list[str], filters: list[str]) -> list[str]:
             out.append(model)
     return out
 
-
 def _read_chunk(resp: Any, size: int = 8192) -> bytes:
     try:
         return resp.read1(size)
     except AttributeError:
         return resp.read(size)
 
-
 def _is_length_finish(reason: str) -> bool:
     return (reason or "").strip() in {"length", "max_tokens", "MAX_TOKENS", "max_output_tokens"}
-
 
 def _save_readline_history() -> None:
     if not _READLINE_AVAILABLE:
@@ -564,23 +536,21 @@ def _save_readline_history() -> None:
     except OSError:
         pass
 
-
 def _args_to_obj(arguments: str) -> dict[str, Any]:
     if not arguments or arguments.isspace():
         return {}
     try:
         obj = json.loads(arguments)
         return obj if isinstance(obj, dict) else {}
-    except (json.JSONDecodeError, TypeError):
-        return {}
-
+    except (json.JSONDecodeError, TypeError) as e:
+        # Pass the error back so the AI knows it made a mistake and can fix it!
+        return {"error": f"Invalid JSON format: {str(e)}"}
 
 def _args_display(arguments: str) -> str:
     obj = _args_to_obj(arguments)
     if not obj:
         return ""
     return json.dumps(obj, ensure_ascii=False, separators=(", ", ": "))
-
 
 def _decompress(data: bytes, encoding: str) -> bytes:
     enc = (encoding or "").lower()
@@ -595,7 +565,6 @@ def _decompress(data: bytes, encoding: str) -> bytes:
     except Exception:
         pass
     return data
-
 
 def _make_opener() -> urllib.request.OpenerDirector:
     jar = http.cookiejar.CookieJar()
@@ -644,7 +613,6 @@ class TextExtractor(HTMLParser):
         lines =[line for line in lines if line]
         return "\n\n".join(lines)
 
-
 def _clean_html(raw: str) -> str:
     if not raw:
         return ""
@@ -657,6 +625,79 @@ def _clean_html(raw: str) -> str:
         text = _html.unescape(text)
         return re.sub(r"\s+", " ", text).strip()
 
+class _ContentExtractor(HTMLParser):
+    """Two-pass content extractor: targets semantic tags, falls back to full page if thin."""
+    TARGET_TAGS = {'article', 'main', 'section'}
+    CONTENT_IDS = {
+        'content', 'main', 'article', 'post', 'entry',
+        'body', 'story', 'docs', 'doc', 'markdown',
+    }
+    SKIP_TAGS = {
+        'script', 'style', 'noscript', 'svg', 'iframe',
+        'template', 'nav', 'footer', 'header', 'aside',
+    }
+    BLOCK_TAGS = {
+        'div', 'p', 'br', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'li', 'tr', 'pre', 'blockquote', 'ul', 'ol', 'hr', 'table',
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skip_depth = 0
+        self._scope_depth = 0
+        self._scope_stack: list[bool] = []
+
+    def _is_content_div(self, attrs: list[tuple[str, Optional[str]]]) -> bool:
+        for name, val in attrs:
+            if name in ('id', 'class') and val:
+                tokens = val.lower().replace('-', ' ').replace('_', ' ').split()
+                if any(t in self.CONTENT_IDS for t in tokens):
+                    return True
+        return False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if tag in self.SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if self._skip_depth > 0:
+            return
+
+        in_scope = (
+            tag in self.TARGET_TAGS
+            or (tag == 'div' and self._is_content_div(attrs))
+        )
+        self._scope_stack.append(in_scope)
+        if in_scope:
+            self._scope_depth += 1
+
+        if tag in self.BLOCK_TAGS and self._scope_depth > 0:
+            self.parts.append('\n')
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.SKIP_TAGS:
+            if self._skip_depth > 0:
+                self._skip_depth -= 1
+            return
+        if self._skip_depth > 0:
+            return
+
+        if self._scope_stack:
+            was_scoped = self._scope_stack.pop()
+            if was_scoped:
+                self._scope_depth = max(0, self._scope_depth - 1)
+
+        if tag in self.BLOCK_TAGS and self._scope_depth > 0:
+            self.parts.append('\n')
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0 and self._scope_depth > 0:
+            self.parts.append(data)
+
+    def get_text(self) -> str:
+        raw = ''.join(self.parts)
+        lines = [re.sub(r'[ \t]+', ' ', ln.strip()) for ln in raw.split('\n')]
+        return '\n\n'.join(ln for ln in lines if ln)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TOOL SPINNER
@@ -702,7 +743,6 @@ class _ToolProgress:
             _stdout_write(f"{C.CLR}{C.TOOL}   {frame} {status}{C.RESET} {C.DIM}({elapsed:.1f}s){C.RESET}")
             self._stop.wait(0.08)
             i += 1
-
 
 _PROGRESS = _ToolProgress()
 
@@ -767,7 +807,6 @@ _FETCH_HEADERS_FALLBACK = {
     "Accept-Encoding": "identity",
 }
 
-
 def _fetch_page(url: str, timeout: int = 20) -> str:
     ok, err = _validate_url(url)
     if not ok:
@@ -778,14 +817,18 @@ def _fetch_page(url: str, timeout: int = 20) -> str:
     for headers in (_FETCH_HEADERS_PRIMARY, _FETCH_HEADERS_FALLBACK):
         req = urllib.request.Request(url, headers=headers)
         try:
-            with _URL_OPENER.open(req, timeout=timeout) as resp:
+            # Create a fresh, clean cookie jar for every single website visit
+            fresh_opener = _make_opener()
+            with fresh_opener.open(req, timeout=timeout) as resp:
                 cl = resp.headers.get("Content-Length")
                 if cl:
                     try:
-                        if int(cl) > FETCH_MAX_BYTES:
-                            raise ValueError("Response too large")
+                        cl_int = int(cl)
                     except ValueError:
-                        pass
+                        cl_int = 0
+                    
+                    if cl_int > FETCH_MAX_BYTES:
+                        raise RuntimeError(f"Response too large: {cl_int} bytes")
                 raw = resp.read(FETCH_MAX_BYTES + 1)
                 if len(raw) > FETCH_MAX_BYTES:
                     raw = raw[:FETCH_MAX_BYTES]
@@ -877,7 +920,6 @@ _STOPWORDS = {
     "many", "much", "very",
 }
 
-
 def _tokenize(text: str) -> list[str]:
     raw = (text or "").strip()
     tokens = re.findall(r"[a-z0-9]{2,}", raw.lower())
@@ -885,7 +927,6 @@ def _tokenize(text: str) -> list[str]:
         return tokens
     filtered =[t for t in tokens if t not in _STOPWORDS]
     return filtered or tokens
-
 
 def _domain_of(url: str) -> str:
     try:
@@ -895,7 +936,6 @@ def _domain_of(url: str) -> str:
     if host.startswith("www."):
         host = host[4:]
     return host
-
 
 def _normalize_url(url: str) -> str:
     try:
@@ -919,7 +959,6 @@ def _normalize_url(url: str) -> str:
     ]
     query = urllib.parse.urlencode(qs, doseq=True)
     return urllib.parse.urlunparse((scheme, netloc, path, "", query, ""))
-
 
 def _unwrap_result_url(url: str) -> str:
     url = _html.unescape(url or "").strip()
@@ -946,7 +985,6 @@ def _unwrap_result_url(url: str) -> str:
                 return cand
     return url
 
-
 def _should_skip_result(url: str) -> bool:
     host = _domain_of(url)
     if not host:
@@ -956,7 +994,6 @@ def _should_skip_result(url: str) -> bool:
     if any(bad in host for bad in ("facebook.com", "instagram.com", "pinterest.", "tiktok.com")):
         return True
     return False
-
 
 def _domain_quality_bonus(url: str) -> float:
     host = _domain_of(url)
@@ -980,7 +1017,6 @@ def _domain_quality_bonus(url: str) -> float:
     if "quora.com" in host:
         score -= 2.0
     return score
-
 
 def _score_text(query: str, title: str = "", snippet: str = "", url: str = "", body: str = "") -> float:
     q_tokens = _tokenize(query)
@@ -1010,7 +1046,6 @@ def _score_text(query: str, title: str = "", snippet: str = "", url: str = "", b
     score += _domain_quality_bonus(url)
     return score
 
-
 def _query_variants(query: str) -> list[str]:
     q = (query or "").strip()
     if not q:
@@ -1037,7 +1072,6 @@ def _query_variants(query: str) -> list[str]:
             seen.add(k)
             dedup.append(item)
     return dedup
-
 
 def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> list[str]:
     paras =[p.strip() for p in re.split(r"\n{2,}", text or "") if p.strip()]
@@ -1075,7 +1109,6 @@ def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> list[s
         push(cur)
     return chunks
 
-
 def _best_excerpts(query: str, title: str, url: str, text: str, max_chunks: int = 4) -> list[str]:
     chunks = _chunk_text(text)
     if not chunks:
@@ -1093,33 +1126,25 @@ def _best_excerpts(query: str, title: str, url: str, text: str, max_chunks: int 
             break
     return out
 
-
 def _extract_title_and_text(raw_html: str) -> tuple[str, str]:
-    title = ""
-    m = re.search(r"<title[^>]*>(.*?)</title>", raw_html, flags=re.I | re.S)
+    title = ''
+    m = re.search(r'<title[^>]*>(.*?)</title>', raw_html, flags=re.I | re.S)
     if m:
-        title = re.sub(r"\s+", " ", _clean_html(m.group(1))).strip()
+        title = re.sub(r'\s+', ' ', _clean_html(m.group(1))).strip()
 
-    candidates: list[str] =[]
-    patterns =[
-        r"<article[^>]*>(.*?)</article>",
-        r"<main[^>]*>(.*?)</main>",
-        r"<section[^>]*>(.*?)</section>",
-        r'<div[^>]+(?:id|class)=["\'][^"\']*(?:article|content|post|entry|body|main|markdown|docs?|story)[^"\']*["\'][^>]*>(.*?)</div>',
-    ]
-    for pat in patterns:
-        for mm in re.finditer(pat, raw_html, flags=re.I | re.S):
-            cleaned = _clean_html(mm.group(1))
-            if len(cleaned) > 200:
-                candidates.append(cleaned)
+    # Pass 1: Scoped extraction (targets <article>, <main>, content divs)
+    scoped_parser = _ContentExtractor()
+    try:
+        scoped_parser.feed(raw_html)
+        scoped_text = scoped_parser.get_text()
+    except Exception:
+        scoped_text = ''
 
-    whole = _clean_html(raw_html)
-    if whole:
-        candidates.append(whole)
+    # Pass 2: Fallback to full page if scoped content is too thin
+    if len(scoped_text) >= 500:
+        return title, scoped_text
 
-    best = max(candidates, key=len) if candidates else ""
-    return title, best
-
+    return title, _clean_html(raw_html)
 
 def _fetch_page_text(url: str) -> tuple[str, str]:
     url = _normalize_url(url)
@@ -1130,7 +1155,6 @@ def _fetch_page_text(url: str) -> tuple[str, str]:
     title, text = _extract_title_and_text(raw)
     PAGE_CACHE[url] = (title, text)
     return title, text
-
 
 def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, Any]]:
     cache_key = f"sp::{query}::{limit}"
@@ -1244,7 +1268,6 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
     SEARCH_CACHE[cache_key] = out
     return out[:limit]
 
-
 def _search_candidates(query: str, max_sources: int) -> list[dict[str, Any]]:
     variants = _query_variants(query)[:4]
     all_rows: list[dict[str, Any]] =[]
@@ -1282,7 +1305,6 @@ def _search_candidates(query: str, max_sources: int) -> list[dict[str, Any]]:
             fallback.append(item)
 
     return (primary + fallback)[:RESEARCH_MAX_CANDIDATES]
-
 
 def _fetch_source_batch(batch: list[dict[str, Any]], query: str) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     ok_rows: list[dict[str, Any]] =[]
@@ -1331,7 +1353,6 @@ def _fetch_source_batch(batch: list[dict[str, Any]], query: str) -> tuple[list[d
         t.join(timeout=22)
 
     return ok_rows, bad_rows
-
 
 def _research_sources(query: str, max_sources: int) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, Any]]]:
     max_sources = max(1, min(max_sources, RESEARCH_MAX_SOURCES))
@@ -1384,7 +1405,6 @@ def _research_sources(query: str, max_sources: int) -> tuple[list[dict[str, Any]
 
 def tool_get_time(**kwargs: Any) -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
 
 _CALC_MAX_EXPONENT = 10_000
 _CALC_MAX_RESULT = 1e308
@@ -1457,7 +1477,10 @@ def tool_calculator(expression: str = "", **kwargs: Any) -> str:
     if not expression.strip():
         return "Error: No expression provided."
     try:
-        expression = expression.replace("^", "**")
+        # Only replace ^ if it's not being used as a valid Python BitXor operator
+        if "^" in expression and "**" not in expression:
+            expression = expression.replace("^", "**")
+            
         tree = ast.parse(expression, mode="eval")
         result = _eval_node(tree.body)
         if isinstance(result, float) and result == int(result) and not math.isinf(result):
@@ -2229,6 +2252,104 @@ def _interactive_confirm(prompt: str, default: bool = True, color: str = C.INFO)
         _stdout_write("\033[?25h")  # ALWAYS restore cursor
 
 
+def _render_provider_picker(providers: list[str], selected: int) -> None:
+    term_cols, term_rows = shutil.get_terminal_size((100, 30))
+    panel_width = min(60, max(44, int(term_cols * 0.5)))
+    inner_width = panel_width - 2
+
+    title_left = f"{C.BOLD}SELECT PROVIDER{C.RESET}"
+    title_right = f"{C.DIM}esc cancel{C.RESET}"
+    title_gap = max(1, inner_width - _visible_len(title_left) - _visible_len(title_right))
+    title_line = title_left + (" " * title_gap) + title_right
+
+    lines: list[str] = []
+    lines.append("┌" + "─" * inner_width + "┐")
+    lines.append(_panel_line(title_line, inner_width))
+    lines.append(_panel_line("", inner_width))
+
+    for idx, p in enumerate(providers):
+        num = idx + 1
+        display_name = {
+            "openrouter": "OpenRouter",
+            "cloudflare": "Cloudflare",
+            "gemini": "Gemini",
+            "groq": "Groq",
+            "together": "Together",
+            "cerebras": "Cerebras",
+            "novita": "Novita",
+            "ollama": "Ollama"
+        }.get(p, p.title())
+        
+        row = f"  {num}. {display_name}"
+        if idx == selected:
+            lines.append(f"│{_PICK_SEL_BG}{_PICK_SEL_FG}{_ansi_pad(row, inner_width)}{C.RESET}│")
+        else:
+            lines.append(_panel_line(row, inner_width))
+
+    lines.append(_panel_line("", inner_width))
+    hint = f"{C.DIM}↑/↓ move • Enter select • digits jump{C.RESET}"
+    lines.append(_panel_line(hint, inner_width))
+    lines.append("└" + "─" * inner_width + "┘")
+
+    screen = _center_block(lines, term_cols, term_rows)
+    _stdout_write(screen)
+
+
+def select_provider_interactive(providers: list[str]) -> Optional[str]:
+    use_picker = (
+        sys.stdin.isatty()
+        and sys.stdout.isatty()
+        and (
+            (os.name == "nt" and msvcrt is not None)
+            or (os.name != "nt" and termios is not None and tty is not None)
+        )
+    )
+
+    if not use_picker:
+        cprint(f"{C.INFO}Available Providers:{C.RESET}")
+        for i, p in enumerate(providers, 1):
+            cprint(f"  {i}. {p}")
+        while True:
+            try:
+                choice = input(f"{_rl(C.INFO)}Select provider number (or 'c' to cancel): {_rl(C.RESET)}").strip()
+                if choice.lower() in ("c", "q", "cancel", "quit"):
+                    return None
+                if choice.isdigit():
+                    idx = int(choice)
+                    if 1 <= idx <= len(providers):
+                        return providers[idx - 1]
+                eprint(f"{C.WARN}Enter a number between 1 and {len(providers)}.{C.RESET}")
+            except (EOFError, KeyboardInterrupt):
+                cprint(f"\n{C.INFO}Cancelled.{C.RESET}")
+                return None
+
+    selected = 0
+    try:
+        _stdout_write("\033[?1049h\033[?25l")
+        with _RawTerminal():
+            while True:
+                _render_provider_picker(providers, selected)
+                key = _read_picker_key()
+                if not key:
+                    continue
+                if key == "UP":
+                    selected = (selected - 1) % len(providers)
+                elif key == "DOWN":
+                    selected = (selected + 1) % len(providers)
+                elif key == "ENTER":
+                    return providers[selected]
+                elif key == "ESC":
+                    return None
+                elif len(key) == 1 and key.isdigit():
+                    idx = int(key) - 1
+                    if 0 <= idx < len(providers):
+                        return providers[idx]
+    except KeyboardInterrupt:
+        return None
+    finally:
+        _stdout_write("\033[?25h\033[?1049l")
+
+
 def _render_model_picker(
     provider: str,
     all_models: list[str],
@@ -2669,7 +2790,6 @@ def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
         })
     return r
 
-
 def _parse_gemini_chunk(obj: dict[str, Any]) -> _ChunkResult:
     r = _ChunkResult()
     candidate = (obj.get("candidates") or [{}])[0]
@@ -3077,7 +3197,6 @@ def _append_assistant_turn(
         asst_msg["tool_calls"] = tool_calls
     history.append(asst_msg)
 
-
 def _append_tool_results(
     history: History,
     tool_calls: list[dict[str, Any]],
@@ -3110,7 +3229,6 @@ def _append_tool_results(
             "name": tc["function"]["name"],
             "content": result,
         })
-
 
 def _extract_display_text(msg: Message) -> str:
     role = msg.get("role", "")
@@ -3146,7 +3264,6 @@ def _extract_display_text(msg: Message) -> str:
 def _extract_urls_from_tool_output(text: str) -> list[str]:
     return re.findall(r"^URL:\s*(https?://\S+)", text or "", flags=re.M)
 
-
 def _extract_domains_from_tool_output(text: str) -> set[str]:
     out: set[str] = set()
     for url in _extract_urls_from_tool_output(text):
@@ -3154,7 +3271,6 @@ def _extract_domains_from_tool_output(text: str) -> set[str]:
         if dom:
             out.add(dom)
     return out
-
 
 def _question_needs_web_research(text: str) -> bool:
     q = (text or "").strip().lower()
@@ -3198,7 +3314,6 @@ def read_multiline_input(initial_prompt: str, cont_prompt: str = "") -> Optional
     lines.append(line)
     return "\n".join(lines).strip()
 
-
 def read_paste_input(prefix: str = "") -> Optional[str]:
     cprint(f"{C.INFO}Paste mode — end with {C.BOLD}---{C.RESET}{C.INFO} on its own line to send:{C.RESET}")
     lines: list[str] =[]
@@ -3226,7 +3341,7 @@ def print_usage() -> None:
     me = Path(sys.argv[0]).name
     cprint(f"""
 {C.INFO}Usage:{C.RESET}
-  python {me} <provider>[filter]...
+  python {me} [provider] [filter]...
 
 {C.INFO}Providers:{C.RESET}
   gemini  openrouter  groq  together  cerebras  novita  cloudflare  ollama
@@ -3551,16 +3666,22 @@ def main() -> None:
             sys.exit(f"Config error: {name}={val} must be between {lo} and {hi}")
 
     argv = sys.argv[1:]
-    if not argv or argv[0] in ("-h", "--help"):
+    if argv and argv[0] in ("-h", "--help"):
         print_usage()
         sys.exit(0)
 
-    provider = argv[0].lower()
-    filters = argv[1:]
-
-    if provider not in VALID_PROVIDERS:
-        cprint(f"{C.ERROR}Unknown provider '{provider}'. Choose from: {', '.join(VALID_PROVIDERS)}{C.RESET}")
-        sys.exit(1)
+    if not argv:
+        provider = select_provider_interactive(VALID_PROVIDERS)
+        if not provider:
+            cprint(f"{C.WARN}No provider selected. Exiting.{C.RESET}")
+            sys.exit(0)
+        filters = []
+    else:
+        provider = argv[0].lower()
+        filters = argv[1:]
+        if provider not in VALID_PROVIDERS:
+            cprint(f"{C.ERROR}Unknown provider '{provider}'. Choose from: {', '.join(VALID_PROVIDERS)}{C.RESET}")
+            sys.exit(1)
 
     api_key = API_KEYS.get(provider, "")
     if not check_placeholder_key(api_key, provider):
@@ -3589,7 +3710,6 @@ def main() -> None:
         cprint(f"\n{C.WARN}Interrupted.{C.RESET}")
 
     cprint("👋 Session ended.")
-
 
 if __name__ == "__main__":
     main()
