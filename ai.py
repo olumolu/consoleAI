@@ -6,7 +6,7 @@ Pure stdlib, Python 3.9+. Zero pip installs required.
 Features:
   - Markdown rendering (Bold, Italic, Code, Fenced code blocks)
   - LaTeX rendering (Greek letters, superscripts, fractions → Unicode)
-  - Image attachment support (Vision models)
+  - File attachment support (Text, Code, PDF, Image)
   - Multi-line input (backslash continuation + /paste mode)
   - Multi-provider support (Gemini, OpenRouter, Groq, Together, etc.)
   - Tool/Function calling (Web search, fetch, Calculator, Time, Wikipedia)
@@ -16,9 +16,10 @@ Features:
   - History compaction (tool messages auto-collapsed after each exchange)
   - SSRF protection with DNS-pinning
   - Interactive UI for settings, provider, and model selection
+  - Smoothed terminal rendering to prevent flicker
 
 Usage:
-    python ai.py [provider] [filter]...
+    python ao.py [provider] [filter]... [--token]
 
 Providers: gemini, openrouter, groq, together, cerebras, novita, cloudflare, ollama
 
@@ -34,6 +35,7 @@ Chat commands:
     /paste[text]       Multi-line paste mode (end with ---)
     /togglethinking     Toggle reasoning/thinking output display
     /toggletools        Toggle tool calling on/off
+    /stats              Show session token usage statistics
     /help               Show available commands
     quit / exit         End the session
 """
@@ -643,10 +645,10 @@ class _ContentExtractor(HTMLParser):
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
+        self.parts: list[str] =[]
         self._skip_depth = 0
         self._scope_depth = 0
-        self._scope_stack: list[bool] = []
+        self._scope_stack: list[bool] =[]
 
     def _is_content_div(self, attrs: list[tuple[str, Optional[str]]]) -> bool:
         for name, val in attrs:
@@ -1728,7 +1730,7 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] =[
                     "query": {"type": "string"},
                     "num_results": {"type": "integer"},
                 },
-                "required": ["query"],
+                "required":["query"],
             },
         },
     },
@@ -2049,7 +2051,7 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
         elif provider == "ollama":
             models = [m["name"] for m in data.get("models",[])]
         elif provider == "together":
-            arr = data if isinstance(data, list) else data.get("data", [])
+            arr = data if isinstance(data, list) else data.get("data",[])
             models = sorted(m["id"] for m in arr)
         elif provider == "cloudflare":
             models = sorted(
@@ -2290,7 +2292,7 @@ def _render_provider_picker(providers: list[str], selected: int) -> None:
     title_gap = max(1, inner_width - _visible_len(title_left) - _visible_len(title_right))
     title_line = title_left + (" " * title_gap) + title_right
 
-    lines: list[str] = []
+    lines: list[str] =[]
     lines.append("┌" + "─" * inner_width + "┐")
     lines.append(_panel_line(title_line, inner_width))
     lines.append(_panel_line("", inner_width))
@@ -2694,7 +2696,7 @@ def build_user_message(text: str, file: FileAttachment, provider: str, is_openai
     if file.text_content:
         full_text = f"{text}\n\n[Attached File: {Path(file.path).name}]\n```\n{file.text_content}\n```" if text else f"[Attached File: {Path(file.path).name}]\n```\n{file.text_content}\n```"
         if not is_openai_compat:
-            return {"role": "user", "parts": [{"text": full_text}]}
+            return {"role": "user", "parts":[{"text": full_text}]}
         return {"role": "user", "content": full_text}
 
     if file.attached and (file.is_image or file.is_pdf):
@@ -2885,6 +2887,7 @@ class StreamRenderer:
         self._used_ai_prefix = False
         self.first_chunk = True
         self._text_buffer = ""
+        self._last_draw = 0.0
 
     def _clear_current_block(self) -> None:
         if self._current_rows <= 0:
@@ -2926,7 +2929,13 @@ class StreamRenderer:
                 text = text[idx + 1:]
             else:
                 self._line_buffer += text
-                self._draw_current_line(final=False)
+                
+                # DEBOUNCE: Max ~33 redraws per second to stop terminal flicker
+                now = time.monotonic()
+                if now - self._last_draw > 0.03:
+                    self._draw_current_line(final=False)
+                    self._last_draw = now
+                    
                 text = ""
 
     def feed_thinking(self, think_tok: str) -> None:
@@ -3251,12 +3260,12 @@ def stream_response(
             clean = strip_think_tags(full_text)
             return (clean if clean else ""), tool_calls_out, response_usage
         cprint(f"{C.ERROR}{error_msg}{C.RESET}")
-        return None, [], response_usage
+        return None,[], response_usage
 
     full_text = renderer.full_text[:MAX_MESSAGE_LENGTH]
     clean = strip_think_tags(full_text)
     if not clean and not tool_calls_out and not interrupted:
-        return None, [], response_usage
+        return None,[], response_usage
     return (clean if clean else ""), tool_calls_out, response_usage
 
 
@@ -3450,7 +3459,7 @@ def print_usage() -> None:
     me = Path(sys.argv[0]).name
     cprint(f"""
 {C.INFO}Usage:{C.RESET}
-  python {me} [provider] [filter]...
+  python {me} [provider] [filter]... [--token]
 
 {C.INFO}Providers:{C.RESET}
   gemini  openrouter  groq  together  cerebras  novita  cloudflare  ollama
@@ -3483,7 +3492,7 @@ def print_chat_help() -> None:
   {C.BOLD}/upload <path>{C.RESET}
   {C.BOLD}/file{C.RESET}
   {C.BOLD}/clearfile{C.RESET}
-  {C.BOLD}/paste [text]{C.RESET}
+  {C.BOLD}/paste[text]{C.RESET}
   {C.BOLD}/togglethinking{C.RESET}
   {C.BOLD}/toggletools{C.RESET}
   {C.BOLD}/stats{C.RESET}                Show session token usage statistics
@@ -3507,6 +3516,7 @@ def chat_loop(
     enable_tools: bool,
     enable_thinking: bool,
     filters: list[str],
+    show_tokens: bool = False,
 ) -> None:
     if _READLINE_AVAILABLE:
         readline.set_history_length(1000)
@@ -3790,8 +3800,8 @@ def chat_loop(
                 clean_final = {"role": "assistant", "content": final_ai_text}
             history[compact_from:] =[clean_final]
 
-        # Show per-response token usage inline if available
-        if usage and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
+        # Show per-response token usage inline ONLY IF --token was passed
+        if show_tokens and usage and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
             pt = usage.get("prompt_tokens", 0)
             ct = usage.get("completion_tokens", 0)
             eprint(f"{C.DIM}[tokens: {pt:,} prompt + {ct:,} completion = {pt + ct:,} total]{C.RESET}")
@@ -3817,12 +3827,18 @@ def main() -> None:
         print_usage()
         sys.exit(0)
 
+    # Check for the token flag and remove it from argv so it doesn't mess up model filters
+    show_tokens = False
+    if "--token" in argv or "--tokens" in argv:
+        show_tokens = True
+        argv =[arg for arg in argv if arg not in ("--token", "--tokens")]
+
     if not argv:
         provider = select_provider_interactive(VALID_PROVIDERS)
         if not provider:
             cprint(f"{C.WARN}No provider selected. Exiting.{C.RESET}")
             sys.exit(0)
-        filters = []
+        filters =[]
     else:
         provider = argv[0].lower()
         filters = argv[1:]
@@ -3850,7 +3866,7 @@ def main() -> None:
     try:
         chat_loop(
             provider, model_id, is_openai_compat, api_key,
-            enable_tools, enable_thinking, filters,
+            enable_tools, enable_thinking, filters, show_tokens,
         )
     except KeyboardInterrupt:
         _PROGRESS.stop()
