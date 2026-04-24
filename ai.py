@@ -31,7 +31,7 @@ Chat commands:
     /upload <path>      Attach an image to your next message
     /image              Show currently attached image
     /clearimage         Remove the attached image
-    /paste[text]       Multi-line paste mode (end with ---)
+    /paste [text]       Multi-line paste mode (end with ---)
     /togglethinking     Toggle reasoning/thinking output display
     /toggletools        Toggle tool calling on/off
     /help               Show available commands
@@ -643,10 +643,10 @@ class _ContentExtractor(HTMLParser):
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
+        self.parts: list[str] =[]
         self._skip_depth = 0
         self._scope_depth = 0
-        self._scope_stack: list[bool] = []
+        self._scope_stack: list[bool] =[]
 
     def _is_content_div(self, attrs: list[tuple[str, Optional[str]]]) -> bool:
         for name, val in attrs:
@@ -696,7 +696,7 @@ class _ContentExtractor(HTMLParser):
 
     def get_text(self) -> str:
         raw = ''.join(self.parts)
-        lines = [re.sub(r'[ \t]+', ' ', ln.strip()) for ln in raw.split('\n')]
+        lines =[re.sub(r'[ \t]+', ' ', ln.strip()) for ln in raw.split('\n')]
         return '\n\n'.join(ln for ln in lines if ln)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1764,7 +1764,7 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] =[
                 "parameters": {
                     "type": "object",
                     "properties": {"expression": {"type": "string"}},
-                    "required": ["expression"],
+                    "required":["expression"],
                 },
             },
             {
@@ -1779,7 +1779,7 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] =[
                         "query": {"type": "string"},
                         "num_results": {"type": "integer"},
                     },
-                    "required": ["query"],
+                    "required":["query"],
                 },
             },
             {
@@ -2021,7 +2021,7 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
         elif provider == "ollama":
             models = [m["name"] for m in data.get("models",[])]
         elif provider == "together":
-            arr = data if isinstance(data, list) else data.get("data", [])
+            arr = data if isinstance(data, list) else data.get("data",[])
             models = sorted(m["id"] for m in arr)
         elif provider == "cloudflare":
             models = sorted(
@@ -2262,7 +2262,7 @@ def _render_provider_picker(providers: list[str], selected: int) -> None:
     title_gap = max(1, inner_width - _visible_len(title_left) - _visible_len(title_right))
     title_line = title_left + (" " * title_gap) + title_right
 
-    lines: list[str] = []
+    lines: list[str] =[]
     lines.append("┌" + "─" * inner_width + "┐")
     lines.append(_panel_line(title_line, inner_width))
     lines.append(_panel_line("", inner_width))
@@ -2706,7 +2706,7 @@ def build_payload(
             },
         }
         if SYSTEM_PROMPT:
-            payload["systemInstruction"] = {"parts": [{"text": SYSTEM_PROMPT}]}
+            payload["systemInstruction"] = {"parts":[{"text": SYSTEM_PROMPT}]}
         if enable_tools:
             payload["tools"] = GEMINI_TOOLS_SCHEMA
         return payload
@@ -2760,7 +2760,7 @@ def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
         r.think = msg_obj.get("thinking") or ""
         if obj.get("done") is True:
             r.finish = obj.get("done_reason") or "stop"
-        for tc in (msg_obj.get("tool_calls") or []):
+        for tc in (msg_obj.get("tool_calls") or[]):
             fn = tc.get("function", {})
             args_raw = fn.get("arguments", "")
             if isinstance(args_raw, dict):
@@ -2777,9 +2777,10 @@ def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
     choice = (obj.get("choices") or [{}])[0]
     delta = choice.get("delta", {})
     r.text = delta.get("content") or ""
-    r.think = delta.get("reasoning") or ""
+    # Update to check for `reasoning_content` API standard used by Cloudflare/Moonshot/DeepSeek-Reasoner
+    r.think = delta.get("reasoning") or delta.get("reasoning_content") or ""
     r.finish = choice.get("finish_reason") or ""
-    for tc_chunk in (delta.get("tool_calls") or []):
+    for tc_chunk in (delta.get("tool_calls") or[]):
         r.tool_chunks.append({
             "index": tc_chunk.get("index", 0),
             "id": tc_chunk.get("id"),
@@ -3355,7 +3356,7 @@ def print_usage() -> None:
   /upload <path>
   /image
   /clearimage
-  /paste [text]
+  /paste[text]
   /togglethinking
   /toggletools
   /help
