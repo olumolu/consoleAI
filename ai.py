@@ -425,36 +425,36 @@ MD_RENDERER = MarkdownRenderer()
 
 ENDPOINTS: dict[str, dict[str, str]] = {
     "gemini": {
-        "chat_base": "[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)",
-        "models":    "[https://generativelanguage.googleapis.com/v1beta/models](https://generativelanguage.googleapis.com/v1beta/models)",
+        "chat_base": "https://generativelanguage.googleapis.com/v1beta/models/",
+        "models":    "https://generativelanguage.googleapis.com/v1beta/models",
     },
     "openrouter": {
-        "chat":   "[https://openrouter.ai/api/v1/chat/completions](https://openrouter.ai/api/v1/chat/completions)",
-        "models": "[https://openrouter.ai/api/v1/models](https://openrouter.ai/api/v1/models)",
+        "chat":   "https://openrouter.ai/api/v1/chat/completions",
+        "models": "https://openrouter.ai/api/v1/models",
     },
     "groq": {
-        "chat":   "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
-        "models": "[https://api.groq.com/openai/v1/models](https://api.groq.com/openai/v1/models)",
+        "chat":   "https://api.groq.com/openai/v1/chat/completions",
+        "models": "https://api.groq.com/openai/v1/models",
     },
     "together": {
-        "chat":   "[https://api.together.ai/v1/chat/completions](https://api.together.ai/v1/chat/completions)",
-        "models": "[https://api.together.ai/v1/models](https://api.together.ai/v1/models)",
+        "chat":   "https://api.together.ai/v1/chat/completions",
+        "models": "https://api.together.ai/v1/models",
     },
     "cerebras": {
-        "chat":   "[https://api.cerebras.ai/v1/chat/completions](https://api.cerebras.ai/v1/chat/completions)",
-        "models": "[https://api.cerebras.ai/v1/models](https://api.cerebras.ai/v1/models)",
+        "chat":   "https://api.cerebras.ai/v1/chat/completions",
+        "models": "https://api.cerebras.ai/v1/models",
     },
     "novita": {
-        "chat":   "[https://api.novita.ai/v3/openai/chat/completions](https://api.novita.ai/v3/openai/chat/completions)",
-        "models": "[https://api.novita.ai/v3/openai/models](https://api.novita.ai/v3/openai/models)",
+        "chat":   "https://api.novita.ai/v3/openai/chat/completions",
+        "models": "https://api.novita.ai/v3/openai/models",
     },
     "cloudflare": {
-        "chat":   "[https://api.cloudflare.com/client/v4/accounts/](https://api.cloudflare.com/client/v4/accounts/){account_id}/ai/v1/chat/completions",
-        "models": "[https://api.cloudflare.com/client/v4/accounts/](https://api.cloudflare.com/client/v4/accounts/){account_id}/ai/models/search",
+        "chat":   "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions",
+        "models": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search",
     },
     "ollama": {
-        "chat":   "[https://ollama.com/api/chat](https://ollama.com/api/chat)",
-        "models": "[https://ollama.com/api/tags](https://ollama.com/api/tags)",
+        "chat":   "https://ollama.com/api/chat",
+        "models": "https://ollama.com/api/tags",
     },
 }
 
@@ -795,7 +795,7 @@ _FETCH_HEADERS_PRIMARY = {
     "DNT": "1",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
-    "Referer": "[https://www.google.com/](https://www.google.com/)",
+    "Referer": "https://www.google.com/",
 }
 
 _FETCH_HEADERS_FALLBACK = {
@@ -965,7 +965,7 @@ def _unwrap_result_url(url: str) -> str:
     if not url:
         return ""
     if url.startswith("/"):
-        url = urllib.parse.urljoin("[https://www.startpage.com](https://www.startpage.com)", url)
+        url = urllib.parse.urljoin("https://www.startpage.com", url)
 
     try:
         p = urllib.parse.urlparse(url)
@@ -1167,7 +1167,7 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
     try:
         _PROGRESS.update("Connecting to Startpage…")
         req = urllib.request.Request(
-            "[https://www.startpage.com/](https://www.startpage.com/)",
+            "https://www.startpage.com/",
             headers={
                 "User-Agent": BROWSER_USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1192,7 +1192,7 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
 
     try:
         req = urllib.request.Request(
-            "[https://www.startpage.com/do/search](https://www.startpage.com/do/search)",
+            "https://www.startpage.com/do/search",
             data=post_data,
             headers={
                 "User-Agent": BROWSER_USER_AGENT,
@@ -1200,8 +1200,8 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate, identity",
                 "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": "[https://www.startpage.com](https://www.startpage.com)",
-                "Referer": "[https://www.startpage.com/](https://www.startpage.com/)",
+                "Origin": "https://www.startpage.com",
+                "Referer": "https://www.startpage.com/",
                 "DNT": "1",
             },
             method="POST",
@@ -1967,7 +1967,7 @@ def _build_request(url: str, api_key: str, provider: str, data: Optional[bytes] 
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if provider == "openrouter":
-        headers["HTTP-Referer"] = "[https://github.com/python-chat-cli](https://github.com/python-chat-cli)"
+        headers["HTTP-Referer"] = "https://github.com/python-chat-cli"
         headers["X-Title"] = "PythonChatCLI"
     method = "POST" if data is not None else "GET"
     return urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -2012,24 +2012,24 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
         if provider == "gemini":
             models = [
                 m["name"].replace("models/", "")
-                for m in (data.get("models") or [])
+                for m in data.get("models",[])
                 if (
                     any("generateContent" in method for method in m.get("supportedGenerationMethods",[]))
                     and not m["name"].startswith("models/embedding")
                 )
             ]
         elif provider == "ollama":
-            models = [m["name"] for m in (data.get("models") or [])]
+            models = [m["name"] for m in data.get("models",[])]
         elif provider == "together":
-            arr = data if isinstance(data, list) else (data.get("data") or [])
+            arr = data if isinstance(data, list) else data.get("data", [])
             models = sorted(m["id"] for m in arr)
         elif provider == "cloudflare":
             models = sorted(
-                m["name"] for m in (data.get("result") or [])
+                m["name"] for m in data.get("result",[])
                 if m.get("task", {}).get("name") == "Text Generation" or "task" not in m
             )
         else:
-            models = sorted(m["id"] for m in (data.get("data") or []))
+            models = sorted(m["id"] for m in data.get("data",[]))
     except Exception as exc:
         eprint(f"{C.ERROR}Could not parse model list: {exc}{C.RESET}")
         return None
@@ -2800,7 +2800,7 @@ def _parse_gemini_chunk(obj: dict[str, Any]) -> _ChunkResult:
         return r
 
     content_obj = candidate.get("content", {})
-    for part in (content_obj.get("parts") or []):
+    for part in content_obj.get("parts",[]):
         if "text" in part:
             r.text += part["text"]
         if "functionCall" in part:
@@ -3238,7 +3238,7 @@ def _extract_display_text(msg: Message) -> str:
         names =[tc.get("function", tc).get("name", "?") for tc in msg["tool_calls"]]
         return ((msg.get("content") or "") + f"[🛠️ → {', '.join(names)}]").strip()
 
-    raw = msg.get("content") or (msg.get("parts") or [{}])
+    raw = msg.get("content") or msg.get("parts",[{}])
     if isinstance(raw, str):
         return raw
     if isinstance(raw, list) and raw:
