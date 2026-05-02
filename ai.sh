@@ -1,7 +1,7 @@
 #!/bin/bash
 # Universal Chat CLI (Bash/curl/jq/bc) - With Model Selection, HISTORY, SYSTEM PROMPT, STREAMING, IMAGE SUPPORT, THINKING OUTPUT
 # REQUIREMENTS: bash, curl, jq, bc, grep, sed, file, base64 (must be pre-installed on the system)
-# Supports: Gemini, OpenRouter, Groq, Together AI, Cerebras AI, Novita AI, Ollama Cloud
+# Supports: Gemini, OpenRouter, Groq, Together AI, Cerebras AI, Novita AI, Ollama Cloud, NVIDIA NIM
 # To Run This Tool First Make It executable with $ chmod +x ai.sh
 # Run This $ ./ai.sh provider
 # filter support added [filter]... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
@@ -17,9 +17,9 @@ set -E -o pipefail
 # --- Configuration ---
 MAX_HISTORY_MESSAGES=20       # Keep the last N messages (user + ai). Adjust if needed.
 MAX_MESSAGE_LENGTH=50000      # Maximum length for a single message
-DEFAULT_OAI_TEMPERATURE=0.7   # t = randomness: Higher = more creative, Lower = more predictable | allowed value 0-2
+DEFAULT_OAI_TEMPERATURE=0.9   # t = randomness: Higher = more creative, Lower = more predictable | allowed value 0-2
 DEFAULT_OAI_MAX_TOKENS=3000   # Default max_tokens for OpenAI-compatible APIs
-DEFAULT_OAI_TOP_P=0.9         # p = diversity: Higher = wider vocabulary, Lower = safer word choices | allowed value 0-1
+DEFAULT_OAI_TOP_P=1.0         # p = diversity: Higher = wider vocabulary, Lower = safer word choices | allowed value 0-1
 SESSION_DIR="${HOME}/.chat_sessions"    # Directory for storing chat session history files.
 
 # --- Image Support Configuration ---
@@ -45,7 +45,7 @@ validate_numeric() {
     fi
 
     # Use bc for comparison but convert result to integer for bash
-    if [ "$(echo "$value < $min" | bc)" = "1" ] || [ "$(echo "$value > $max" | bc)" = "1" ]; then
+    if [[ "$(echo "$value < $min" | bc)" == "1" ]] || [[ "$(echo "$value > $max" | bc)" == "1" ]]; then
         echo "Error: $name must be between $min and $max, got: $value" >&2
         return 1
     fi
@@ -72,6 +72,7 @@ COLOR_WARN='\033[38;5;221m'     # Soft yellow
 COLOR_INFO='\033[38;5;75m'      # Darker cyan-blue
 COLOR_BOLD='\033[1m'
 COLOR_IMAGE='\033[38;5;208m'    # Orange - for image attachments and indicators
+COLOR_NVIDIA='\033[38;5;118m'   # NVIDIA green - for NVIDIA branding
 
 ##########################################################################
 #                    !!! EDIT YOUR API KEYS HERE !!!                     #
@@ -103,6 +104,9 @@ OLLAMA_API_KEY=""
 CLOUDFLARE_API_TOKEN=""
 CLOUDFLARE_ACCOUNT_ID=""
 
+# NVIDIA NIM: https://build.nvidia.com/ (get API key from "Get API Key" on any model page)
+NVIDIA_API_KEY=""
+
 # --- API Endpoints ---
 # Chat Endpoints
 GEMINI_CHAT_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models/"
@@ -112,6 +116,7 @@ TOGETHER_CHAT_URL="https://api.together.ai/v1/chat/completions"
 CEREBRAS_CHAT_URL="https://api.cerebras.ai/v1/chat/completions"
 NOVITA_CHAT_URL="https://api.novita.ai/v3/openai/chat/completions"
 OLLAMA_CHAT_URL="https://ollama.com/api/chat"
+NVIDIA_CHAT_URL="https://integrate.api.nvidia.com/v1/chat/completions"
 # Ollama to localhost. If using Ollama Cloud, uncomment the next line to use local.
 # OLLAMA_CHAT_URL="http://localhost:11434/api/chat"
 
@@ -128,6 +133,7 @@ CEREBRAS_MODELS_URL="https://api.cerebras.ai/v1/models"
 NOVITA_MODELS_URL="https://api.novita.ai/v3/openai/models"
 OLLAMA_MODELS_URL="https://ollama.com/api/tags"
 CLOUDFLARE_MODELS_URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/models"
+NVIDIA_MODELS_URL="https://integrate.api.nvidia.com/v1/models"
 # Ollama to localhost. If using Ollama Cloud, uncomment the next line to use local.
 #OLLAMA_MODELS_URL="http://localhost:11434/api/tags"
 
@@ -166,7 +172,7 @@ function print_usage() {
   echo -e "  Now with thinking output support for reasoning models!"
   echo -e ""
   echo -e "${COLOR_INFO}Supported Providers:${COLOR_RESET}"
-  echo -e "  gemini, openrouter, groq, together, cerebras, novita, ollama, cloudflare"
+  echo -e "  gemini, openrouter, groq, together, cerebras, novita, ollama, cloudflare, ${COLOR_NVIDIA}nvidia${COLOR_RESET}"
   echo -e ""
   echo -e "${COLOR_INFO}Chat Commands:${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}/history${COLOR_RESET}         - Show conversation history"
@@ -188,6 +194,7 @@ function print_usage() {
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Novita:${COLOR_RESET}     https://docs.novita.ai"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Ollama:${COLOR_RESET}     https://ollama.com/library"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Cloudflare:${COLOR_RESET} https://developers.cloudflare.com/workers-ai/models"
+  echo -e "    ${COLOR_BOLD}${COLOR_NVIDIA}NVIDIA NIM:${COLOR_RESET} https://build.nvidia.com/explore/discover"
   echo -e ""
   echo -e "${COLOR_BOLD}${COLOR_INFO}Example Commands:${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 gemini${COLOR_RESET}"
@@ -198,6 +205,9 @@ function print_usage() {
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 novita${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 ollama${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 cloudflare${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}${COLOR_NVIDIA}$0 nvidia${COLOR_RESET}"
+  echo -e "  ${COLOR_BOLD}${COLOR_NVIDIA}$0 nvidia llama${COLOR_RESET}       # filter to llama models only"
+  echo -e "  ${COLOR_BOLD}${COLOR_NVIDIA}$0 nvidia deepseek${COLOR_RESET}    # filter to deepseek models only"
   echo -e ""
   echo -e "${COLOR_IMAGE}Image Support:${COLOR_RESET}"
   echo -e "  Supports JPEG, PNG, GIF, WebP, BMP. Max ${MAX_IMAGE_SIZE_MB}MB per image."
@@ -255,6 +265,9 @@ check_placeholder_key() {
         placeholder_found=true
         message="appears to be too short to be a valid key"
     elif [[ "$provider_name" == "cloudflare" && ${#key_value} -lt 10 ]]; then
+        placeholder_found=true
+        message="appears to be too short to be a valid key"
+    elif [[ "$provider_name" == "nvidia" && ${#key_value} -lt 10 ]]; then
         placeholder_found=true
         message="appears to be too short to be a valid key"
     fi
@@ -373,7 +386,7 @@ clear_current_image() {
 }
 
 # --- Argument Parsing ---
-if [ "$#" -lt 1 ]; then
+if [[ "$#" -lt 1 ]]; then
     echo -e "${COLOR_ERROR}Error: Invalid number of arguments.${COLOR_RESET}" >&2
     print_usage
     exit 1
@@ -390,7 +403,7 @@ for cmd in "${required_commands[@]}"; do
         missing_commands+=("$cmd")
     fi
 done
-if [ ${#missing_commands[@]} -ne 0 ]; then
+if [[ ${#missing_commands[@]} -ne 0 ]]; then
     echo -e "${COLOR_ERROR}Error: Required command(s) not found: ${missing_commands[*]}. Please install them.${COLOR_RESET}" >&2
     exit 1
 fi
@@ -406,6 +419,7 @@ case "$PROVIDER" in
     cerebras)   API_KEY="$CEREBRAS_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
     novita)     API_KEY="$NOVITA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
     ollama)     API_KEY="$OLLAMA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
+    nvidia)     API_KEY="$NVIDIA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
     cloudflare)
         # Cloudflare needs both token and account ID
         if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
@@ -426,7 +440,7 @@ case "$PROVIDER" in
         fi
         ;;
     *)
-        echo -e "${COLOR_ERROR}Error: Unknown provider '$PROVIDER'. Choose from: gemini, openrouter, groq, together, cerebras, novita, ollama, cloudflare${COLOR_RESET}" >&2
+        echo -e "${COLOR_ERROR}Error: Unknown provider '$PROVIDER'. Choose from: gemini, openrouter, groq, together, cerebras, novita, ollama, cloudflare, nvidia${COLOR_RESET}" >&2
         print_usage
         exit 1
         ;;
@@ -483,6 +497,12 @@ case "$PROVIDER" in
         fi
         JQ_QUERY='.models[] | .name'
         ;;
+    nvidia)
+        MODELS_URL="$NVIDIA_MODELS_URL"
+        MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
+        # Filter to chat-capable models only (exclude embedding/reranking models)
+        JQ_QUERY='.data | sort_by(.id) | .[].id'
+        ;;
     cloudflare)
         MODELS_URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/models"
         MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
@@ -490,9 +510,13 @@ case "$PROVIDER" in
         ;;
 esac
 
-model_curl_args=(-sS -L -X GET "$MODELS_URL") # Added -S to show curl errors
-[ -n "$MODELS_AUTH_HEADER" ] && model_curl_args+=(-H "$MODELS_AUTH_HEADER")
-[ ${#MODELS_EXTRA_HEADERS[@]} -gt 0 ] && model_curl_args+=("${MODELS_EXTRA_HEADERS[@]}")
+model_curl_args=(-sS -L -X GET "$MODELS_URL")
+if [[ -n "$MODELS_AUTH_HEADER" ]]; then
+    model_curl_args+=(-H "$MODELS_AUTH_HEADER")
+fi
+if [[ ${#MODELS_EXTRA_HEADERS[@]} -gt 0 ]]; then
+    model_curl_args+=("${MODELS_EXTRA_HEADERS[@]}")
+fi
 
 model_list_json=""
 if ! model_list_json=$(curl "${model_curl_args[@]}"); then
@@ -525,7 +549,7 @@ jq_exit_code=$?
 jq_stderr_output=$(cat "$jq_err_file" 2>/dev/null || true)
 rm -f "$jq_err_file"
 
-if [ $jq_exit_code -ne 0 ] || [ ${#available_models[@]} -eq 0 ]; then
+if [[ $jq_exit_code -ne 0 ]] || [[ ${#available_models[@]} -eq 0 ]]; then
     echo -e "${COLOR_ERROR}Error: No models found or failed to parse successful API response for provider '$PROVIDER'.${COLOR_RESET}" >&2
     echo -e "${COLOR_INFO}The API call succeeded, but the JQ query ('${COLOR_BOLD}$JQ_QUERY${COLOR_RESET}') might not match the response structure, produced no output, or jq itself failed.${COLOR_RESET}" >&2
     echo -e "${COLOR_INFO}JQ Exit Code was: ${jq_exit_code}${COLOR_RESET}" >&2
@@ -540,7 +564,7 @@ if [ $jq_exit_code -ne 0 ] || [ ${#available_models[@]} -eq 0 ]; then
 fi
 
 # --- Filter models based on additional arguments with improved matching ---
-if [ ${#filters[@]} -gt 0 ]; then
+if [[ ${#filters[@]} -gt 0 ]]; then
     echo -e "${COLOR_INFO}Filtering models with terms: ${filters[*]}${COLOR_RESET}"
     echo -e "${COLOR_INFO}Using word boundary matching for better precision${COLOR_RESET}"
     declare -a filtered_models=()
@@ -573,9 +597,9 @@ if [ ${#filters[@]} -gt 0 ]; then
 fi
 
 # After potential filtering, check if any models are left
-if [ ${#available_models[@]} -eq 0 ]; then
+if [[ ${#available_models[@]} -eq 0 ]]; then
     echo -e "${COLOR_ERROR}No models available.${COLOR_RESET}" >&2
-    if [ ${#filters[@]} -gt 0 ]; then
+    if [[ ${#filters[@]} -gt 0 ]]; then
         echo -e "${COLOR_WARN}Your filter criteria (${filters[*]}) did not match any models from provider '${PROVIDER^^}'.${COLOR_RESET}" >&2
         echo -e "${COLOR_INFO}Filters use word boundary matching (e.g., '3' matches 'gpt-3' but not '13b')${COLOR_RESET}" >&2
     else
@@ -587,7 +611,7 @@ fi
 MODEL_ID=""
 
 # --- Auto-select if only one model, otherwise prompt user ---
-if [ ${#available_models[@]} -eq 1 ]; then
+if [[ ${#available_models[@]} -eq 1 ]]; then
     MODEL_ID="${available_models[0]}"
     echo -e "${COLOR_INFO}Auto-selecting only matching model.${COLOR_RESET}"
 else
@@ -598,7 +622,7 @@ else
     echo ""
     while true; do
         read -r -p "$(echo -e "${COLOR_INFO}Select model by number: ${COLOR_RESET}")" choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#available_models[@]} ]; then
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#available_models[@]} ]]; then
             MODEL_ID="${available_models[$((choice-1))]}"
             break
         else
@@ -645,7 +669,7 @@ case "$PROVIDER" in
         CHAT_API_URL="${GEMINI_CHAT_URL_BASE}${MODEL_ID}:streamGenerateContent?key=${API_KEY}&alt=sse"
         IS_OPENAI_COMPATIBLE=false # Gemini uses "model" role, not "assistant"
         ;;
-    openrouter|groq|together|cerebras|novita|ollama)
+    openrouter|groq|together|cerebras|novita|ollama|nvidia)
         CHAT_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
         IS_OPENAI_COMPATIBLE=true # These use "assistant" role
         case "$PROVIDER" in
@@ -658,6 +682,11 @@ case "$PROVIDER" in
             together)   CHAT_API_URL="$TOGETHER_CHAT_URL" ;;
             cerebras)   CHAT_API_URL="$CEREBRAS_CHAT_URL" ;;
             novita)     CHAT_API_URL="$NOVITA_CHAT_URL" ;;
+            nvidia)
+                CHAT_API_URL="$NVIDIA_CHAT_URL"
+                # NVIDIA NIM supports reasoning tokens on select models (e.g. QwQ, DeepSeek-v4)
+                PROVIDER_SUPPORTS_THINKING=true
+                ;;
             ollama)
                 CHAT_API_URL="$OLLAMA_CHAT_URL"
                 PROVIDER_SUPPORTS_THINKING=true # Ollama supports native thinking field
@@ -765,6 +794,11 @@ else
     echo -e "${COLOR_INFO}Thinking Output:${COLOR_RESET} Disabled (toggle with /togglethinking)"
 fi
 
+# Display NVIDIA-specific note for reasoning models
+if [[ "$PROVIDER" == "nvidia" ]]; then
+    echo -e "${COLOR_NVIDIA}NVIDIA NIM:${COLOR_RESET}      Endpoint: integrate.api.nvidia.com | Reasoning models show thinking in orange"
+fi
+
 # Updated help text to include new session commands
 echo -e "Enter prompt. Type ${COLOR_BOLD}'quit'/'exit'${COLOR_RESET}. Commands: ${COLOR_BOLD}/history, /save <name>, /load <name>, /clear, /upload, /togglethinking${COLOR_RESET}"
 echo -e "---------------------------------------------------------------------------------------"
@@ -854,7 +888,7 @@ while true; do
                 ;;
             "/history")
                 echo -e "${COLOR_INFO}--- Current Conversation History (${#chat_history[@]} messages) ---${COLOR_RESET}"
-                if [ ${#chat_history[@]} -eq 0 ]; then
+                if [[ ${#chat_history[@]} -eq 0 ]]; then
                     echo "(History is empty)" >&2
                 else
                     printf '%s\n' "${chat_history[@]}" | jq -s -c '.[]' | while IFS= read -r msg; do
@@ -920,7 +954,7 @@ while true; do
                 continue
                 ;;
             "/clear")
-                if [ ! -d "$SESSION_DIR" ] || [ -z "$(ls -A "$SESSION_DIR"/*.json 2>/dev/null)" ]; then
+                if [[ ! -d "$SESSION_DIR" ]] || [[ -z "$(ls -A "$SESSION_DIR"/*.json 2>/dev/null)" ]]; then
                     echo -e "${COLOR_INFO}No saved sessions to clear.${COLOR_RESET}" >&2
                     continue
                 fi
@@ -972,7 +1006,7 @@ while true; do
                 --arg text "$user_prompt_text" \
                 --arg mime "$CURRENT_IMAGE_MIME" \
                 --arg data "$CURRENT_IMAGE_BASE64" \
-                '{role: "user", parts: [{text: $text}, {inlineData: {mimeType: $mime, data: $data}}]}'
+                '{role: "user", parts:[{text: $text}, {inlineData: {mimeType: $mime, data: $data}}]}'
             )
         elif [[ "$PROVIDER" == "ollama" ]]; then
             # OLLAMA CLOUD: Native API format with images array
@@ -982,12 +1016,12 @@ while true; do
                 '{role: "user", content: $content, images: [$image_data]}'
             )
         else
-            # OpenAI compatible format
+            # OpenAI compatible format (covers NVIDIA NIM vision models too)
             user_message_json=$(jq -n \
                 --arg text "$user_input" \
                 --arg mime "$CURRENT_IMAGE_MIME" \
                 --arg data "$CURRENT_IMAGE_BASE64" \
-                '{role: "user", content: [{type: "text", text: $text}, {type: "image_url", image_url: {url: ("data:" + $mime + ";base64," + $data)}}]}'
+                '{role: "user", content:[{type: "text", text: $text}, {type: "image_url", image_url: {url: ("data:" + $mime + ";base64," + $data)}}]}'
             )
         fi
         clear_current_image
@@ -997,7 +1031,7 @@ while true; do
             if [[ "$first_user_message" == true && -n "$SYSTEM_PROMPT" ]]; then
                 user_prompt_text="${SYSTEM_PROMPT}\n\nUser: ${user_input}"
             fi
-            user_message_json=$(jq -n --arg text "$user_prompt_text" '{role: "user", parts: [{text: $text}]}')
+            user_message_json=$(jq -n --arg text "$user_prompt_text" '{role: "user", parts:[{text: $text}]}')
         else
             user_message_json=$(jq -n --arg content "$user_prompt_text" '{role: "user", content: $content}')
         fi
@@ -1041,7 +1075,7 @@ while true; do
     history_json_array=$(printf '%s\n' "${chat_history[@]}" | jq -sc 'map(select(. != null))')
     if [[ -z "$history_json_array" || "$history_json_array" == "null" || "$history_json_array" == "[]" ]]; then
         echo -e "${COLOR_ERROR}Error: Failed to create valid JSON array from history. Rolling back last user message.${COLOR_RESET}" >&2
-        if [ ${#chat_history[@]} -gt 0 ]; then
+        if [[ ${#chat_history[@]} -gt 0 ]]; then
              last_idx=$(( ${#chat_history[@]} - 1 ))
              last_role_raw=$(echo "${chat_history[$last_idx]}" | jq -r .role 2>/dev/null)
              if [[ "$last_role_raw" == "user" ]]; then
@@ -1052,9 +1086,6 @@ while true; do
         continue
     fi
 
-    # Create a temporary file for the history to pass to jq via stdin if needed,
-    # but here we use the variable in a pipe.
-    
     json_payload=""
     if [[ "$IS_OPENAI_COMPATIBLE" == false ]]; then # Gemini payload
         # FIX: Pipe history_json_array to jq to avoid ARG_MAX limit
@@ -1065,7 +1096,7 @@ while true; do
             'input as $contents | {contents: $contents, generationConfig: {temperature: ($temperature_str | tonumber), maxOutputTokens: ($max_tokens_str | tonumber), topP: ($top_p_str | tonumber)}}'
         )
         if [[ "$ENABLE_TOOL_CALLING" == true ]]; then
-            json_payload=$(echo "$json_payload" | jq '. + {tools: [{"urlContext": {}}, {"googleSearch": {}}]}')
+            json_payload=$(echo "$json_payload" | jq '. + {tools:[{"urlContext": {}}, {"googleSearch": {}}]}')
         fi
     else # OpenAI-Compatible payload
          ### --- Dynamic Payload Construction --- ###
@@ -1107,6 +1138,33 @@ while true; do
             # Update URL to include model ID
             CHAT_API_URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${MODEL_ID}"
 
+         # NVIDIA NIM: standard OpenAI-compatible with max_tokens + top_p
+         # Added chat_template_kwargs for reasoning models (DeepSeek, etc.)
+         elif [[ "$PROVIDER" == "nvidia" ]]; then
+            if [[ "${MODEL_ID,,}" == *"deepseek"* || "${MODEL_ID,,}" == *"reason"* || "${MODEL_ID,,}" == *"nemotron"* || "${MODEL_ID,,}" == *"qwq"* ]]; then
+                json_payload=$(echo "$base_payload" | jq -c \
+                    --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
+                    --arg top_p_str "$DEFAULT_OAI_TOP_P" \
+                    '. + {
+                        max_tokens: ($max_tokens_str | tonumber),
+                        top_p: ($top_p_str | tonumber),
+                        chat_template_kwargs: {
+                            thinking: true,
+                            reasoning_effort: "max"
+                        }
+                    }'
+                )
+            else
+                json_payload=$(echo "$base_payload" | jq -c \
+                    --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
+                    --arg top_p_str "$DEFAULT_OAI_TOP_P" \
+                    '. + {
+                        max_tokens: ($max_tokens_str | tonumber),
+                        top_p: ($top_p_str | tonumber)
+                    }'
+                )
+            fi
+
          # Conditionally add parameters for providers that support them.
          # TogetherAI, for example, can be sensitive to extra parameters on some models.
          elif [[ "$PROVIDER" != "together" ]]; then
@@ -1126,7 +1184,7 @@ while true; do
 
     if [[ -z "$json_payload" ]]; then
         echo -e "${COLOR_ERROR}Error: Failed to create final JSON payload using jq. Rolling back last user message.${COLOR_RESET}" >&2
-        if [ ${#chat_history[@]} -gt 0 ]; then
+        if [[ ${#chat_history[@]} -gt 0 ]]; then
             last_idx=$(( ${#chat_history[@]} - 1 ))
             last_role_raw=$(echo "${chat_history[$last_idx]}" | jq -r .role 2>/dev/null)
             if [[ "$last_role_raw" == "user" ]]; then
@@ -1142,8 +1200,12 @@ while true; do
     # Base curl arguments for chat
     # FIX: Do not put -d in the array, use stdin redirection to avoid ARG_MAX
     base_chat_curl_args=(-sS -L -N -X POST "$CHAT_API_URL" -H "Content-Type: application/json" -H "Accept: application/json")
-    [ -n "$CHAT_AUTH_HEADER" ] && base_chat_curl_args+=(-H "$CHAT_AUTH_HEADER")
-    [ ${#CHAT_EXTRA_HEADERS[@]} -gt 0 ] && base_chat_curl_args+=("${CHAT_EXTRA_HEADERS[@]}")
+    if [[ -n "$CHAT_AUTH_HEADER" ]]; then
+        base_chat_curl_args+=(-H "$CHAT_AUTH_HEADER")
+    fi
+    if [[ ${#CHAT_EXTRA_HEADERS[@]} -gt 0 ]]; then
+        base_chat_curl_args+=("${CHAT_EXTRA_HEADERS[@]}")
+    fi
 
     full_ai_response_text=""
     full_ai_thinking_text=""  # Store thinking content separately
@@ -1232,10 +1294,11 @@ while true; do
                     current_sfr=""
                 fi
             else
-                # Standard OpenAI format
+                # Standard OpenAI format (covers NVIDIA NIM)
                 text_chunk=$(echo "$json_chunk" | jq -r '.choices[0].delta.content // .choices[0].text // empty')
-                # FIX: Extract reasoning field for providers like Cerebras, Groq, OpenRouter
-                thinking_chunk=$(echo "$json_chunk" | jq -r '.choices[0].delta.reasoning // empty')
+                # Extract reasoning field - NVIDIA reasoning models use .choices[0].delta.reasoning_content
+                # Also handles Cerebras/Groq/OpenRouter which use .choices[0].delta.reasoning
+                thinking_chunk=$(echo "$json_chunk" | jq -r '.choices[0].delta.reasoning_content // .choices[0].delta.reasoning // empty')
                 current_sfr=$(echo "$json_chunk" | jq -r '.choices[0].finish_reason // empty')
             fi
         else
