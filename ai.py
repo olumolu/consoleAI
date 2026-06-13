@@ -380,11 +380,11 @@ class MarkdownRenderer:
         if stripped.startswith("```"):
             new_state = not in_code_block
             lang = stripped[3:].strip()
-            
+
             # Use dynamic cached width to respect terminal resizes
             term_cols = _get_term_cols()
             bar_len = min(term_cols - 4, 60)
-            
+
             if new_state: # Opening a code block
                 lbl = lang.upper() or 'CODE'
                 dashes = max(1, bar_len - 17 - len(lbl))
@@ -460,6 +460,29 @@ ENDPOINTS: dict[str, dict[str, str]] = {
 
 VALID_PROVIDERS = list(ENDPOINTS.keys())
 
+# Deprecated Gemini models (as of June 1, 2026)
+DEPRECATED_GEMINI_MODELS = (
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash-lite-001",
+    "gemini-3-pro-preview",
+    "gemini-3.1-flash-lite-preview",
+)
+
+def _is_model_deprecated(model_name: str, provider: str) -> bool:
+    if provider != "gemini":
+        return False
+    return model_name.lower() in [m.lower() for m in DEPRECATED_GEMINI_MODELS]
+
+def _mark_deprecated_models(models: list[str], provider: str) -> list[str]:
+    if provider != "gemini":
+        return models
+    return [
+        f"{m} {C.ERROR}[DEPRECATED]{C.RESET}" if _is_model_deprecated(m, provider) else m
+        for m in models
+    ]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -495,7 +518,7 @@ def check_placeholder_key(key: str, provider: str) -> bool:
         bad = "looks incomplete"
     elif provider == "cloudflare" and ":" not in key:
         bad = "is missing the Account ID (Format must be ACCOUNT_ID:API_TOKEN)"
-    
+
     if bad:
         eprint(f"{C.WARN}WARNING: API key for {provider.upper()} {bad}.{C.RESET}")
         return False
@@ -826,7 +849,7 @@ def _fetch_page(url: str, timeout: int = 20) -> str:
                         cl_int = int(cl)
                     except ValueError:
                         cl_int = 0
-                    
+
                     if cl_int > FETCH_MAX_BYTES:
                         raise RuntimeError(f"Response too large: {cl_int} bytes")
                 raw = resp.read(FETCH_MAX_BYTES + 1)
@@ -1480,7 +1503,7 @@ def tool_calculator(expression: str = "", **kwargs: Any) -> str:
         # Only replace ^ if it's not being used as a valid Python BitXor operator
         if "^" in expression and "**" not in expression:
             expression = expression.replace("^", "**")
-            
+
         tree = ast.parse(expression, mode="eval")
         result = _eval_node(tree.body)
         if isinstance(result, float) and result == int(result) and not math.isinf(result):
@@ -2034,7 +2057,9 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
         eprint(f"{C.ERROR}Could not parse model list: {exc}{C.RESET}")
         return None
 
-    return[m for m in models if m]
+    models = [m for m in models if m]
+    models = _mark_deprecated_models(models, provider)
+    return models
 
 
 _PICK_SEL_BG = "\033[48;5;215m"
@@ -2217,16 +2242,16 @@ def _interactive_confirm(prompt: str, default: bool = True, color: str = C.INFO)
 
     selected = default
     _stdout_write("\033[?25l")  # Hide cursor safely
-    
+
     try:
         with _RawTerminal():
             while True:
                 yes_str = f"{_PICK_SEL_BG}{_PICK_SEL_FG} Yes {C.RESET}" if selected else " Yes "
                 no_str  = f"{_PICK_SEL_BG}{_PICK_SEL_FG} No {C.RESET}" if not selected else " No "
-                
+
                 # Write inline prompt
                 _stdout_write(f"\r{C.CLR}{color}✦ {prompt}{C.RESET}  {yes_str} {no_str}")
-                
+
                 key = _read_picker_key()
                 if key in ("LEFT", "UP", "RIGHT", "DOWN", "h", "l", "j", "k"):
                     selected = not selected
@@ -2240,11 +2265,11 @@ def _interactive_confirm(prompt: str, default: bool = True, color: str = C.INFO)
                     break
                 elif key == "ESC":
                     sys.exit(0)
-            
+
             ans_str = "Yes" if selected else "No"
             _stdout_write(f"\r{C.CLR}{color}✓ {prompt}{C.RESET} {C.BOLD}{ans_str}{C.RESET}\n")
             return selected
-            
+
     except KeyboardInterrupt:
         _stdout_write("\r")
         sys.exit(0)
@@ -2279,7 +2304,7 @@ def _render_provider_picker(providers: list[str], selected: int) -> None:
             "novita": "Novita",
             "ollama": "Ollama"
         }.get(p, p.title())
-        
+
         row = f"  {num}. {display_name}"
         if idx == selected:
             lines.append(f"│{_PICK_SEL_BG}{_PICK_SEL_FG}{_ansi_pad(row, inner_width)}{C.RESET}│")
@@ -2882,7 +2907,7 @@ class StreamRenderer:
         if not self._in_think_display:
             _stdout_write(f"{C.THINK}[Thinking]\n┃ {C.RESET}{C.THINK}")
             self._in_think_display = True
-            
+
         indented_think = think_tok.replace("\n", f"\n{C.THINK}┃ {C.RESET}{C.THINK}")
         _stdout_write(f"{C.THINK}{indented_think}{C.RESET}")
 
