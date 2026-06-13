@@ -20,7 +20,7 @@ Features:
 Usage:
     python ai.py [provider] [filter]...
 
-Providers: gemini, openrouter, groq, together, cerebras, novita, cloudflare, ollama
+Providers: gemini, openrouter, groq, together, cerebras, novita, cloudflare, ollama, nvidia
 
 Chat commands:
     /history            Show conversation history
@@ -107,6 +107,7 @@ API_KEYS: dict[str, str] = {
     "novita":     "",   # https://novita.ai/
     "ollama":     "",   # https://ollama.com/ (leave blank for local)
     "cloudflare": "",   # https://dash.cloudflare.com Format: ACCOUNT_ID:API_TOKEN
+    "nvidia":     "",   # https://build.nvidia.com/
 }
 
 MAX_HISTORY_MESSAGES = 20
@@ -451,6 +452,10 @@ ENDPOINTS: dict[str, dict[str, str]] = {
     "cloudflare": {
         "chat":   "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions",
         "models": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search",
+    },
+    "nvidia": {
+        "chat":   "https://integrate.api.nvidia.com/v1/chat/completions",
+        "models": "https://integrate.api.nvidia.com/v1/models",
     },
     "ollama": {
         "chat":   "https://ollama.com/api/chat",
@@ -2190,7 +2195,7 @@ def _read_picker_key() -> str:
         except UnicodeDecodeError:
             if len(buf) >= 4:
                 return ""
-            if _select.select([fd], [],[], 0.05)[0]:
+            if _select.select([fd],[],[], 0.05)[0]:
                 buf += os.read(fd, 1)
             else:
                 return ""
@@ -2277,6 +2282,7 @@ def _render_provider_picker(providers: list[str], selected: int) -> None:
             "together": "Together",
             "cerebras": "Cerebras",
             "novita": "Novita",
+            "nvidia": "Nvidia",
             "ollama": "Ollama"
         }.get(p, p.title())
         
@@ -2673,7 +2679,7 @@ def build_user_message(text: str, image: ImageAttachment, provider: str, is_open
                 ],
             }
         if provider == "ollama":
-            return {"role": "user", "content": text, "images": [image.base64]}
+            return {"role": "user", "content": text, "images":[image.base64]}
         return {
             "role": "user",
             "content":[
@@ -2732,6 +2738,9 @@ def build_payload(
     elif provider != "together":
         out["max_tokens"] = DEFAULT_MAX_TOKENS
         out["top_p"] = DEFAULT_TOP_P
+
+    if provider == "nvidia" and enable_thinking:
+        out["chat_template_kwargs"] = {"thinking": True, "reasoning_effort": "max"}
 
     return out
 
@@ -3345,7 +3354,7 @@ def print_usage() -> None:
   python {me} [provider] [filter]...
 
 {C.INFO}Providers:{C.RESET}
-  gemini  openrouter  groq  together  cerebras  novita  cloudflare  ollama
+  gemini  openrouter  groq  together  cerebras  novita  cloudflare  ollama  nvidia
 
 {C.INFO}Commands:{C.RESET}
   /history
@@ -3676,7 +3685,7 @@ def main() -> None:
         if not provider:
             cprint(f"{C.WARN}No provider selected. Exiting.{C.RESET}")
             sys.exit(0)
-        filters = []
+        filters =[]
     else:
         provider = argv[0].lower()
         filters = argv[1:]
