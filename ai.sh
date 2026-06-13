@@ -320,6 +320,46 @@ regex_escape_ere() {
     printf '%s' "$1" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g'
 }
 
+# Deprecated Gemini models (as of June 1, 2026)
+DEPRECATED_GEMINI_MODELS=(
+    "gemini-2.0-flash"
+    "gemini-2.0-flash-001"
+    "gemini-2.0-flash-lite"
+    "gemini-2.0-flash-lite-001"
+    "gemini-3-pro-preview"
+    "gemini-3.1-flash-lite-preview"
+)
+
+is_model_deprecated() {
+    local model="$1"
+    local provider="$2"
+
+    if [[ "$provider" != "gemini" ]]; then
+        return 1
+    fi
+
+    local model_lower
+    model_lower="$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')"
+
+    for deprecated in "${DEPRECATED_GEMINI_MODELS[@]}"; do
+        if [[ "$model_lower" == "$deprecated" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+model_display_name() {
+    local model="$1"
+    local provider="$2"
+
+    if is_model_deprecated "$model" "$provider"; then
+        printf '%s %s[DEPRECATED]%s' "$model" "$COLOR_ERROR" "$COLOR_RESET"
+    else
+        printf '%s' "$model"
+    fi
+}
+
 # --- Image Helper Functions ---
 validate_image_file() {
     local file_path="$1"
@@ -589,11 +629,11 @@ MODEL_ID=""
 # --- Auto-select if only one model, otherwise prompt user ---
 if [ ${#available_models[@]} -eq 1 ]; then
     MODEL_ID="${available_models[0]}"
-    echo -e "${COLOR_INFO}Auto-selecting only matching model.${COLOR_RESET}"
+    echo -e "${COLOR_INFO}Auto-selecting only matching model:${COLOR_RESET} $(model_display_name "$MODEL_ID" "$PROVIDER")"
 else
     echo -e "${COLOR_INFO}Available Models for ${PROVIDER^^}:${COLOR_RESET}"
     for i in "${!available_models[@]}"; do
-        printf "  ${COLOR_BOLD}%3d${COLOR_RESET}. %s\n" $((i+1)) "${available_models[$i]}"
+        printf "  ${COLOR_BOLD}%3d${COLOR_RESET}. %s\n" $((i+1)) "$(model_display_name "${available_models[$i]}" "$PROVIDER")"
     done
     echo ""
     while true; do
@@ -607,7 +647,7 @@ else
     done
 fi
 
-echo -e "${COLOR_INFO}Using model:${COLOR_RESET} ${MODEL_ID}"
+echo -e "${COLOR_INFO}Using model:${COLOR_RESET} $(model_display_name "$MODEL_ID" "$PROVIDER")"
 echo ""
 
 CHAT_API_URL=""
