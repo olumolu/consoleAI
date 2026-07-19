@@ -18,24 +18,24 @@ Features:
   - Interactive UI for settings, provider, and model selection
 
 Usage:
-    python ai.py [provider] [filter]...
+  python ai.py [provider] [filter]...
 
 Providers: gemini, openrouter, groq, together, cerebras, novita, cloudflare, ollama, nvidia
 
 Chat commands:
-    /history            Show conversation history
-    /model              Switch to a different model mid-chat
-    /save <name>        Save session to ~/.chat_sessions/<name>.json
-    /load <name>        Load a saved session
-    /clear              Delete all saved sessions
-    /upload <path>      Attach an image to your next message
-    /image              Show currently attached image
-    /clearimage         Remove the attached image
-    /paste [text]       Multi-line paste mode (end with ---)
-    /togglethinking     Toggle reasoning/thinking output display
-    /toggletools        Toggle tool calling on/off
-    /help               Show available commands
-    quit / exit         End the session
+  /history            Show conversation history
+  /model              Switch to a different model mid-chat
+  /save <name>        Save session to ~/.chat_sessions/<name>.json
+  /load <name>        Load a saved session
+  /clear              Delete all saved sessions
+  /upload <path>      Attach an image to your next message
+  /image              Show currently attached image
+  /clearimage         Remove the attached image
+  /paste [text]       Multi-line paste mode (end with ---)
+  /togglethinking     Toggle reasoning/thinking output display
+  /toggletools        Toggle tool calling on/off
+  /help               Show available commands
+  quit / exit         End the session
 """
 
 import sys
@@ -63,6 +63,7 @@ import html as _html
 import mimetypes
 import atexit
 import select as _select
+from collections import OrderedDict
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Optional
@@ -120,20 +121,22 @@ SESSION_DIR = Path.home() / ".chat_sessions"
 HISTORY_FILE = Path.home() / ".ai_cli_history"
 
 MAX_IMAGE_SIZE_MB = 20
-SUPPORTED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/jxl", "image/avif", "image/heic", "image/heif", "image/tiff"}
+SUPPORTED_MIME_TYPES = {
+    "image/jpeg", "image/png", "image/webp", "image/gif",
+    "image/jxl", "image/avif", "image/heic", "image/heif", "image/tiff",
+}
 
 FETCH_MAX_CHARS = 30_000
 FETCH_MAX_BYTES = 5 * 1024 * 1024
 SEARCH_MAX_RESULTS = 6
-
 MAX_TOOL_ITERATIONS = 10
 TOOL_EXEC_TIMEOUT = 60
-
 REQUEST_TIMEOUT = 300
 MODEL_FETCH_TIMEOUT = 30
-
 MAX_RETRIES = 3
-RETRYABLE_HTTP_CODES = (429, 500, 502, 503, 504)
+# FIX: Added 408 (Request Timeout) to retryable codes
+RETRYABLE_HTTP_CODES = (408, 429, 500, 502, 503, 504)
+MAX_URL_LENGTH = 8192  # FIX: URL length cap
 
 USER_AGENT = "PythonChatCLI/2.0"
 BROWSER_USER_AGENT = (
@@ -147,6 +150,10 @@ RESEARCH_MAX_SOURCES = 8
 RESEARCH_BATCH_SIZE = 6
 RESEARCH_MAX_CANDIDATES = 30
 
+# FIX: Bounded cache sizes to prevent memory exhaustion in long sessions
+SEARCH_CACHE_MAX = 100
+PAGE_CACHE_MAX = 50
+
 SYSTEM_PROMPT = """You are a highly helpful assistant running in a command-line interface.
 
 For factual, current, version, release, pricing, documentation, troubleshooting, benchmark, or comparison questions:
@@ -154,7 +161,6 @@ For factual, current, version, release, pricing, documentation, troubleshooting,
 - If fewer than 4 sources are reachable, say so explicitly.
 - Use fetch_url for specific pages when needed.
 """
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ANSI
@@ -178,7 +184,6 @@ class C:
 
 def _rl(code: str) -> str:
     return f"\001{code}\002"
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OUTPUT
@@ -229,23 +234,22 @@ def _resolve_and_validate(hostname: str) -> str:
     }
     if hostname.lower() in blocked_hosts:
         raise ValueError(f"Blocked hostname: {hostname}")
-
     try:
         infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
     except (socket.gaierror, socket.herror, OSError) as exc:
         raise ValueError(f"DNS resolution failed for {hostname}: {exc}")
-
     if not infos:
         raise ValueError(f"No DNS results for {hostname}")
-
     for _family, _, _, _, sockaddr in infos:
         ip = sockaddr[0]
         if not _is_ip_blocked(ip):
             return ip
-
     raise ValueError(f"All IPs for {hostname} resolve to private/reserved addresses")
 
 def _validate_url(url: str) -> tuple[bool, str]:
+    # FIX: Added URL length validation
+    if len(url) > MAX_URL_LENGTH:
+        return False, f"URL too long ({len(url)} chars, max {MAX_URL_LENGTH})"
     try:
         parsed = urllib.parse.urlparse(url)
     except Exception:
@@ -269,17 +273,16 @@ class _SSRFSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
             raise urllib.error.URLError(f"Redirect blocked: {err}")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-
 _COOKIE_JAR = http.cookiejar.CookieJar()
 _URL_OPENER = urllib.request.build_opener(
     urllib.request.HTTPCookieProcessor(_COOKIE_JAR),
     _SSRFSafeRedirectHandler(),
 )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # TERMINAL MATH (CACHED FOR PERFORMANCE)
 # ─────────────────────────────────────────────────────────────────────────────
+
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 def _visible_len(text: str) -> int:
@@ -289,9 +292,10 @@ _LAST_TERM_COLS = 80
 _LAST_COLS_CHECK = 0.0
 
 def _get_term_cols() -> int:
+    # NOTE: Called from spinner thread and main thread. CPython's GIL makes
+    # this safe in practice; worst case is a slightly stale cached value.
     global _LAST_TERM_COLS, _LAST_COLS_CHECK
     now = time.monotonic()
-    # Update terminal size at most every 0.2 seconds to prevent OS spam
     if now - _LAST_COLS_CHECK > 0.2:
         _LAST_TERM_COLS = max(shutil.get_terminal_size((80, 24)).columns, 20)
         _LAST_COLS_CHECK = now
@@ -300,12 +304,10 @@ def _get_term_cols() -> int:
 def _wrapped_rows(text: str) -> int:
     rows = 0
     term_cols = _get_term_cols()
-    # Safely account for any \n characters that sneak into the renderer
     for line in text.split("\n"):
         vis = max(_visible_len(line), 1)
         rows += (vis - 1) // term_cols + 1
     return rows
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RENDERERS
@@ -354,11 +356,11 @@ class LatexRenderer:
         while tex != prev:
             prev = tex
             tex = self._frac_inner.sub(r'(\1/\2)', tex)
-        tex = self._frac_outer.sub(r'(\1/\2)', tex)
-        tex = self._sup_brace.sub(lambda m: m.group(1).translate(self.sup_map), tex)
-        tex = self._sup_single.sub(lambda m: m.group(1).translate(self.sup_map), tex)
-        tex = self._sub_brace.sub(lambda m: m.group(1).translate(self.sub_map), tex)
-        tex = self._sub_single.sub(lambda m: m.group(1).translate(self.sub_map), tex)
+            tex = self._frac_outer.sub(r'(\1/\2)', tex)
+            tex = self._sup_brace.sub(lambda m: m.group(1).translate(self.sup_map), tex)
+            tex = self._sup_single.sub(lambda m: m.group(1).translate(self.sup_map), tex)
+            tex = self._sub_brace.sub(lambda m: m.group(1).translate(self.sub_map), tex)
+            tex = self._sub_single.sub(lambda m: m.group(1).translate(self.sub_map), tex)
         for cmd, sym in {
             "\\cdot": "·", "\\times": "×", "\\div": "÷", "\\sqrt": "√",
             "\\infty": "∞", "\\pm": "±", "\\neq": "≠", "\\leq": "≤",
@@ -381,25 +383,19 @@ class MarkdownRenderer:
         if stripped.startswith("```"):
             new_state = not in_code_block
             lang = stripped[3:].strip()
-            
-            # Use dynamic cached width to respect terminal resizes
             term_cols = _get_term_cols()
             bar_len = min(term_cols - 4, 60)
-            
-            if new_state: # Opening a code block
+            if new_state:
                 lbl = lang.upper() or 'CODE'
                 dashes = max(1, bar_len - 17 - len(lbl))
                 return f"{C.DIM}╭{'─' * 15} {lbl} {'─' * dashes}{C.RESET}", new_state
-            else:         # Closing a code block
+            else:
                 return f"{C.DIM}╰{'─' * bar_len}{C.RESET}", new_state
-
         if in_code_block:
             return f"{C.CODE}{line}{C.RESET}", in_code_block
-
         h = self.header_pat.match(line)
         if h:
             return f"{C.BOLD}{C.INFO}{h.group(2)}{C.RESET}", in_code_block
-
         line = LATEX_RENDERER.render(line)
         line = self.code_pat.sub(rf'{C.CODE}`\1`{C.RESET}{C.AI}', line)
         line = self.bold_pat.sub(rf'{C.BOLD}\1{C.RESET}{C.AI}', line)
@@ -415,10 +411,8 @@ class MarkdownRenderer:
         rendered, _ = self._render_line_impl(line, self.in_code_block)
         return rendered
 
-
 LATEX_RENDERER = LatexRenderer()
 MD_RENDERER = MarkdownRenderer()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PROVIDERS
@@ -465,7 +459,6 @@ ENDPOINTS: dict[str, dict[str, str]] = {
 
 VALID_PROVIDERS = list(ENDPOINTS.keys())
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -500,24 +493,26 @@ def check_placeholder_key(key: str, provider: str) -> bool:
         bad = "looks incomplete"
     elif provider == "cloudflare" and ":" not in key:
         bad = "is missing the Account ID (Format must be ACCOUNT_ID:API_TOKEN)"
-    
     if bad:
         eprint(f"{C.WARN}WARNING: API key for {provider.upper()} {bad}.{C.RESET}")
         return False
     return True
 
 def strip_think_tags(text: str) -> str:
-    # Use re.I for "case-insensitive" and .*? for "non-greedy" matching
-    # This handles <think>, <THINK>, and even <think extra_info>
-    text = re.sub(r"<think.*?>.*?</think.*?>", "", text, flags=re.DOTALL | re.I)
-    # This catches a <think> block that started but never finished
-    text = re.sub(r"<think.*?>.*$", "", text, flags=re.DOTALL | re.I)
+    # FIX: Made regex more conservative to avoid eating legitimate content.
+    # Only match <think> tags that look like actual XML tags (word boundary after "think").
+    # The unclosed-tag fallback now only strips to end-of-string if the tag
+    # appears at a line boundary or start, reducing false positives in code blocks.
+    text = re.sub(r"<think(?:\s[^>]*)?>.*?</think\s*>", "", text, flags=re.DOTALL | re.I)
+    # For unclosed think tags: only strip if it starts at beginning of a line
+    # or the very start of text, to avoid matching "<think" inside code examples.
+    text = re.sub(r"(?:^|\n)\s*<think(?:\s[^>]*)?>.*$", "", text, flags=re.DOTALL | re.I)
     return text.strip()
 
 def filter_models(models: list[str], filters: list[str]) -> list[str]:
     if not filters:
         return models
-    out: list[str] =[]
+    out: list[str] = []
     for model in models:
         ml = model.lower()
         if all(re.search(r"(?:^|[^a-z0-9])" + re.escape(f.lower()) + r"(?:[^a-z0-9]|$)", ml) for f in filters):
@@ -548,7 +543,6 @@ def _args_to_obj(arguments: str) -> dict[str, Any]:
         obj = json.loads(arguments)
         return obj if isinstance(obj, dict) else {}
     except (json.JSONDecodeError, TypeError) as e:
-        # Pass the error back so the AI knows it made a mistake and can fix it!
         return {"error": f"Invalid JSON format: {str(e)}"}
 
 def _args_display(arguments: str) -> str:
@@ -578,7 +572,6 @@ def _make_opener() -> urllib.request.OpenerDirector:
         _SSRFSafeRedirectHandler(),
     )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # HTML CLEANING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -586,7 +579,7 @@ def _make_opener() -> urllib.request.OpenerDirector:
 class TextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.parts: list[str] =[]
+        self.parts: list[str] = []
         self.skip_tags = {'script', 'style', 'noscript', 'svg', 'iframe', 'template'}
         self.block_tags = {
             'div', 'p', 'br', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
@@ -614,9 +607,9 @@ class TextExtractor(HTMLParser):
 
     def get_text(self) -> str:
         raw = "".join(self.parts)
-        lines =[re.sub(r"[ \t]+", " ", line.strip()) for line in raw.split("\n")]
-        lines =[line for line in lines if line]
-        return "\n\n".join(lines)
+        lines = [re.sub(r"[ \t]+", " ", line.strip()) for line in raw.split("\n")]
+        lines = [line for line in lines if line]
+        return "\n".join(lines)
 
 def _clean_html(raw: str) -> str:
     if not raw:
@@ -631,7 +624,11 @@ def _clean_html(raw: str) -> str:
         return re.sub(r"\s+", " ", text).strip()
 
 class _ContentExtractor(HTMLParser):
-    """Two-pass content extractor: targets semantic tags, falls back to full page if thin."""
+    """Two-pass content extractor: targets semantic tags, falls back to full page if thin.
+
+    FIX: Now tracks which tag opened each scope level so that mismatched
+    closing tags don't desync the scope stack.
+    """
     TARGET_TAGS = {'article', 'main', 'section'}
     CONTENT_IDS = {
         'content', 'main', 'article', 'post', 'entry',
@@ -648,10 +645,11 @@ class _ContentExtractor(HTMLParser):
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.parts: list[str] =[]
+        self.parts: list[str] = []
         self._skip_depth = 0
         self._scope_depth = 0
-        self._scope_stack: list[bool] =[]
+        # FIX: Store (tag_name, was_scoped) tuples so we can match end tags properly
+        self._scope_stack: list[tuple[str, bool]] = []
 
     def _is_content_div(self, attrs: list[tuple[str, Optional[str]]]) -> bool:
         for name, val in attrs:
@@ -667,15 +665,14 @@ class _ContentExtractor(HTMLParser):
             return
         if self._skip_depth > 0:
             return
-
         in_scope = (
             tag in self.TARGET_TAGS
             or (tag == 'div' and self._is_content_div(attrs))
         )
-        self._scope_stack.append(in_scope)
+        # FIX: Push (tag, in_scope) so handle_endtag can verify the match
+        self._scope_stack.append((tag, in_scope))
         if in_scope:
             self._scope_depth += 1
-
         if tag in self.BLOCK_TAGS and self._scope_depth > 0:
             self.parts.append('\n')
 
@@ -686,12 +683,26 @@ class _ContentExtractor(HTMLParser):
             return
         if self._skip_depth > 0:
             return
-
+        # FIX: Only pop if the closing tag matches what was opened.
+        # This prevents desync on malformed HTML with mismatched tags.
         if self._scope_stack:
-            was_scoped = self._scope_stack.pop()
-            if was_scoped:
-                self._scope_depth = max(0, self._scope_depth - 1)
-
+            open_tag, was_scoped = self._scope_stack[-1]
+            if open_tag == tag:
+                self._scope_stack.pop()
+                if was_scoped:
+                    self._scope_depth = max(0, self._scope_depth - 1)
+            else:
+                # Mismatched tag: search stack for a matching opener
+                for i in range(len(self._scope_stack) - 1, -1, -1):
+                    if self._scope_stack[i][0] == tag:
+                        # Pop everything from i onward (implicit close of nested tags)
+                        removed = self._scope_stack[i:]
+                        self._scope_stack = self._scope_stack[:i]
+                        for _, ws in removed:
+                            if ws:
+                                self._scope_depth = max(0, self._scope_depth - 1)
+                        break
+                # If no match found, ignore the stray end tag
         if tag in self.BLOCK_TAGS and self._scope_depth > 0:
             self.parts.append('\n')
 
@@ -701,8 +712,8 @@ class _ContentExtractor(HTMLParser):
 
     def get_text(self) -> str:
         raw = ''.join(self.parts)
-        lines =[re.sub(r'[ \t]+', ' ', ln.strip()) for ln in raw.split('\n')]
-        return '\n\n'.join(ln for ln in lines if ln)
+        lines = [re.sub(r'[ \t]+', ' ', ln.strip()) for ln in raw.split('\n')]
+        return '\n'.join(ln for ln in lines if ln)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TOOL SPINNER
@@ -751,7 +762,6 @@ class _ToolProgress:
 
 _PROGRESS = _ToolProgress()
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP
 # ─────────────────────────────────────────────────────────────────────────────
@@ -785,8 +795,10 @@ def _request_with_retry(
             wait = 2 ** attempt
             eprint(f"{C.WARN}Network error — retrying in {wait}s…{C.RESET}")
             time.sleep(wait)
-    raise last_exc  # type: ignore[misc]
-
+    # Should not reach here, but satisfy type checker
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Retry loop exhausted with no exception captured")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WEB FETCH
@@ -802,7 +814,6 @@ _FETCH_HEADERS_PRIMARY = {
     "Upgrade-Insecure-Requests": "1",
     "Referer": "https://www.google.com/",
 }
-
 _FETCH_HEADERS_FALLBACK = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -816,13 +827,10 @@ def _fetch_page(url: str, timeout: int = 20) -> str:
     ok, err = _validate_url(url)
     if not ok:
         raise ValueError(f"Blocked: {err}")
-
     last_error: Optional[Exception] = None
-
     for headers in (_FETCH_HEADERS_PRIMARY, _FETCH_HEADERS_FALLBACK):
         req = urllib.request.Request(url, headers=headers)
         try:
-            # Create a fresh, clean cookie jar for every single website visit
             fresh_opener = _make_opener()
             with fresh_opener.open(req, timeout=timeout) as resp:
                 cl = resp.headers.get("Content-Length")
@@ -831,7 +839,6 @@ def _fetch_page(url: str, timeout: int = 20) -> str:
                         cl_int = int(cl)
                     except ValueError:
                         cl_int = 0
-                    
                     if cl_int > FETCH_MAX_BYTES:
                         raise RuntimeError(f"Response too large: {cl_int} bytes")
                 raw = resp.read(FETCH_MAX_BYTES + 1)
@@ -841,6 +848,8 @@ def _fetch_page(url: str, timeout: int = 20) -> str:
                 return raw.decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             last_error = exc
+            # NOTE: Only retry with fallback headers on auth/rate-limit errors.
+            # Server errors (5xx) are raised immediately since changing UA won't help.
             if exc.code in (401, 403, 429):
                 continue
             raise
@@ -849,11 +858,9 @@ def _fetch_page(url: str, timeout: int = 20) -> str:
         except Exception as exc:
             last_error = exc
             continue
-
     if last_error is not None:
         raise last_error
     raise RuntimeError("Failed to fetch page")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # IMAGE
@@ -879,23 +886,19 @@ class ImageAttachment:
         if not path.is_file():
             eprint(f"{C.ERROR}Error: File not found: {path}{C.RESET}")
             return False
-
         size_mb = path.stat().st_size / (1024 * 1024)
         if size_mb > MAX_IMAGE_SIZE_MB:
             eprint(f"{C.ERROR}Error: Image too large ({size_mb:.1f} MB). Max {MAX_IMAGE_SIZE_MB} MB.{C.RESET}")
             return False
-
         mime, _ = mimetypes.guess_type(str(path))
         if not mime:
             mime = {
                 ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                 ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
             }.get(path.suffix.lower(), "")
-
         if mime not in SUPPORTED_MIME_TYPES:
             eprint(f"{C.ERROR}Error: Unsupported type '{mime}'.{C.RESET}")
             return False
-
         eprint(f"{C.IMAGE}Encoding image…{C.RESET}")
         try:
             raw = path.read_bytes()
@@ -908,13 +911,37 @@ class ImageAttachment:
             eprint(f"{C.ERROR}Error reading image: {exc}{C.RESET}")
             return False
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # RESEARCH ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-SEARCH_CACHE: dict[str, list[dict[str, Any]]] = {}
-PAGE_CACHE: dict[str, tuple[str, str]] = {}
+# FIX: Bounded caches using OrderedDict with LRU eviction
+SEARCH_CACHE: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+PAGE_CACHE: OrderedDict[str, tuple[str, str]] = OrderedDict()
+
+def _cache_get_search(key: str) -> Optional[list[dict[str, Any]]]:
+    if key in SEARCH_CACHE:
+        SEARCH_CACHE.move_to_end(key)
+        return SEARCH_CACHE[key]
+    return None
+
+def _cache_put_search(key: str, val: list[dict[str, Any]]) -> None:
+    SEARCH_CACHE[key] = val
+    SEARCH_CACHE.move_to_end(key)
+    while len(SEARCH_CACHE) > SEARCH_CACHE_MAX:
+        SEARCH_CACHE.popitem(last=False)
+
+def _cache_get_page(key: str) -> Optional[tuple[str, str]]:
+    if key in PAGE_CACHE:
+        PAGE_CACHE.move_to_end(key)
+        return PAGE_CACHE[key]
+    return None
+
+def _cache_put_page(key: str, val: tuple[str, str]) -> None:
+    PAGE_CACHE[key] = val
+    PAGE_CACHE.move_to_end(key)
+    while len(PAGE_CACHE) > PAGE_CACHE_MAX:
+        PAGE_CACHE.popitem(last=False)
 
 _STOPWORDS = {
     "the", "and", "for", "are", "with", "that", "this", "from", "was", "were",
@@ -930,7 +957,7 @@ def _tokenize(text: str) -> list[str]:
     tokens = re.findall(r"[a-z0-9]{2,}", raw.lower())
     if len(tokens) <= 3 or '"' in raw:
         return tokens
-    filtered =[t for t in tokens if t not in _STOPWORDS]
+    filtered = [t for t in tokens if t not in _STOPWORDS]
     return filtered or tokens
 
 def _domain_of(url: str) -> str:
@@ -955,7 +982,7 @@ def _normalize_url(url: str) -> str:
     if path != "/":
         path = path.rstrip("/")
     qs = urllib.parse.parse_qsl(p.query, keep_blank_values=False)
-    qs =[
+    qs = [
         (k, v) for k, v in qs
         if not (
             k.lower().startswith("utm_")
@@ -971,16 +998,13 @@ def _unwrap_result_url(url: str) -> str:
         return ""
     if url.startswith("/"):
         url = urllib.parse.urljoin("https://www.startpage.com", url)
-
     try:
         p = urllib.parse.urlparse(url)
     except Exception:
         return url
-
     host = (p.netloc or "").lower()
     if p.scheme in ("http", "https") and "startpage.com" not in host:
         return url
-
     qs = urllib.parse.parse_qs(p.query)
     for key in ("url", "u", "to", "target"):
         vals = qs.get(key)
@@ -1026,50 +1050,40 @@ def _domain_quality_bonus(url: str) -> float:
 def _score_text(query: str, title: str = "", snippet: str = "", url: str = "", body: str = "") -> float:
     q_tokens = _tokenize(query)
     phrase = (query or "").strip().lower()
-
     title_l = (title or "").lower()
     snippet_l = (snippet or "").lower()
     url_l = (url or "").lower()
     body_l = (body or "").lower()
-
     full = f"{title_l} {snippet_l} {url_l} {body_l[:6000]}"
     score = 0.0
-
     if phrase:
         if phrase in title_l:
             score += 8.0
         if phrase in full:
             score += 6.0
-
     for tok in q_tokens:
         if tok in title_l:
             score += 4.0
         if tok in snippet_l:
             score += 2.0
         score += min(full.count(tok), 5) * 0.8
-
     score += _domain_quality_bonus(url)
     return score
 
 def _query_variants(query: str) -> list[str]:
     q = (query or "").strip()
     if not q:
-        return[]
-
+        return []
     year = datetime.datetime.now().year
     ql = q.lower()
     out = [q]
-
     if any(k in ql for k in ("latest", "current", "new", "recent", "today", "now", "version", "release", "pricing", "price", "updated", "update")):
         out.append(f"{q} {year}")
-
     if any(k in ql for k in ("api", "sdk", "docs", "documentation", "install", "cli", "python", "javascript", "typescript", "error", "traceback", "library", "package", "pip", "docker", "fastapi")):
         out.append(f"{q} official documentation")
-
     if len(q.split()) >= 3:
-        out.append(f"\"{q}\"")
-
-    dedup: list[str] =[]
+        out.append(f'"{q}"')
+    dedup: list[str] = []
     seen: set[str] = set()
     for item in out:
         k = item.lower()
@@ -1079,8 +1093,8 @@ def _query_variants(query: str) -> list[str]:
     return dedup
 
 def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> list[str]:
-    paras =[p.strip() for p in re.split(r"\n{2,}", text or "") if p.strip()]
-    chunks: list[str] =[]
+    paras = [p.strip() for p in re.split(r"\n{2,}", text or "") if p.strip()]
+    chunks: list[str] = []
     cur = ""
 
     def push(buf: str) -> None:
@@ -1102,11 +1116,10 @@ def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> list[s
                     break
                 start = max(end - overlap, start + 1)
             continue
-
         if not cur:
             cur = p
         elif len(cur) + 2 + len(p) <= chunk_size:
-            cur += "\n\n" + p
+            cur += "\n" + p
         else:
             push(cur)
             cur = p
@@ -1117,7 +1130,7 @@ def _chunk_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> list[s
 def _best_excerpts(query: str, title: str, url: str, text: str, max_chunks: int = 4) -> list[str]:
     chunks = _chunk_text(text)
     if not chunks:
-        return[]
+        return []
     ranked = sorted(chunks, key=lambda ch: _score_text(query, title=title, url=url, body=ch), reverse=True)
     out: list[str] = []
     seen: set[str] = set()
@@ -1136,39 +1149,35 @@ def _extract_title_and_text(raw_html: str) -> tuple[str, str]:
     m = re.search(r'<title[^>]*>(.*?)</title>', raw_html, flags=re.I | re.S)
     if m:
         title = re.sub(r'\s+', ' ', _clean_html(m.group(1))).strip()
-
-    # Pass 1: Scoped extraction (targets <article>, <main>, content divs)
     scoped_parser = _ContentExtractor()
     try:
         scoped_parser.feed(raw_html)
         scoped_text = scoped_parser.get_text()
     except Exception:
         scoped_text = ''
-
-    # Pass 2: Fallback to full page if scoped content is too thin
     if len(scoped_text) >= 500:
         return title, scoped_text
-
     return title, _clean_html(raw_html)
 
 def _fetch_page_text(url: str) -> tuple[str, str]:
     url = _normalize_url(url)
-    cached = PAGE_CACHE.get(url)
+    # FIX: Use bounded LRU cache
+    cached = _cache_get_page(url)
     if cached is not None:
         return cached
     raw = _fetch_page(url)
     title, text = _extract_title_and_text(raw)
-    PAGE_CACHE[url] = (title, text)
+    _cache_put_page(url, (title, text))
     return title, text
 
 def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, Any]]:
     cache_key = f"sp::{query}::{limit}"
-    cached = SEARCH_CACHE.get(cache_key)
+    # FIX: Use bounded LRU cache
+    cached = _cache_get_search(cache_key)
     if cached is not None:
         return cached[:limit]
 
     opener = _make_opener()
-
     try:
         _PROGRESS.update("Connecting to Startpage…")
         req = urllib.request.Request(
@@ -1216,13 +1225,13 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
             raw = _decompress(raw, resp.headers.get("Content-Encoding", ""))
             html_text = raw.decode("utf-8", errors="replace")
     except Exception:
-        return[]
+        return []
 
     if "captcha" in html_text.lower():
-        return[]
+        return []
 
     _PROGRESS.update("Parsing results…")
-    found: list[tuple[str, str, str]] =[]
+    found: list[tuple[str, str, str]] = []
 
     for m in re.finditer(
         r'<a[^>]+class="[^"]*result-title[^"]*"[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
@@ -1247,7 +1256,11 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
         ):
             found.append((m.group(1), re.sub(r"\s+", " ", _clean_html(m.group(2))).strip(), ""))
 
-    out: list[dict[str, Any]] =[]
+    # FIX: Warn user if both scraping patterns failed (Startpage may have changed HTML)
+    if not found:
+        eprint(f"{C.WARN}⚠ Startpage HTML structure may have changed. Search results unavailable.{C.RESET}")
+
+    out: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
     for href, title, snippet in found:
         url = _normalize_url(_unwrap_result_url(href))
@@ -1270,16 +1283,14 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
             break
 
     out.sort(key=lambda x: x["score"], reverse=True)
-    SEARCH_CACHE[cache_key] = out
+    _cache_put_search(cache_key, out)
     return out[:limit]
 
 def _search_candidates(query: str, max_sources: int) -> list[dict[str, Any]]:
     variants = _query_variants(query)[:4]
-    all_rows: list[dict[str, Any]] =[]
+    all_rows: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
-
     per_variant = max(10, max_sources * 5)
-
     for variant_index, variant in enumerate(variants):
         rows = _startpage_search_structured(variant, limit=per_variant)
         for rank, row in enumerate(rows, 1):
@@ -1294,13 +1305,10 @@ def _search_candidates(query: str, max_sources: int) -> list[dict[str, Any]]:
                 item["score"] += 3.0
             item["score"] += max(0.0, 2.0 - 0.15 * (rank - 1))
             all_rows.append(item)
-
     all_rows.sort(key=lambda x: x["score"], reverse=True)
-
-    primary: list[dict[str, Any]] =[]
-    fallback: list[dict[str, Any]] =[]
+    primary: list[dict[str, Any]] = []
+    fallback: list[dict[str, Any]] = []
     seen_domains: set[str] = set()
-
     for item in all_rows:
         dom = _domain_of(item["url"])
         if dom and dom not in seen_domains:
@@ -1308,14 +1316,13 @@ def _search_candidates(query: str, max_sources: int) -> list[dict[str, Any]]:
             seen_domains.add(dom)
         else:
             fallback.append(item)
-
     return (primary + fallback)[:RESEARCH_MAX_CANDIDATES]
 
 def _fetch_source_batch(batch: list[dict[str, Any]], query: str) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    ok_rows: list[dict[str, Any]] =[]
-    bad_rows: list[dict[str, str]] =[]
+    ok_rows: list[dict[str, Any]] = []
+    bad_rows: list[dict[str, str]] = []
     lock = threading.Lock()
-    threads: list[threading.Thread] =[]
+    threads: list[threading.Thread] = []
 
     def worker(candidate: dict[str, Any]) -> None:
         url = candidate["url"]
@@ -1323,19 +1330,13 @@ def _fetch_source_batch(batch: list[dict[str, Any]], query: str) -> tuple[list[d
             title, text = _fetch_page_text(url)
             if len((text or "").strip()) < 200:
                 raise ValueError("not enough readable text")
-
             final_title = title or candidate.get("title") or url
             excerpts = _best_excerpts(query, final_title, url, text, max_chunks=4)
             if not excerpts:
                 excerpts = [text[:1800]]
-
             score = float(candidate.get("score", 0.0)) + _score_text(
-                query,
-                title=final_title,
-                url=url,
-                body="\n\n".join(excerpts),
+                query, title=final_title, url=url, body="\n".join(excerpts),
             )
-
             with lock:
                 ok_rows.append({
                     "title": final_title,
@@ -1353,22 +1354,18 @@ def _fetch_source_batch(batch: list[dict[str, Any]], query: str) -> tuple[list[d
         t = threading.Thread(target=worker, args=(item,), daemon=True)
         threads.append(t)
         t.start()
-
     for t in threads:
         t.join(timeout=22)
-
     return ok_rows, bad_rows
 
 def _research_sources(query: str, max_sources: int) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, Any]]]:
     max_sources = max(1, min(max_sources, RESEARCH_MAX_SOURCES))
     candidates = _search_candidates(query, max_sources=max_sources)
     if not candidates:
-        return [], [],[]
-
-    fetched_raw: list[dict[str, Any]] =[]
-    failures: list[dict[str, str]] =[]
+        return [], [], []
+    fetched_raw: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
     cursor = 0
-
     while cursor < len(candidates):
         batch = candidates[cursor:cursor + RESEARCH_BATCH_SIZE]
         cursor += RESEARCH_BATCH_SIZE
@@ -1376,17 +1373,13 @@ def _research_sources(query: str, max_sources: int) -> tuple[list[dict[str, Any]
         ok_rows, bad_rows = _fetch_source_batch(batch, query)
         fetched_raw.extend(ok_rows)
         failures.extend(bad_rows)
-
         unique_domains = {_domain_of(item["url"]) for item in fetched_raw if _domain_of(item["url"])}
         if len(unique_domains) >= max_sources:
             break
-
     fetched_raw.sort(key=lambda x: x["score"], reverse=True)
-
-    selected: list[dict[str, Any]] =[]
-    leftovers: list[dict[str, Any]] =[]
+    selected: list[dict[str, Any]] = []
+    leftovers: list[dict[str, Any]] = []
     seen_domains: set[str] = set()
-
     for item in fetched_raw:
         dom = _domain_of(item["url"])
         if dom and dom not in seen_domains:
@@ -1394,15 +1387,12 @@ def _research_sources(query: str, max_sources: int) -> tuple[list[dict[str, Any]
             seen_domains.add(dom)
         else:
             leftovers.append(item)
-
     if len(selected) < max_sources:
         for item in leftovers:
             selected.append(item)
             if len(selected) >= max_sources:
                 break
-
     return selected[:max_sources], failures, candidates
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TOOLS
@@ -1413,6 +1403,9 @@ def tool_get_time(**kwargs: Any) -> str:
 
 _CALC_MAX_EXPONENT = 10_000
 _CALC_MAX_RESULT = 1e308
+# FIX: Cap factorial output string length to avoid injecting huge numbers into history
+_CALC_MAX_FACTORIAL = 170  # 170! is the largest that fits in float64
+_CALC_MAX_RESULT_STR_LEN = 500
 
 _CALC_ALLOWED_FUNCS: dict[str, Any] = {
     "sqrt": math.sqrt, "abs": abs, "sin": math.sin, "cos": math.cos, "tan": math.tan,
@@ -1433,7 +1426,6 @@ _CALC_BIN_OPS: dict[type, Any] = {
 _CALC_UNARY_OPS: dict[type, Any] = {
     ast.USub: operator.neg, ast.UAdd: operator.pos,
 }
-
 
 def tool_calculator(expression: str = "", **kwargs: Any) -> str:
     def _eval_node(node: ast.AST) -> Any:
@@ -1470,32 +1462,37 @@ def tool_calculator(expression: str = "", **kwargs: Any) -> str:
                 raise TypeError(f"Unknown function '{name}'")
             if node.keywords:
                 raise TypeError("Keyword arguments not supported")
-            args =[_eval_node(a) for a in node.args]
+            args = [_eval_node(a) for a in node.args]
             if name == "factorial":
                 if len(args) != 1 or not isinstance(args[0], int) or args[0] < 0:
                     raise ValueError("factorial() requires a non-negative integer")
-                if args[0] > 1000:
-                    raise ValueError("factorial() input too large")
+                # FIX: Reduced cap from 1000 to 170 to avoid astronomically large ints
+                if args[0] > _CALC_MAX_FACTORIAL:
+                    raise ValueError(f"factorial() input too large (max {_CALC_MAX_FACTORIAL})")
             return fn(*args)
         raise TypeError(f"Unsupported expression element: {type(node).__name__}")
 
     if not expression.strip():
         return "Error: No expression provided."
     try:
-        # Only replace ^ if it's not being used as a valid Python BitXor operator
-        if "^" in expression and "**" not in expression:
-            expression = expression.replace("^", "**")
-            
+        # FIX: Removed the blanket ^ → ** replacement.
+        # The AST evaluator already handles ^ as BitXor (operator.xor) and ** as Pow.
+        # Users should use ** for exponentiation and ^ for XOR.
+        # This prevents "5 ^ 3" (XOR=6) from being misinterpreted as "5 ** 3" (pow=125).
         tree = ast.parse(expression, mode="eval")
         result = _eval_node(tree.body)
         if isinstance(result, float) and result == int(result) and not math.isinf(result):
-            return str(int(result))
-        return str(result)
+            result_str = str(int(result))
+        else:
+            result_str = str(result)
+        # FIX: Truncate extremely long result strings
+        if len(result_str) > _CALC_MAX_RESULT_STR_LEN:
+            result_str = result_str[:_CALC_MAX_RESULT_STR_LEN] + "… [truncated]"
+        return result_str
     except (TypeError, ValueError, OverflowError, ZeroDivisionError) as exc:
         return f"Error: {exc}"
     except SyntaxError:
         return f"Error: Invalid expression syntax: {expression}"
-
 
 def tool_web_search(query: str = "", num_results: int = 0, **kwargs: Any) -> str:
     if not query:
@@ -1505,12 +1502,10 @@ def tool_web_search(query: str = "", num_results: int = 0, **kwargs: Any) -> str
     except Exception:
         limit = 0
     limit = limit if 1 <= limit <= 10 else SEARCH_MAX_RESULTS
-
     rows = _search_candidates(query, max_sources=max(limit, 6))[:limit]
     if not rows:
         return f"No results found for: {query}"
-
-    lines =[
+    lines = [
         f"Web search results for: {query}",
         "(Quick lookup only. For final factual/current answers, prefer web_research.)",
         "",
@@ -1525,31 +1520,26 @@ def tool_web_search(query: str = "", num_results: int = 0, **kwargs: Any) -> str
         lines.append("")
     return "\n".join(lines).strip()[:FETCH_MAX_CHARS]
 
-
 def tool_fetch_url(url: str = "", focus_query: str = "", **kwargs: Any) -> str:
     if not url:
         return "Error: No URL provided."
     if not url.startswith("http"):
         url = "https://" + url
     url = _normalize_url(url)
-
     ok, err = _validate_url(url)
     if not ok:
         return f"Error: {err}"
-
     try:
         _PROGRESS.update(f"Fetching {truncate(_domain_of(url) or url, 35)}…")
         title, text = _fetch_page_text(url)
         if not text:
             return f"Error: No readable text found at {url}"
-
         focus_query = str(focus_query or "").strip()
         if focus_query:
             excerpts = _best_excerpts(focus_query, title or url, url, text, max_chunks=4)
             if not excerpts:
                 excerpts = [text[:1800]]
-
-            lines =[
+            lines = [
                 f"Page: {title or url}",
                 f"URL: {url}",
                 f"Focus query: {focus_query}",
@@ -1560,35 +1550,29 @@ def tool_fetch_url(url: str = "", focus_query: str = "", **kwargs: Any) -> str:
                 lines.append(ex)
                 lines.append("")
             return "\n".join(lines).strip()[:FETCH_MAX_CHARS]
-
-        header = f"Page: {title}\nURL: {url}\n\n" if title else f"URL: {url}\n\n"
+        header = f"Page: {title}\nURL: {url}\n" if title else f"URL: {url}\n"
         full = header + text
         if len(full) > FETCH_MAX_CHARS:
-            return full[:FETCH_MAX_CHARS] + "\n\n[Content truncated]"
+            return full[:FETCH_MAX_CHARS] + "\n[Content truncated]"
         return full
-
     except urllib.error.HTTPError as exc:
         return f"Error fetching URL: HTTP {exc.code} ({exc.reason})"
     except Exception as exc:
         return f"Error fetching URL: {exc}"
 
-
 def tool_web_research(query: str = "", max_sources: int = RESEARCH_TARGET_SOURCES, **kwargs: Any) -> str:
     if not query:
         return "Error: No query provided."
-
     try:
         max_sources = int(max_sources)
     except Exception:
         max_sources = RESEARCH_TARGET_SOURCES
     max_sources = max(1, min(max_sources, RESEARCH_MAX_SOURCES))
-
     _PROGRESS.update("Building candidate list…")
     selected, failures, candidates = _research_sources(query, max_sources=max_sources)
     if not selected:
         return f"No research sources could be fetched for: {query}"
-
-    lines =[
+    lines = [
         f"Research results for: {query}",
         f"RESEARCH_SOURCES_REVIEWED: {len(selected)}",
         f"RESEARCH_TARGET_SOURCES: {max_sources}",
@@ -1596,7 +1580,6 @@ def tool_web_research(query: str = "", max_sources: int = RESEARCH_TARGET_SOURCE
         f"Candidate URLs considered: {len(candidates)}",
         "",
     ]
-
     for i, item in enumerate(selected, 1):
         lines.append(f"[{i}] {item['title']}")
         lines.append(f"URL: {item['url']}")
@@ -1606,16 +1589,14 @@ def tool_web_research(query: str = "", max_sources: int = RESEARCH_TARGET_SOURCE
         if item.get("query_used") and item["query_used"] != query:
             lines.append(f"Matched via query variant: {item['query_used']}")
         lines.append("Relevant excerpts:")
-        for ex in item.get("excerpts",[])[:4]:
+        for ex in item.get("excerpts", [])[:4]:
             lines.append(f"- {truncate(ex, 1800)}")
         lines.append("")
-
     if failures:
         lines.append("Fetch failures:")
         for row in failures[:10]:
             lines.append(f"- {row['url']} :: {truncate(row['error'], 160)}")
         lines.append("")
-
     if len(selected) < RESEARCH_MIN_SOURCES:
         lines.append(
             f"WARNING: Only {len(selected)} independent sources could be reviewed. "
@@ -1625,16 +1606,13 @@ def tool_web_research(query: str = "", max_sources: int = RESEARCH_TARGET_SOURCE
         lines.append(
             "You have enough sources to answer. Prefer claims supported by multiple numbered sources above."
         )
-
     return "\n".join(lines).strip()[:FETCH_MAX_CHARS]
-
 
 def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
     if not query:
         return "Error: No query provided."
     if not re.fullmatch(r"[a-z]{2,5}", lang):
         lang = "en"
-
     try:
         _PROGRESS.update(f"Searching Wikipedia: {truncate(query, 30)}")
         search_url = (
@@ -1646,17 +1624,14 @@ def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
         req = urllib.request.Request(search_url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
-
-        rows = data.get("query", {}).get("search",[])
+        rows = data.get("query", {}).get("search", [])
         if not rows:
             return f"No Wikipedia results for: {query}"
-
         title = rows[0]["title"]
         page_url = f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
         return tool_fetch_url(url=page_url, focus_query=query)
     except Exception as exc:
         return f"Error: {exc}"
-
 
 TOOLS_REGISTRY: dict[str, Any] = {
     "get_time":      tool_get_time,
@@ -1667,8 +1642,7 @@ TOOLS_REGISTRY: dict[str, Any] = {
     "wikipedia":     tool_wikipedia,
 }
 
-
-OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] =[
+OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
@@ -1681,7 +1655,7 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] =[
         "type": "function",
         "function": {
             "name": "calculator",
-            "description": "Evaluate a mathematical expression.",
+            "description": "Evaluate a mathematical expression. Use ** for exponentiation, ^ for XOR.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1723,7 +1697,7 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] =[
                     "query": {"type": "string"},
                     "max_sources": {"type": "integer"},
                 },
-                "required":["query"],
+                "required": ["query"],
             },
         },
     },
@@ -1759,17 +1733,17 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] =[
     },
 ]
 
-GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] =[
+GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
-        "functionDeclarations":[
+        "functionDeclarations": [
             {"name": "get_time", "description": "Get the current local time and date."},
             {
                 "name": "calculator",
-                "description": "Evaluate a mathematical expression.",
+                "description": "Evaluate a mathematical expression. Use ** for exponentiation, ^ for XOR.",
                 "parameters": {
                     "type": "object",
                     "properties": {"expression": {"type": "string"}},
-                    "required":["expression"],
+                    "required": ["expression"],
                 },
             },
             {
@@ -1784,7 +1758,7 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] =[
                         "query": {"type": "string"},
                         "num_results": {"type": "integer"},
                     },
-                    "required":["query"],
+                    "required": ["query"],
                 },
             },
             {
@@ -1811,7 +1785,7 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] =[
                         "url": {"type": "string"},
                         "focus_query": {"type": "string"},
                     },
-                    "required":["url"],
+                    "required": ["url"],
                 },
             },
             {
@@ -1830,18 +1804,15 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] =[
     },
 ]
 
-
 def execute_tool(name: str, arguments_json: str) -> str:
     fn = TOOLS_REGISTRY.get(name)
     if fn is None:
         return f"Error: unknown tool '{name}'"
-
     args = _args_to_obj(arguments_json)
     args = {k: v for k, v in args.items() if k}
-
     _PROGRESS.start(f"{name}…")
-    result_box: list[Optional[str]] =[None]
-    error_box: list[Optional[Exception]] =[None]
+    result_box: list[Optional[str]] = [None]
+    error_box: list[Optional[Exception]] = [None]
 
     def _run() -> None:
         try:
@@ -1853,13 +1824,11 @@ def execute_tool(name: str, arguments_json: str) -> str:
     worker.start()
     worker.join(timeout=TOOL_EXEC_TIMEOUT)
     _PROGRESS.stop()
-
     if worker.is_alive():
         return f"Error: tool '{name}' timed out after {TOOL_EXEC_TIMEOUT}s"
     if error_box[0] is not None:
         return f"Error executing '{name}': {error_box[0]}"
     return result_box[0] or ""
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION MANAGEMENT
@@ -1867,7 +1836,6 @@ def execute_tool(name: str, arguments_json: str) -> str:
 
 def _session_path(name: str) -> Path:
     return SESSION_DIR / f"{name}.json"
-
 
 def save_session(name: str, history: History) -> None:
     SESSION_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1880,7 +1848,6 @@ def save_session(name: str, history: History) -> None:
     except OSError as exc:
         eprint(f"{C.ERROR}Error saving session: {exc}{C.RESET}")
 
-
 def _validate_session_data(data: Any) -> str:
     if not isinstance(data, list):
         return "not a JSON array"
@@ -1891,7 +1858,6 @@ def _validate_session_data(data: Any) -> str:
         if not role:
             return "missing role"
     return ""
-
 
 def load_session(name: str) -> Optional[History]:
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -1910,7 +1876,6 @@ def load_session(name: str) -> Optional[History]:
         return None
     cprint(f"{C.INFO}Session loaded ← {path} ({len(data)} messages){C.RESET}")
     return data
-
 
 def clear_sessions() -> None:
     if not SESSION_DIR.exists():
@@ -1935,16 +1900,14 @@ def clear_sessions() -> None:
     else:
         cprint(f"{C.INFO}Cancelled.{C.RESET}")
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # HISTORY
 # ─────────────────────────────────────────────────────────────────────────────
 
 def init_history(is_openai_compat: bool) -> History:
     if SYSTEM_PROMPT and is_openai_compat:
-        return[{"role": "system", "content": SYSTEM_PROMPT}]
-    return[]
-
+        return [{"role": "system", "content": SYSTEM_PROMPT}]
+    return []
 
 def truncate_history(history: History, is_openai_compat: bool) -> History:
     system_offset = 1 if is_openai_compat and history and history[0].get("role") == "system" else 0
@@ -1955,9 +1918,8 @@ def truncate_history(history: History, is_openai_compat: bool) -> History:
     if not is_openai_compat and to_remove % 2 == 1:
         to_remove += 1
     if system_offset:
-        return[history[0]] + history[1 + to_remove:]
+        return [history[0]] + history[1 + to_remove:]
     return history[to_remove:]
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODELS INTERACTIVE UI
@@ -1977,11 +1939,9 @@ def _build_request(url: str, api_key: str, provider: str, data: Optional[bytes] 
     method = "POST" if data is not None else "GET"
     return urllib.request.Request(url, data=data, headers=headers, method=method)
 
-
 def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
     ep = ENDPOINTS[provider]
     models_url = ep["models"]
-
     if provider == "cloudflare":
         if ":" not in api_key:
             eprint(f"{C.ERROR}Cloudflare API key must be in format ACCOUNT_ID:API_TOKEN{C.RESET}")
@@ -1989,13 +1949,11 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
         acc_id, token = api_key.split(":", 1)
         models_url = models_url.replace("{account_id}", acc_id)
         api_key = token
-
     if provider == "gemini":
         url = f"{models_url}?key={api_key}"
         req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
     else:
         req = _build_request(models_url, api_key, provider)
-
     try:
         with _request_with_retry(req, timeout=MODEL_FETCH_TIMEOUT) as resp:
             body = resp.read().decode("utf-8", errors="replace")
@@ -2006,45 +1964,40 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
     except OSError as exc:
         eprint(f"{C.ERROR}Network error fetching models: {exc}{C.RESET}")
         return None
-
     try:
         data = json.loads(body)
     except json.JSONDecodeError:
         eprint(f"{C.ERROR}Invalid JSON from model endpoint.{C.RESET}")
         return None
-
     try:
         if provider == "gemini":
             models = [
                 m["name"].replace("models/", "")
-                for m in data.get("models",[])
+                for m in data.get("models", [])
                 if (
-                    any("generateContent" in method for method in m.get("supportedGenerationMethods",[]))
+                    any("generateContent" in method for method in m.get("supportedGenerationMethods", []))
                     and not m["name"].startswith("models/embedding")
                 )
             ]
         elif provider == "ollama":
-            models = [m["name"] for m in data.get("models",[])]
+            models = [m["name"] for m in data.get("models", [])]
         elif provider == "together":
-            arr = data if isinstance(data, list) else data.get("data",[])
+            arr = data if isinstance(data, list) else data.get("data", [])
             models = sorted(m["id"] for m in arr)
         elif provider == "cloudflare":
             models = sorted(
-                m["name"] for m in data.get("result",[])
+                m["name"] for m in data.get("result", [])
                 if m.get("task", {}).get("name") == "Text Generation" or "task" not in m
             )
         else:
-            models = sorted(m["id"] for m in data.get("data",[]))
+            models = sorted(m["id"] for m in data.get("data", []))
     except Exception as exc:
         eprint(f"{C.ERROR}Could not parse model list: {exc}{C.RESET}")
         return None
-
-    return[m for m in models if m]
-
+    return [m for m in models if m]
 
 _PICK_SEL_BG = "\033[48;5;215m"
 _PICK_SEL_FG = "\033[38;5;16m"
-
 
 class _RawTerminal:
     def __init__(self) -> None:
@@ -2062,7 +2015,6 @@ class _RawTerminal:
         if self.fd is not None and self.old is not None and termios:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
 
-
 def _truncate_plain(text: str, width: int) -> str:
     if width <= 0:
         return ""
@@ -2072,71 +2024,51 @@ def _truncate_plain(text: str, width: int) -> str:
         return "…"
     return text[:width - 1] + "…"
 
-
 def _picker_filter_models(models: list[str], query: str) -> list[str]:
     q = (query or "").strip().lower()
     if not q:
         return list(models)
-
-    parts =[p for p in q.split() if p]
+    parts = [p for p in q.split() if p]
     if not parts:
         return list(models)
-
-    out: list[str] =[]
+    out: list[str] = []
     for model in models:
         ml = model.lower()
         if all(part in ml for part in parts):
             out.append(model)
     return out
 
-
 def _tty_join(lines: list[str]) -> str:
     return "\r\n".join(lines)
-
 
 def _ansi_pad(text: str, width: int) -> str:
     pad = max(0, width - _visible_len(text))
     return text + (" " * pad)
 
-
 def _panel_line(content: str, inner_width: int) -> str:
     return f"│{_ansi_pad(content, inner_width)}│"
-
 
 def _center_block(lines: list[str], term_cols: int, term_rows: int) -> str:
     block_h = len(lines)
     block_w = max((_visible_len(line) for line in lines), default=0)
-
     top = max(0, (term_rows - block_h) // 2)
     left = max(0, (term_cols - block_w) // 2)
-
-    out: list[str] =[]
+    out: list[str] = []
     out.extend([""] * top)
-
     prefix = " " * left
     for line in lines:
         out.append(prefix + line)
-
     return "\033[H\033[2J" + _tty_join(out)
-
 
 def _read_picker_key() -> str:
     if os.name == "nt" and msvcrt is not None:
         ch = msvcrt.getwch()
-
         if ch in ("\x00", "\xe0"):
             ch2 = msvcrt.getwch()
             return {
-                "H": "UP",
-                "P": "DOWN",
-                "K": "LEFT",
-                "M": "RIGHT",
-                "G": "HOME",
-                "O": "END",
-                "I": "PGUP",
-                "Q": "PGDN",
+                "H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT",
+                "G": "HOME", "O": "END", "I": "PGUP", "Q": "PGDN",
             }.get(ch2, "")
-
         if ch in ("\r", "\n"):
             return "ENTER"
         if ch == "\x1b":
@@ -2147,13 +2079,11 @@ def _read_picker_key() -> str:
             raise KeyboardInterrupt
         return ch
 
-    # Unbuffered posix read (avoids crashing on arrow keys when python buffers inputs)
     try:
         fd = sys.stdin.fileno()
         b = os.read(fd, 1)
     except OSError:
         return ""
-
     if not b:
         return ""
     if b == b"\x03":
@@ -2162,15 +2092,17 @@ def _read_picker_key() -> str:
         return "ENTER"
     if b in (b"\x7f", b"\x08"):
         return "BACKSPACE"
-
     if b == b"\x1b":
-        if _select.select([fd], [],[], 0.05)[0]:
+        # FIX: Increased timeout from 0.05s to 0.1s to reduce false ESC
+        # detection on slow SSH connections where escape sequence bytes
+        # may arrive with slight delays.
+        if _select.select([fd], [], [], 0.1)[0]:
             nxt = os.read(fd, 1)
             if nxt in (b"[", b"O"):
-                if _select.select([fd], [],[], 0.05)[0]:
+                if _select.select([fd], [], [], 0.1)[0]:
                     nxt2 = os.read(fd, 1)
                     if nxt == b"[" and nxt2.isdigit():
-                        if _select.select([fd],[], [], 0.05)[0]:
+                        if _select.select([fd], [], [], 0.1)[0]:
                             nxt3 = os.read(fd, 1)
                             seq = nxt2 + nxt3
                             return {
@@ -2178,12 +2110,9 @@ def _read_picker_key() -> str:
                                 b"6~": "PGDN",
                             }.get(seq, "ESC")
                     return {
-                        b"A": "UP",
-                        b"B": "DOWN",
-                        b"C": "RIGHT",
-                        b"D": "LEFT",
-                        b"H": "HOME",
-                        b"F": "END",
+                        b"A": "UP", b"B": "DOWN",
+                        b"C": "RIGHT", b"D": "LEFT",
+                        b"H": "HOME", b"F": "END",
                     }.get(nxt2, "ESC")
             return "ESC"
         return "ESC"
@@ -2195,11 +2124,10 @@ def _read_picker_key() -> str:
         except UnicodeDecodeError:
             if len(buf) >= 4:
                 return ""
-            if _select.select([fd],[],[], 0.05)[0]:
+            if _select.select([fd], [], [], 0.1)[0]:
                 buf += os.read(fd, 1)
             else:
                 return ""
-
 
 def _interactive_confirm(prompt: str, default: bool = True, color: str = C.INFO) -> bool:
     """Inline interactive Yes/No selector."""
@@ -2215,23 +2143,22 @@ def _interactive_confirm(prompt: str, default: bool = True, color: str = C.INFO)
         while True:
             try:
                 ans = input(f"{_rl(color)}{prompt} (Y/n): {_rl(C.RESET)}").strip().lower()
-                if ans in ("", "y", "yes"): return True
-                if ans in ("n", "no"): return False
+                if ans in ("", "y", "yes"):
+                    return True
+                if ans in ("n", "no"):
+                    return False
             except (EOFError, KeyboardInterrupt):
-                sys.exit(0)
+                # FIX: Return default instead of sys.exit(0) for graceful handling
+                return default
 
     selected = default
-    _stdout_write("\033[?25l")  # Hide cursor safely
-    
+    _stdout_write("\033[?25l")
     try:
         with _RawTerminal():
             while True:
                 yes_str = f"{_PICK_SEL_BG}{_PICK_SEL_FG} Yes {C.RESET}" if selected else " Yes "
                 no_str  = f"{_PICK_SEL_BG}{_PICK_SEL_FG} No {C.RESET}" if not selected else " No "
-                
-                # Write inline prompt
                 _stdout_write(f"\r{C.CLR}{color}✦ {prompt}{C.RESET}  {yes_str} {no_str}")
-                
                 key = _read_picker_key()
                 if key in ("LEFT", "UP", "RIGHT", "DOWN", "h", "l", "j", "k"):
                     selected = not selected
@@ -2244,62 +2171,50 @@ def _interactive_confirm(prompt: str, default: bool = True, color: str = C.INFO)
                 elif key == "ENTER":
                     break
                 elif key == "ESC":
-                    sys.exit(0)
-            
-            ans_str = "Yes" if selected else "No"
-            _stdout_write(f"\r{C.CLR}{color}✓ {prompt}{C.RESET} {C.BOLD}{ans_str}{C.RESET}\n")
-            return selected
-            
+                    # FIX: Return default on ESC instead of sys.exit(0)
+                    selected = default
+                    break
+        ans_str = "Yes" if selected else "No"
+        _stdout_write(f"\r{C.CLR}{color}✓ {prompt}{C.RESET} {C.BOLD}{ans_str}{C.RESET}\n")
+        return selected
     except KeyboardInterrupt:
         _stdout_write("\r")
-        sys.exit(0)
+        # FIX: Return default on interrupt instead of sys.exit(0)
+        return default
     finally:
-        _stdout_write("\033[?25h")  # ALWAYS restore cursor
-
+        _stdout_write("\033[?25h")
 
 def _render_provider_picker(providers: list[str], selected: int) -> None:
     term_cols, term_rows = shutil.get_terminal_size((100, 30))
     panel_width = min(60, max(44, int(term_cols * 0.5)))
     inner_width = panel_width - 2
-
     title_left = f"{C.BOLD}SELECT PROVIDER{C.RESET}"
     title_right = f"{C.DIM}esc cancel{C.RESET}"
     title_gap = max(1, inner_width - _visible_len(title_left) - _visible_len(title_right))
     title_line = title_left + (" " * title_gap) + title_right
-
-    lines: list[str] =[]
+    lines: list[str] = []
     lines.append("┌" + "─" * inner_width + "┐")
     lines.append(_panel_line(title_line, inner_width))
     lines.append(_panel_line("", inner_width))
-
     for idx, p in enumerate(providers):
         num = idx + 1
         display_name = {
-            "openrouter": "OpenRouter",
-            "cloudflare": "Cloudflare",
-            "gemini": "Gemini",
-            "groq": "Groq",
-            "together": "Together",
-            "cerebras": "Cerebras",
-            "novita": "Novita",
-            "nvidia": "Nvidia",
-            "ollama": "Ollama"
+            "openrouter": "OpenRouter", "cloudflare": "Cloudflare",
+            "gemini": "Gemini", "groq": "Groq", "together": "Together",
+            "cerebras": "Cerebras", "novita": "Novita", "nvidia": "Nvidia",
+            "ollama": "Ollama",
         }.get(p, p.title())
-        
         row = f"  {num}. {display_name}"
         if idx == selected:
             lines.append(f"│{_PICK_SEL_BG}{_PICK_SEL_FG}{_ansi_pad(row, inner_width)}{C.RESET}│")
         else:
             lines.append(_panel_line(row, inner_width))
-
     lines.append(_panel_line("", inner_width))
     hint = f"{C.DIM}↑/↓ move • Enter select • digits jump{C.RESET}"
     lines.append(_panel_line(hint, inner_width))
     lines.append("└" + "─" * inner_width + "┘")
-
     screen = _center_block(lines, term_cols, term_rows)
     _stdout_write(screen)
-
 
 def select_provider_interactive(providers: list[str]) -> Optional[str]:
     use_picker = (
@@ -2310,7 +2225,6 @@ def select_provider_interactive(providers: list[str]) -> Optional[str]:
             or (os.name != "nt" and termios is not None and tty is not None)
         )
     )
-
     if not use_picker:
         cprint(f"{C.INFO}Available Providers:{C.RESET}")
         for i, p in enumerate(providers, 1):
@@ -2355,7 +2269,6 @@ def select_provider_interactive(providers: list[str]) -> Optional[str]:
     finally:
         _stdout_write("\033[?25h\033[?1049l")
 
-
 def _render_model_picker(
     provider: str,
     all_models: list[str],
@@ -2368,17 +2281,13 @@ def _render_model_picker(
     term_cols, term_rows = shutil.get_terminal_size((100, 30))
     term_cols = max(term_cols, 60)
     term_rows = max(term_rows, 16)
-
     panel_width = min(100, max(60, int(term_cols * 0.72)))
     inner_width = panel_width - 2
-
     max_needed_height = 9 + len(visible)
     panel_height = min(term_rows - 4, max_needed_height)
     panel_height = max(panel_height, 12)
-
     fixed_rows = 9
     list_rows = max(4, panel_height - fixed_rows)
-
     if visible:
         selected = max(0, min(selected, len(visible) - 1))
         start = max(0, selected - (list_rows // 2))
@@ -2403,7 +2312,7 @@ def _render_model_picker(
 
     hint_plain = "↑/↓ move • Enter select • digits jump • Backspace delete"
     if number_buffer:
-        hint_plain += f"[jump: {number_buffer}]"
+        hint_plain += f" [jump: {number_buffer}]"
     hint = f"{C.DIM}{_truncate_plain(hint_plain, inner_width)}{C.RESET}"
 
     header = (
@@ -2411,7 +2320,7 @@ def _render_model_picker(
         f"{C.DIM}({len(visible)} shown / {len(all_models)} total){C.RESET}"
     )
 
-    lines: list[str] =[]
+    lines: list[str] = []
     lines.append("┌" + "─" * inner_width + "┐")
     lines.append(_panel_line(title_line, inner_width))
     lines.append(_panel_line("", inner_width))
@@ -2430,22 +2339,18 @@ def _render_model_picker(
             is_current = visible[idx] == current_model
             current_suffix_plain = " [current]" if is_current else ""
             current_suffix_col = f" {C.DIM}[current]{C.RESET}" if is_current else ""
-
             name_space = max(8, inner_width - 6 - len(current_suffix_plain))
             model_name = _truncate_plain(visible[idx], name_space)
             row = f"{num:>3}. {model_name}{current_suffix_col}"
-
             scroll_char = "│"
             if len(visible) > list_rows:
                 thumb_pos = int((start / max(1, len(visible) - list_rows)) * (list_rows - 1))
                 current_pos = idx - start
                 scroll_char = f"{C.DIM}█{C.RESET}" if current_pos == thumb_pos else f"{C.DIM}│{C.RESET}"
-
             if idx == selected:
                 lines.append(f"│{_PICK_SEL_BG}{_PICK_SEL_FG}{_ansi_pad(row, inner_width)}{C.RESET}{scroll_char}")
             else:
                 lines.append(f"│{_ansi_pad(row, inner_width)}{scroll_char}")
-
         for _ in range(list_rows - (end - start)):
             lines.append(_panel_line("", inner_width))
 
@@ -2453,14 +2358,11 @@ def _render_model_picker(
     footer_right = f"{C.DIM}{selected + 1 if visible else 0}/{len(visible)}{C.RESET}"
     footer_gap = max(1, inner_width - _visible_len(footer_left) - _visible_len(footer_right))
     footer = footer_left + (" " * footer_gap) + footer_right
-
     lines.append(_panel_line("", inner_width))
     lines.append(_panel_line(footer, inner_width))
     lines.append("└" + "─" * inner_width + "┘")
-
     screen = _center_block(lines, term_cols, term_rows)
     _stdout_write(screen)
-
 
 def _select_model_numeric_fallback(
     provider: str,
@@ -2470,30 +2372,24 @@ def _select_model_numeric_fallback(
     if len(models) == 1:
         cprint(f"{C.INFO}Auto-selected:{C.RESET} {models[0]}")
         return models[0]
-
     cprint(f"{C.INFO}Available models for {provider.upper()}:{C.RESET}")
     for i, m in enumerate(models, 1):
-        marker = "[current]" if m == current_model else ""
+        marker = " [current]" if m == current_model else ""
         cprint(f"  {i:3}. {m}{marker}")
-
     while True:
         try:
             choice = input(f"{_rl(C.INFO)}Select model number (or 'c' to cancel): {_rl(C.RESET)}").strip()
         except (EOFError, KeyboardInterrupt):
             cprint(f"\n{C.INFO}Cancelled.{C.RESET}")
             return None
-
         if choice.lower() in {"c", "cancel", "q"}:
             cprint(f"{C.INFO}Cancelled.{C.RESET}")
             return None
-
         if choice.isdigit():
             idx = int(choice)
             if 1 <= idx <= len(models):
                 return models[idx - 1]
-
         eprint(f"{C.WARN}Enter a number between 1 and {len(models)}.{C.RESET}")
-
 
 def select_model_interactive(
     provider: str,
@@ -2506,10 +2402,8 @@ def select_model_interactive(
     if not models:
         eprint(f"{C.ERROR}No models returned by {provider.upper()}.{C.RESET}")
         return None
-
     initial_query = " ".join(filters).strip()
     initially_filtered = _picker_filter_models(models, initial_query)
-
     use_picker = (
         sys.stdin.isatty()
         and sys.stdout.isatty()
@@ -2518,7 +2412,6 @@ def select_model_interactive(
             or (os.name != "nt" and termios is not None and tty is not None)
         )
     )
-
     if not use_picker:
         if initial_query and not initially_filtered:
             eprint(f"{C.ERROR}No models matched filter: {' '.join(filters)}{C.RESET}")
@@ -2528,97 +2421,78 @@ def select_model_interactive(
             initially_filtered if initial_query else models,
             current_model=current_model,
         )
-
     if len(initially_filtered) == 1:
         cprint(f"{C.INFO}Auto-selected:{C.RESET} {initially_filtered[0]}")
         return initially_filtered[0]
 
     query = initial_query
     visible = _picker_filter_models(models, query)
-
     if visible and current_model in visible:
         selected = visible.index(current_model)
     elif not query and current_model in models:
         selected = models.index(current_model)
     else:
         selected = 0
-
     number_buffer = ""
 
     try:
         _stdout_write("\033[?1049h\033[?25l")
-
         with _RawTerminal():
             while True:
                 visible = _picker_filter_models(models, query)
-
                 if visible:
                     selected = max(0, min(selected, len(visible) - 1))
-                    if number_buffer:
-                        try:
-                            idx = int(number_buffer) - 1
-                            if 0 <= idx < len(visible):
-                                selected = idx
-                        except ValueError:
-                            number_buffer = ""
+                if number_buffer:
+                    try:
+                        idx = int(number_buffer) - 1
+                        if 0 <= idx < len(visible):
+                            selected = idx
+                    except ValueError:
+                        number_buffer = ""
                 else:
-                    selected = 0
+                    selected = max(0, min(selected, max(0, len(visible) - 1)))
 
                 _render_model_picker(
-                    provider=provider,
-                    all_models=models,
-                    visible=visible,
-                    selected=selected,
-                    query=query,
-                    current_model=current_model,
-                    number_buffer=number_buffer,
+                    provider=provider, all_models=models, visible=visible,
+                    selected=selected, query=query,
+                    current_model=current_model, number_buffer=number_buffer,
                 )
-
                 key = _read_picker_key()
                 if not key:
                     continue
-
                 if key == "UP":
                     number_buffer = ""
                     if visible:
                         selected = (selected - 1) % len(visible)
-
                 elif key == "DOWN":
                     number_buffer = ""
                     if visible:
                         selected = (selected + 1) % len(visible)
-
                 elif key == "HOME":
                     number_buffer = ""
                     if visible:
                         selected = 0
-
                 elif key == "END":
                     number_buffer = ""
                     if visible:
                         selected = len(visible) - 1
-
                 elif key == "PGUP":
                     number_buffer = ""
                     if visible:
                         selected = max(0, selected - 10)
-
                 elif key == "PGDN":
                     number_buffer = ""
                     if visible:
                         selected = min(len(visible) - 1, selected + 10)
-
                 elif key == "BACKSPACE":
                     if number_buffer:
                         number_buffer = number_buffer[:-1]
                     elif query:
                         query = query[:-1]
                         selected = 0
-
                 elif key == "ENTER":
                     if not visible:
                         continue
-
                     if number_buffer:
                         try:
                             idx = int(number_buffer) - 1
@@ -2628,12 +2502,9 @@ def select_model_interactive(
                         if 0 <= idx < len(visible):
                             return visible[idx]
                         continue
-
                     return visible[selected]
-
                 elif key == "ESC":
                     return None
-
                 elif len(key) == 1 and key.isdigit():
                     if query:
                         number_buffer = ""
@@ -2652,17 +2523,14 @@ def select_model_interactive(
                                 selected = idx
                         except ValueError:
                             number_buffer = ""
-
                 elif len(key) == 1 and key.isprintable():
                     number_buffer = ""
                     query += key
                     selected = 0
-
     except KeyboardInterrupt:
         return None
     finally:
         _stdout_write("\033[?25h\033[?1049l")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAYLOADS
@@ -2673,25 +2541,23 @@ def build_user_message(text: str, image: ImageAttachment, provider: str, is_open
         if not is_openai_compat:
             return {
                 "role": "user",
-                "parts":[
+                "parts": [
                     {"text": text},
                     {"inlineData": {"mimeType": image.mime, "data": image.base64}},
                 ],
             }
         if provider == "ollama":
-            return {"role": "user", "content": text, "images":[image.base64]}
+            return {"role": "user", "content": text, "images": [image.base64]}
         return {
             "role": "user",
-            "content":[
+            "content": [
                 {"type": "text", "text": text},
                 {"type": "image_url", "image_url": {"url": f"data:{image.mime};base64,{image.base64}"}},
             ],
         }
-
     if not is_openai_compat:
-        return {"role": "user", "parts":[{"text": text}]}
+        return {"role": "user", "parts": [{"text": text}]}
     return {"role": "user", "content": text}
-
 
 def build_payload(
     provider: str,
@@ -2702,7 +2568,7 @@ def build_payload(
     enable_thinking: bool,
 ) -> dict[str, Any]:
     if not is_openai_compat:
-        contents =[m for m in history if m.get("role") != "system"]
+        contents = [m for m in history if m.get("role") != "system"]
         payload: dict[str, Any] = {
             "contents": contents,
             "generationConfig": {
@@ -2712,7 +2578,7 @@ def build_payload(
             },
         }
         if SYSTEM_PROMPT:
-            payload["systemInstruction"] = {"parts":[{"text": SYSTEM_PROMPT}]}
+            payload["systemInstruction"] = {"parts": [{"text": SYSTEM_PROMPT}]}
         if enable_tools:
             payload["tools"] = GEMINI_TOOLS_SCHEMA
         return payload
@@ -2725,7 +2591,6 @@ def build_payload(
     }
     if enable_tools:
         out["tools"] = OPENAI_TOOLS_SCHEMA
-
     if provider == "ollama":
         out["think"] = enable_thinking
         out["options"] = {
@@ -2738,12 +2603,9 @@ def build_payload(
     elif provider != "together":
         out["max_tokens"] = DEFAULT_MAX_TOKENS
         out["top_p"] = DEFAULT_TOP_P
-
     if provider == "nvidia" and enable_thinking:
         out["chat_template_kwargs"] = {"thinking": True, "reasoning_effort": "max"}
-
     return out
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STREAM PARSING
@@ -2757,19 +2619,19 @@ class _ChunkResult:
         self.think = ""
         self.finish = ""
         self.error = ""
-        self.tool_chunks: list[dict[str, Any]] =[]
-
+        self.tool_chunks: list[dict[str, Any]] = []
 
 def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
     r = _ChunkResult()
-
     if provider == "ollama":
         msg_obj = obj.get("message", {})
         r.text = msg_obj.get("content") or ""
         r.think = msg_obj.get("thinking") or ""
-        if obj.get("done") is True:
+        # FIX: Use truthiness check instead of `is True` for Ollama's done field.
+        # Some Ollama versions send done as 1, "true", etc.
+        if obj.get("done"):
             r.finish = obj.get("done_reason") or "stop"
-        for tc in (msg_obj.get("tool_calls") or[]):
+        for tc in (msg_obj.get("tool_calls") or []):
             fn = tc.get("function", {})
             args_raw = fn.get("arguments", "")
             if isinstance(args_raw, dict):
@@ -2786,10 +2648,9 @@ def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
     choice = (obj.get("choices") or [{}])[0]
     delta = choice.get("delta", {})
     r.text = delta.get("content") or ""
-    # Update to check for `reasoning_content` API standard used by Cloudflare/Moonshot/DeepSeek-Reasoner
     r.think = delta.get("reasoning") or delta.get("reasoning_content") or ""
     r.finish = choice.get("finish_reason") or ""
-    for tc_chunk in (delta.get("tool_calls") or[]):
+    for tc_chunk in (delta.get("tool_calls") or []):
         r.tool_chunks.append({
             "index": tc_chunk.get("index", 0),
             "id": tc_chunk.get("id"),
@@ -2803,23 +2664,19 @@ def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
 def _parse_gemini_chunk(obj: dict[str, Any]) -> _ChunkResult:
     r = _ChunkResult()
     candidate = (obj.get("candidates") or [{}])[0]
-
     pf = obj.get("promptFeedback")
     if pf and pf.get("blockReason"):
         r.error = f"Content blocked (reason: {pf['blockReason']})"
         return r
-
     content_obj = candidate.get("content", {})
-    for part in content_obj.get("parts",[]):
+    for part in content_obj.get("parts", []):
         if "text" in part:
             r.text += part["text"]
         if "functionCall" in part:
             fc = part["functionCall"]
             r.tool_chunks.append({"name": fc.get("name", ""), "args": fc.get("args", {})})
-
     r.finish = candidate.get("finishReason", "")
     return r
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STREAM RENDERER
@@ -2891,7 +2748,6 @@ class StreamRenderer:
         if not self._in_think_display:
             _stdout_write(f"{C.THINK}[Thinking]\n┃ {C.RESET}{C.THINK}")
             self._in_think_display = True
-            
         indented_think = think_tok.replace("\n", f"\n{C.THINK}┃ {C.RESET}{C.THINK}")
         _stdout_write(f"{C.THINK}{indented_think}{C.RESET}")
 
@@ -2908,18 +2764,16 @@ class StreamRenderer:
             _stdout_write(C.CLR)
             self.first_chunk = False
         if self._in_think_display:
-            _stdout_write(f"{C.RESET}\n\n")
+            _stdout_write(f"{C.RESET}\n")
             self._in_think_display = False
-
         self.full_text += text_tok
         remaining = text_tok
-
         while remaining:
             if self.is_thinking:
                 close = remaining.find("</think")
                 if close != -1:
                     self._write_think(remaining[:close])
-                    _stdout_write(f"{C.RESET}\n\n")
+                    _stdout_write(f"{C.RESET}\n")
                     self.is_thinking = False
                     self._in_think_display = False
                     after = remaining[close + 7:]
@@ -2952,7 +2806,6 @@ class StreamRenderer:
             self._commit_current_line()
         MD_RENDERER.in_code_block = False
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # STREAM RESPONSE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2969,13 +2822,12 @@ def stream_response(
     payload = build_payload(provider, model_id, history, is_openai_compat, enable_tools, enable_thinking)
     payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ep = ENDPOINTS[provider]
-
     chat_url = ep.get("chat_base", "") if not is_openai_compat else ep["chat"]
 
     if provider == "cloudflare":
         if ":" not in api_key:
             cprint(f"{C.ERROR}Cloudflare API key must be in format ACCOUNT_ID:API_TOKEN{C.RESET}")
-            return None,[]
+            return None, []
         acc_id, token = api_key.split(":", 1)
         chat_url = chat_url.replace("{account_id}", acc_id)
         api_key = token
@@ -2983,8 +2835,7 @@ def stream_response(
     if not is_openai_compat:
         url = f"{chat_url}{model_id}:streamGenerateContent?key={api_key}&alt=sse"
         req = urllib.request.Request(
-            url,
-            data=payload_bytes,
+            url, data=payload_bytes,
             headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
             method="POST",
         )
@@ -2992,15 +2843,13 @@ def stream_response(
         req = _build_request(chat_url, api_key, provider, data=payload_bytes)
 
     _stdout_write(f"{C.AI}AI:{C.RESET} {C.INFO}(💬 Waiting…){C.RESET}")
-
     renderer = StreamRenderer(enable_thinking)
     finish_reason = ""
     error_msg = ""
     interrupted = False
     done_received = False
-
     oai_tool_calls: dict[int, dict[str, Any]] = {}
-    gem_tool_calls: list[dict[str, Any]] =[]
+    gem_tool_calls: list[dict[str, Any]] = []
 
     try:
         with _request_with_retry(req, timeout=REQUEST_TIMEOUT) as resp:
@@ -3012,16 +2861,12 @@ def stream_response(
                     interrupted = True
                     cprint(f"\n{C.WARN}(Stream interrupted){C.RESET}")
                     break
-
                 if not raw:
                     break
-
                 buffer += raw.decode("utf-8", errors="replace")
-
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
                     line = line.rstrip("\r")
-
                     json_chunk = ""
                     if line.startswith("data: "):
                         json_chunk = line[6:].strip()
@@ -3030,10 +2875,8 @@ def stream_response(
                             break
                     elif line.startswith("{"):
                         json_chunk = line
-
                     if not json_chunk:
                         continue
-
                     try:
                         obj = json.loads(json_chunk)
                     except json.JSONDecodeError:
@@ -3046,7 +2889,6 @@ def stream_response(
                         chunk_err = obj["error"]
                     elif isinstance(obj.get("detail"), str):
                         chunk_err = obj["detail"]
-
                     if chunk_err:
                         error_msg = f"API error: {chunk_err}"
                         done_received = True
@@ -3089,19 +2931,17 @@ def stream_response(
 
                     if cr.finish and not finish_reason:
                         finish_reason = cr.finish
-
                     renderer.feed_thinking(cr.think)
                     renderer.feed_text(cr.text)
 
                     if provider == "ollama" and finish_reason:
                         done_received = True
                         break
-
     except KeyboardInterrupt:
         interrupted = True
         if renderer.first_chunk:
             _stdout_write(C.CLR)
-        cprint(f"\n{C.WARN}(Request interrupted){C.RESET}")
+            cprint(f"\n{C.WARN}(Request interrupted){C.RESET}")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         if renderer.first_chunk:
@@ -3118,7 +2958,7 @@ def stream_response(
 
     renderer.finalize()
 
-    tool_calls_out: list[dict[str, Any]] =[]
+    tool_calls_out: list[dict[str, Any]] = []
     if is_openai_compat:
         for idx in sorted(oai_tool_calls):
             tool_calls_out.append(oai_tool_calls[idx])
@@ -3148,18 +2988,17 @@ def stream_response(
     if error_msg:
         if renderer.full_text or tool_calls_out:
             eprint(f"{C.WARN}(Stream ended after partial output: {error_msg}){C.RESET}")
-            full_text = renderer.full_text[:MAX_MESSAGE_LENGTH]
-            clean = strip_think_tags(full_text)
-            return (clean if clean else ""), tool_calls_out
-        cprint(f"{C.ERROR}{error_msg}{C.RESET}")
-        return None,[]
+        full_text = renderer.full_text[:MAX_MESSAGE_LENGTH]
+        clean = strip_think_tags(full_text)
+        return (clean if clean else ""), tool_calls_out
+    cprint(f"{C.ERROR}{error_msg}{C.RESET}")
+    return None, []
 
     full_text = renderer.full_text[:MAX_MESSAGE_LENGTH]
     clean = strip_think_tags(full_text)
     if not clean and not tool_calls_out and not interrupted:
-        return None,[]
+        return None, []
     return (clean if clean else ""), tool_calls_out
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HISTORY HELPERS
@@ -3173,7 +3012,7 @@ def _append_assistant_turn(
     is_openai_compat: bool,
 ) -> None:
     if not is_openai_compat:
-        parts: list[dict[str, Any]] =[]
+        parts: list[dict[str, Any]] = []
         if ai_text:
             parts.append({"text": ai_text})
         for tc in tool_calls:
@@ -3186,11 +3025,10 @@ def _append_assistant_turn(
         if parts:
             history.append({"role": "model", "parts": parts})
         return
-
     if provider == "ollama":
         asst_msg: Message = {"role": "assistant", "content": ai_text or ""}
         if tool_calls:
-            asst_msg["tool_calls"] =[
+            asst_msg["tool_calls"] = [
                 {
                     "function": {
                         "name": tc["function"]["name"],
@@ -3201,7 +3039,6 @@ def _append_assistant_turn(
             ]
         history.append(asst_msg)
         return
-
     asst_msg = {"role": "assistant", "content": ai_text or ""}
     if tool_calls:
         asst_msg["tool_calls"] = tool_calls
@@ -3215,7 +3052,7 @@ def _append_tool_results(
     is_openai_compat: bool,
 ) -> None:
     if not is_openai_compat:
-        parts =[
+        parts = [
             {
                 "functionResponse": {
                     "name": tc["function"]["name"],
@@ -3226,12 +3063,10 @@ def _append_tool_results(
         ]
         history.append({"role": "user", "parts": parts})
         return
-
     if provider == "ollama":
         for result in results:
             history.append({"role": "tool", "content": result})
         return
-
     for tc, result in zip(tool_calls, results):
         history.append({
             "role": "tool",
@@ -3245,10 +3080,9 @@ def _extract_display_text(msg: Message) -> str:
     if role == "tool":
         return f"[🛠️ {msg.get('name', 'tool')}] {truncate(msg.get('content', ''), 120)}"
     if "tool_calls" in msg:
-        names =[tc.get("function", tc).get("name", "?") for tc in msg["tool_calls"]]
-        return ((msg.get("content") or "") + f"[🛠️ → {', '.join(names)}]").strip()
-
-    raw = msg.get("content") or msg.get("parts",[{}])
+        names = [tc.get("function", tc).get("name", "?") for tc in msg["tool_calls"]]
+        return ((msg.get("content") or "") + f" [🛠️ → {', '.join(names)}]").strip()
+    raw = msg.get("content") or msg.get("parts", [{}])
     if isinstance(raw, str):
         return raw
     if isinstance(raw, list) and raw:
@@ -3259,13 +3093,15 @@ def _extract_display_text(msg: Message) -> str:
                 return f"[🛠️ → {', '.join(p['functionCall'].get('name', '?') for p in raw if 'functionCall' in p)}]"
             if "functionResponse" in raw[0]:
                 return "[🛠️ results]"
-            for p in raw:
-                if isinstance(p, dict) and p.get("type") == "text":
-                    return p.get("text", "")
-            has_image = any(isinstance(p, dict) and (p.get("type") == "image_url" or "inlineData" in p) for p in raw)
-            return "[📎 image]" if has_image else "[content]"
+        for p in raw:
+            if isinstance(p, dict) and p.get("type") == "text":
+                return p.get("text", "")
+        has_image = any(
+            isinstance(p, dict) and (p.get("type") == "image_url" or "inlineData" in p)
+            for p in raw
+        )
+        return "[📎 image]" if has_image else "[content]"
     return "[empty]"
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENFORCEMENT HELPERS
@@ -3300,7 +3136,6 @@ def _question_needs_web_research(text: str) -> bool:
         return True
     return False
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # INPUT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3312,8 +3147,7 @@ def read_multiline_input(initial_prompt: str, cont_prompt: str = "") -> Optional
         line = input(initial_prompt)
     except (EOFError, KeyboardInterrupt):
         return None
-
-    lines: list[str] =[]
+    lines: list[str] = []
     while line.endswith("\\"):
         lines.append(line[:-1])
         try:
@@ -3326,7 +3160,7 @@ def read_multiline_input(initial_prompt: str, cont_prompt: str = "") -> Optional
 
 def read_paste_input(prefix: str = "") -> Optional[str]:
     cprint(f"{C.INFO}Paste mode — end with {C.BOLD}---{C.RESET}{C.INFO} on its own line to send:{C.RESET}")
-    lines: list[str] =[]
+    lines: list[str] = []
     prompt = f"  {_rl(C.DIM)}│{_rl(C.RESET)} "
     while True:
         try:
@@ -3340,8 +3174,7 @@ def read_paste_input(prefix: str = "") -> Optional[str]:
     body = "\n".join(lines).strip()
     if not body:
         return None
-    return f"{prefix}\n\n{body}" if prefix else body
-
+    return f"{prefix}\n{body}" if prefix else body
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELP
@@ -3365,13 +3198,12 @@ def print_usage() -> None:
   /upload <path>
   /image
   /clearimage
-  /paste[text]
+  /paste [text]
   /togglethinking
   /toggletools
   /help
   quit / exit
 """)
-
 
 def print_chat_help() -> None:
     cprint(f"""{C.INFO}Commands:{C.RESET}
@@ -3392,7 +3224,6 @@ def print_chat_help() -> None:
 {C.TOOL}Tools:{C.RESET}
   get_time · calculator · web_search · web_research · fetch_url · wikipedia
 """)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHAT LOOP
@@ -3433,19 +3264,14 @@ def chat_loop(
         cprint(f"\n╭{'─' * (width - 2)}╮")
         cprint(_line(f"{C.BOLD}AI Chat CLI{C.RESET}"))
         cprint(f"├{'─' * (width - 2)}┤")
-
         cprint(_line(f"{C.INFO}Provider:{C.RESET} {provider.upper()}", f"{C.INFO}Model:{C.RESET} {model_id}"))
         cprint(_line(f"{C.INFO}History:{C.RESET}  last {MAX_HISTORY_MESSAGES} turns", f"{C.INFO}Tokens:{C.RESET} {DEFAULT_MAX_TOKENS}  {C.INFO}Temp:{C.RESET} {DEFAULT_TEMPERATURE}"))
-
         status = f"{C.AI}active{C.RESET}" if SYSTEM_PROMPT else "inactive"
         cprint(_line(f"{C.INFO}System prompt:{C.RESET} {status}"))
-
         think_st = f"{C.BOLD}{C.THINK}enabled{C.RESET}" if thinking_on else "disabled"
         cprint(_line(f"{C.INFO}Thinking output:{C.RESET} {think_st}", f"{C.DIM}/togglethinking{C.RESET}"))
-
         tool_st = f"{C.BOLD}{C.TOOL}enabled{C.RESET}" if tools_on else "disabled"
         cprint(_line(f"{C.INFO}Tool calling:{C.RESET}    {tool_st}", f"{C.DIM}/toggletools{C.RESET}"))
-
         cprint(f"├{'─' * (width - 2)}┤")
         cprint(_line(f"{C.DIM}Type {C.BOLD}quit{C.RESET}{C.DIM} to exit • {C.BOLD}/model{C.RESET}{C.DIM} to switch • {C.BOLD}/help{C.RESET}{C.DIM} for commands{C.RESET}"))
         cprint(f"╰{'─' * (width - 2)}╯\n")
@@ -3459,8 +3285,8 @@ def chat_loop(
         if raw is None:
             cprint(f"\n{C.INFO}Ending session.{C.RESET}")
             break
-
         user_input = raw
+
         if user_input.lower() in ("quit", "exit"):
             break
 
@@ -3477,10 +3303,8 @@ def chat_loop(
                     handled = False
                 else:
                     cprint(f"{C.INFO}Nothing to send.{C.RESET}")
-
             elif cmd == "/help":
                 print_chat_help()
-
             elif cmd == "/model":
                 inline_filters = args.split() if args else filters
                 new_model = select_model_interactive(provider, api_key, inline_filters, current_model=model_id)
@@ -3491,31 +3315,25 @@ def chat_loop(
                         cprint(f"{C.INFO}Already using {model_id}.{C.RESET}")
                     else:
                         cprint(f"{C.INFO}Switched model: {old} → {C.BOLD}{model_id}{C.RESET}")
-
             elif cmd == "/upload":
                 if not args:
                     eprint(f"{C.IMAGE}Usage: /upload <image_path>{C.RESET}")
                 else:
                     image.load(args)
-
             elif cmd == "/image":
                 if image.attached:
                     cprint(f"{C.IMAGE}Attached: {image.path} ({image.mime}){C.RESET}")
                 else:
                     cprint(f"{C.IMAGE}No image attached.{C.RESET}")
-
             elif cmd == "/clearimage":
                 image.clear()
                 cprint(f"{C.IMAGE}Image cleared.{C.RESET}")
-
             elif cmd == "/togglethinking":
                 thinking_on = not thinking_on
                 cprint(f"{C.INFO}Thinking output {'enabled' if thinking_on else 'disabled'}.{C.RESET}")
-
             elif cmd == "/toggletools":
                 tools_on = not tools_on
                 cprint(f"{C.INFO}Tool calling {'enabled' if tools_on else 'disabled'}.{C.RESET}")
-
             elif cmd == "/history":
                 cprint(f"{C.INFO}── History ({len(history)} messages) ─────────────────────{C.RESET}")
                 if not history:
@@ -3528,13 +3346,11 @@ def chat_loop(
                     }.get(role, C.DIM)
                     cprint(f"  {colour}[{role}]{C.RESET} {truncate(_extract_display_text(msg), 500)}")
                 cprint(f"{C.INFO}────────────────────────────────────────────────────{C.RESET}")
-
             elif cmd == "/save":
                 if not args:
                     eprint(f"{C.WARN}Usage: /save <name>{C.RESET}")
                 elif validate_session_name(args):
                     save_session(args, history)
-
             elif cmd == "/load":
                 if not args:
                     eprint(f"{C.WARN}Usage: /load <name>{C.RESET}")
@@ -3542,13 +3358,10 @@ def chat_loop(
                     loaded = load_session(args)
                     if loaded is not None:
                         history = loaded
-
             elif cmd == "/clear":
                 clear_sessions()
-
             else:
                 eprint(f"{C.WARN}Unknown command '{cmd}'. Type /help for a list.{C.RESET}")
-
             if handled:
                 continue
 
@@ -3566,16 +3379,16 @@ def chat_loop(
 
         history_snapshot = list(history)
         history.append(user_msg)
-
         compact_from = len(history)
         had_tool_calls = False
         final_ai_text: Optional[str] = None
         tool_iter = 0
         tool_loop_ok = True
-
         reviewed_domains: set[str] = set()
         original_user_input = user_input
         research_enforcements = 0
+        # FIX: Track tool names used for a summary in compaction
+        tool_names_used: list[str] = []
 
         try:
             while True:
@@ -3583,14 +3396,11 @@ def chat_loop(
                 if tool_iter > MAX_TOOL_ITERATIONS:
                     eprint(f"{C.ERROR}Tool loop limit reached.{C.RESET}")
                     break
-
                 history = truncate_history(history, is_openai_compat)
-
                 ai_text, tool_calls = stream_response(
                     provider, model_id, history, is_openai_compat,
                     api_key, tools_on, thinking_on,
                 )
-
                 if ai_text is None and not tool_calls:
                     if history and history[-1].get("role") == "user":
                         history.pop()
@@ -3601,22 +3411,18 @@ def chat_loop(
 
                 if tool_calls and tools_on:
                     had_tool_calls = True
-                    results: list[str] =[]
-
+                    results: list[str] = []
                     for tc in tool_calls:
                         fn_name = tc["function"]["name"]
                         fn_args = tc["function"]["arguments"]
                         display = _args_display(fn_args)
-
                         cprint(f"\n{C.TOOL}⚡ Tool: {fn_name}({display}){C.RESET}")
                         result = execute_tool(fn_name, fn_args)
                         cprint(f"{C.DIM}   → {truncate(result, 300)}{C.RESET}")
-
                         if fn_name in {"web_research", "fetch_url", "wikipedia"}:
                             reviewed_domains.update(_extract_domains_from_tool_output(result))
-
+                        tool_names_used.append(fn_name)
                         results.append(result)
-
                     _append_tool_results(history, tool_calls, results, provider, is_openai_compat)
                     continue
 
@@ -3644,7 +3450,6 @@ def chat_loop(
                         history.append({"role": "user", "content": reminder})
                     final_ai_text = None
                     continue
-
                 break
 
         except Exception as exc:
@@ -3652,22 +3457,27 @@ def chat_loop(
             history[:] = history_snapshot
             tool_loop_ok = False
 
+        # FIX: Improved history compaction — keep a brief tool-usage summary
+        # so the model retains context about what tools were called.
         if tool_loop_ok and had_tool_calls and final_ai_text is not None:
+            tool_summary = ""
+            if tool_names_used:
+                unique_tools = list(dict.fromkeys(tool_names_used))
+                tool_summary = f"\n[Context: Used tools: {', '.join(unique_tools)}. Reviewed {len(reviewed_domains)} web sources.]"
             if not is_openai_compat:
-                clean_final: Message = {"role": "model", "parts":[{"text": final_ai_text}]}
+                clean_final: Message = {"role": "model", "parts": [{"text": final_ai_text + tool_summary}]}
             else:
-                clean_final = {"role": "assistant", "content": final_ai_text}
-            history[compact_from:] =[clean_final]
+                clean_final = {"role": "assistant", "content": final_ai_text + tool_summary}
+            history[compact_from:] = [clean_final]
 
         cprint("")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    for name, val, lo, hi in[
+    for name, val, lo, hi in [
         ("DEFAULT_TEMPERATURE", DEFAULT_TEMPERATURE, 0, 2),
         ("DEFAULT_TOP_P", DEFAULT_TOP_P, 0, 1),
         ("DEFAULT_MAX_TOKENS", DEFAULT_MAX_TOKENS, 1, 1_000_000),
@@ -3685,13 +3495,14 @@ def main() -> None:
         if not provider:
             cprint(f"{C.WARN}No provider selected. Exiting.{C.RESET}")
             sys.exit(0)
-        filters =[]
+        filters = []
     else:
         provider = argv[0].lower()
         filters = argv[1:]
-        if provider not in VALID_PROVIDERS:
-            cprint(f"{C.ERROR}Unknown provider '{provider}'. Choose from: {', '.join(VALID_PROVIDERS)}{C.RESET}")
-            sys.exit(1)
+
+    if provider not in VALID_PROVIDERS:
+        cprint(f"{C.ERROR}Unknown provider '{provider}'. Choose from: {', '.join(VALID_PROVIDERS)}{C.RESET}")
+        sys.exit(1)
 
     api_key = API_KEYS.get(provider, "")
     if not check_placeholder_key(api_key, provider):
@@ -3699,7 +3510,6 @@ def main() -> None:
 
     is_openai_compat = provider != "gemini"
 
-    # Interactive Selectors
     enable_thinking = _interactive_confirm("Enable thinking/reasoning?", default=True, color=C.THINK)
     enable_tools = _interactive_confirm("Enable tool calling?", default=False, color=C.TOOL)
 
