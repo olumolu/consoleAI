@@ -9,8 +9,9 @@ Features:
   - Image attachment support (Vision models)
   - Multi-line input (backslash continuation + /paste mode)
   - Multi-provider support (Gemini, OpenRouter, Groq, Together, etc.)
-  - Tool/Function calling (Web search, fetch, Calculator, Time, Wikipedia)
-  - Deep web research via Startpage HTML scraping
+  - Tool/Function calling (Web search, fetch, Calculator, Time, Wikipedia,
+    Weather, Dictionary, Password Gen, System Info, Unit Convert, Hash/Encode)
+  - Deep web research via Startpage + DuckDuckGo Lite HTML scraping
   - Live tool progress spinner
   - Live model switching (/model command)
   - History compaction (tool messages auto-collapsed after each exchange)
@@ -63,6 +64,10 @@ import html as _html
 import mimetypes
 import atexit
 import select as _select
+import secrets as _secrets
+import string as _string
+import hashlib as _hashlib
+import platform as _platform
 from collections import OrderedDict
 from html.parser import HTMLParser
 from pathlib import Path
@@ -500,9 +505,7 @@ def check_placeholder_key(key: str, provider: str) -> bool:
 
 def strip_think_tags(text: str) -> str:
     # FIX: Made regex more conservative to avoid eating legitimate content.
-    # Only match <think> tags that look like actual XML tags (word boundary after "think").
-    # The unclosed-tag fallback now only strips to end-of-string if the tag
-    # appears at a line boundary or start, reducing false positives in code blocks.
+    # Only match <think> tags that look like actual XML tags.
     text = re.sub(r"<think(?:\s[^>]*)?>.*?</think\s*>", "", text, flags=re.DOTALL | re.I)
     # For unclosed think tags: only strip if it starts at beginning of a line
     # or the very start of text, to avoid matching "<think" inside code examples.
@@ -684,7 +687,6 @@ class _ContentExtractor(HTMLParser):
         if self._skip_depth > 0:
             return
         # FIX: Only pop if the closing tag matches what was opened.
-        # This prevents desync on malformed HTML with mismatched tags.
         if self._scope_stack:
             open_tag, was_scoped = self._scope_stack[-1]
             if open_tag == tag:
@@ -695,14 +697,12 @@ class _ContentExtractor(HTMLParser):
                 # Mismatched tag: search stack for a matching opener
                 for i in range(len(self._scope_stack) - 1, -1, -1):
                     if self._scope_stack[i][0] == tag:
-                        # Pop everything from i onward (implicit close of nested tags)
                         removed = self._scope_stack[i:]
                         self._scope_stack = self._scope_stack[:i]
                         for _, ws in removed:
                             if ws:
                                 self._scope_depth = max(0, self._scope_depth - 1)
                         break
-                # If no match found, ignore the stray end tag
         if tag in self.BLOCK_TAGS and self._scope_depth > 0:
             self.parts.append('\n')
 
@@ -795,7 +795,7 @@ def _request_with_retry(
             wait = 2 ** attempt
             eprint(f"{C.WARN}Network error — retrying in {wait}s…{C.RESET}")
             time.sleep(wait)
-    # Should not reach here, but satisfy type checker
+    # FIX: Proper guard instead of bare raise
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("Retry loop exhausted with no exception captured")
@@ -1020,6 +1020,8 @@ def _should_skip_result(url: str) -> bool:
         return True
     if "startpage.com" in host:
         return True
+    if "duckduckgo.com" in host:
+        return True
     if any(bad in host for bad in ("facebook.com", "instagram.com", "pinterest.", "tiktok.com")):
         return True
     return False
@@ -1161,7 +1163,6 @@ def _extract_title_and_text(raw_html: str) -> tuple[str, str]:
 
 def _fetch_page_text(url: str) -> tuple[str, str]:
     url = _normalize_url(url)
-    # FIX: Use bounded LRU cache
     cached = _cache_get_page(url)
     if cached is not None:
         return cached
@@ -1170,9 +1171,12 @@ def _fetch_page_text(url: str) -> tuple[str, str]:
     _cache_put_page(url, (title, text))
     return title, text
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SEARCH: STARTPAGE
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, Any]]:
     cache_key = f"sp::{query}::{limit}"
-    # FIX: Use bounded LRU cache
     cached = _cache_get_search(cache_key)
     if cached is not None:
         return cached[:limit]
@@ -1195,7 +1199,7 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
     except Exception:
         pass
 
-    _PROGRESS.update(f"Searching: {truncate(query, 40)}")
+    _PROGRESS.update(f"Searching Startpage: {truncate(query, 40)}")
     post_data = urllib.parse.urlencode({
         "q": query,
         "cat": "web",
@@ -1230,7 +1234,7 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
     if "captcha" in html_text.lower():
         return []
 
-    _PROGRESS.update("Parsing results…")
+    _PROGRESS.update("Parsing Startpage results…")
     found: list[tuple[str, str, str]] = []
 
     for m in re.finditer(
@@ -1256,9 +1260,9 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
         ):
             found.append((m.group(1), re.sub(r"\s+", " ", _clean_html(m.group(2))).strip(), ""))
 
-    # FIX: Warn user if both scraping patterns failed (Startpage may have changed HTML)
+    # FIX: Warn user if both scraping patterns failed
     if not found:
-        eprint(f"{C.WARN}⚠ Startpage HTML structure may have changed. Search results unavailable.{C.RESET}")
+        eprint(f"{C.WARN}⚠ Startpage HTML structure may have changed. Trying DuckDuckGo…{C.RESET}")
 
     out: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
@@ -1286,13 +1290,122 @@ def _startpage_search_structured(query: str, limit: int = 10) -> list[dict[str, 
     _cache_put_search(cache_key, out)
     return out[:limit]
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SEARCH: DUCKDUCKGO LITE (NEW — pure stdlib, no pip)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ddg_search_structured(query: str, limit: int = 10) -> list[dict[str, Any]]:
+    """DuckDuckGo Lite HTML scraping — pure stdlib fallback search."""
+    cache_key = f"ddg::{query}::{limit}"
+    cached = _cache_get_search(cache_key)
+    if cached is not None:
+        return cached[:limit]
+
+    _PROGRESS.update(f"Searching DuckDuckGo: {truncate(query, 40)}")
+
+    post_data = urllib.parse.urlencode({
+        "q": query,
+        "kl": "us-en",
+    }).encode()
+
+    try:
+        req = urllib.request.Request(
+            "https://lite.duckduckgo.com/lite/",
+            data=post_data,
+            headers={
+                "User-Agent": BROWSER_USER_AGENT,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://lite.duckduckgo.com/",
+            },
+            method="POST",
+        )
+        fresh_opener = _make_opener()
+        with fresh_opener.open(req, timeout=15) as resp:
+            raw = resp.read(FETCH_MAX_BYTES)
+            raw = _decompress(raw, resp.headers.get("Content-Encoding", ""))
+            html_text = raw.decode("utf-8", errors="replace")
+    except Exception:
+        return []
+
+    if "captcha" in html_text.lower() or "anomaly" in html_text.lower():
+        return []
+
+    _PROGRESS.update("Parsing DDG results…")
+    found: list[tuple[str, str, str]] = []
+
+    # DDG Lite wraps results in <a class="result-link"> and <td class="result-snippet">
+    for m in re.finditer(
+        r'<a[^>]+class="result-link"[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        html_text, re.I | re.S,
+    ):
+        href = m.group(1)
+        title = re.sub(r"\s+", " ", _clean_html(m.group(2))).strip()
+        snippet = ""
+        after = html_text[m.end():m.end() + 2000]
+        sm = re.search(
+            r'class="result-snippet"[^>]*>(.*?)</td>',
+            after, re.I | re.S,
+        )
+        if sm:
+            snippet = re.sub(r"\s+", " ", _clean_html(sm.group(1))).strip()
+        found.append((href, title, snippet))
+
+    # Fallback pattern: DDG sometimes uses <a rel="nofollow">
+    if not found:
+        for m in re.finditer(
+            r'<a[^>]+rel="nofollow"[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+            html_text, re.I | re.S,
+        ):
+            href = m.group(1)
+            if "duckduckgo.com" in href:
+                continue
+            title = re.sub(r"\s+", " ", _clean_html(m.group(2))).strip()
+            found.append((href, title, ""))
+
+    out: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for href, title, snippet in found:
+        url = _normalize_url(href)
+        if not url.startswith(("http://", "https://")):
+            continue
+        if _should_skip_result(url):
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        if not title:
+            title = url
+        out.append({
+            "title": title,
+            "url": url,
+            "snippet": snippet,
+            "score": _score_text(query, title=title, snippet=snippet, url=url),
+        })
+        if len(out) >= limit * 3:
+            break
+
+    out.sort(key=lambda x: x["score"], reverse=True)
+    _cache_put_search(cache_key, out)
+    return out[:limit]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEARCH: UNIFIED CANDIDATES (Startpage → DDG fallback)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _search_candidates(query: str, max_sources: int) -> list[dict[str, Any]]:
     variants = _query_variants(query)[:4]
     all_rows: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
     per_variant = max(10, max_sources * 5)
+
     for variant_index, variant in enumerate(variants):
+        # Try Startpage first, fall back to DuckDuckGo Lite
         rows = _startpage_search_structured(variant, limit=per_variant)
+        if not rows:
+            rows = _ddg_search_structured(variant, limit=per_variant)
+
         for rank, row in enumerate(rows, 1):
             url = _normalize_url(row["url"])
             if url in seen_urls:
@@ -1305,6 +1418,7 @@ def _search_candidates(query: str, max_sources: int) -> list[dict[str, Any]]:
                 item["score"] += 3.0
             item["score"] += max(0.0, 2.0 - 0.15 * (rank - 1))
             all_rows.append(item)
+
     all_rows.sort(key=lambda x: x["score"], reverse=True)
     primary: list[dict[str, Any]] = []
     fallback: list[dict[str, Any]] = []
@@ -1395,7 +1509,7 @@ def _research_sources(query: str, max_sources: int) -> tuple[list[dict[str, Any]
     return selected[:max_sources], failures, candidates
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOOLS
+# TOOLS — ORIGINAL
 # ─────────────────────────────────────────────────────────────────────────────
 
 def tool_get_time(**kwargs: Any) -> str:
@@ -1403,8 +1517,8 @@ def tool_get_time(**kwargs: Any) -> str:
 
 _CALC_MAX_EXPONENT = 10_000
 _CALC_MAX_RESULT = 1e308
-# FIX: Cap factorial output string length to avoid injecting huge numbers into history
-_CALC_MAX_FACTORIAL = 170  # 170! is the largest that fits in float64
+# FIX: Cap factorial at 170 (float64 limit) and truncate result strings
+_CALC_MAX_FACTORIAL = 170
 _CALC_MAX_RESULT_STR_LEN = 500
 
 _CALC_ALLOWED_FUNCS: dict[str, Any] = {
@@ -1466,7 +1580,7 @@ def tool_calculator(expression: str = "", **kwargs: Any) -> str:
             if name == "factorial":
                 if len(args) != 1 or not isinstance(args[0], int) or args[0] < 0:
                     raise ValueError("factorial() requires a non-negative integer")
-                # FIX: Reduced cap from 1000 to 170 to avoid astronomically large ints
+                # FIX: Reduced cap from 1000 to 170
                 if args[0] > _CALC_MAX_FACTORIAL:
                     raise ValueError(f"factorial() input too large (max {_CALC_MAX_FACTORIAL})")
             return fn(*args)
@@ -1476,9 +1590,7 @@ def tool_calculator(expression: str = "", **kwargs: Any) -> str:
         return "Error: No expression provided."
     try:
         # FIX: Removed the blanket ^ → ** replacement.
-        # The AST evaluator already handles ^ as BitXor (operator.xor) and ** as Pow.
-        # Users should use ** for exponentiation and ^ for XOR.
-        # This prevents "5 ^ 3" (XOR=6) from being misinterpreted as "5 ** 3" (pow=125).
+        # The AST evaluator handles ^ as BitXor and ** as Pow natively.
         tree = ast.parse(expression, mode="eval")
         result = _eval_node(tree.body)
         if isinstance(result, float) and result == int(result) and not math.isinf(result):
@@ -1633,6 +1745,242 @@ def tool_wikipedia(query: str = "", lang: str = "en", **kwargs: Any) -> str:
     except Exception as exc:
         return f"Error: {exc}"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOLS — NEW (pure stdlib, zero pip)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def tool_weather(location: str = "", **kwargs: Any) -> str:
+    """Fetch weather from wttr.in — no API key needed."""
+    if not location:
+        return "Error: No location provided. Example: weather(location='London')"
+    try:
+        _PROGRESS.update(f"Weather: {truncate(location, 30)}")
+        encoded = urllib.parse.quote(location.strip())
+        url = f"https://wttr.in/{encoded}?format=4&lang=en"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "curl/8.0",
+            "Accept": "text/plain",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            text = resp.read().decode("utf-8", errors="replace").strip()
+        if not text or "Unknown location" in text:
+            return f"Error: Could not find weather for '{location}'"
+        url2 = f"https://wttr.in/{encoded}?format=%l:+%C+%t+%w+%h+%p&lang=en"
+        req2 = urllib.request.Request(url2, headers={
+            "User-Agent": "curl/8.0",
+            "Accept": "text/plain",
+        })
+        detail = ""
+        try:
+            with urllib.request.urlopen(req2, timeout=10) as resp2:
+                detail = resp2.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            pass
+        result = f"Weather for {location}:\n{text}"
+        if detail:
+            result += f"\nDetails: {detail}"
+        return result
+    except Exception as exc:
+        return f"Error fetching weather: {exc}"
+
+def tool_dictionary(word: str = "", **kwargs: Any) -> str:
+    """Look up a word definition from dictionaryapi.dev (free, no key)."""
+    if not word:
+        return "Error: No word provided."
+    try:
+        _PROGRESS.update(f"Dictionary: {truncate(word, 30)}")
+        encoded = urllib.parse.quote(word.strip().lower())
+        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{encoded}"
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if not data or not isinstance(data, list):
+            return f"No definition found for '{word}'."
+        entry = data[0]
+        lines = [f"📖 {entry.get('word', word)}"]
+        if entry.get("phonetic"):
+            lines.append(f"   Phonetic: {entry['phonetic']}")
+        for meaning in entry.get("meanings", [])[:3]:
+            pos = meaning.get("partOfSpeech", "")
+            lines.append(f"\n  [{pos}]")
+            for defn in meaning.get("definitions", [])[:3]:
+                lines.append(f"    • {defn.get('definition', '')}")
+                if defn.get("example"):
+                    lines.append(f"      Example: \"{defn['example']}\"")
+            if meaning.get("synonyms"):
+                lines.append(f"    Synonyms: {', '.join(meaning['synonyms'][:5])}")
+            if meaning.get("antonyms"):
+                lines.append(f"    Antonyms: {', '.join(meaning['antonyms'][:5])}")
+        return "\n".join(lines)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return f"No definition found for '{word}'."
+        return f"Error: HTTP {exc.code}"
+    except Exception as exc:
+        return f"Error: {exc}"
+
+def tool_password_gen(length: int = 16, count: int = 1, **kwargs: Any) -> str:
+    """Generate cryptographically secure passwords using secrets module."""
+    try:
+        length = max(8, min(int(length), 128))
+        count = max(1, min(int(count), 10))
+    except (TypeError, ValueError):
+        length, count = 16, 1
+
+    charset = _string.ascii_letters + _string.digits + "!@#$%^&*()-_=+[]{}|;:,.<>?"
+    required = [
+        _secrets.choice(_string.ascii_uppercase),
+        _secrets.choice(_string.ascii_lowercase),
+        _secrets.choice(_string.digits),
+        _secrets.choice("!@#$%^&*()-_=+"),
+    ]
+    passwords = []
+    for _ in range(count):
+        remaining = [_secrets.choice(charset) for _ in range(length - len(required))]
+        pw_chars = required + remaining
+        for i in range(len(pw_chars) - 1, 0, -1):
+            j = _secrets.randbelow(i + 1)
+            pw_chars[i], pw_chars[j] = pw_chars[j], pw_chars[i]
+        passwords.append("".join(pw_chars))
+
+    lines = [f"Generated {count} password(s) (length={length}):"]
+    for i, pw in enumerate(passwords, 1):
+        lines.append(f"  {i}. {pw}")
+    return "\n".join(lines)
+
+def tool_system_info(**kwargs: Any) -> str:
+    """Get current system information."""
+    lines = [
+        f"OS:        {_platform.system()} {_platform.release()}",
+        f"Version:   {_platform.version()[:80]}",
+        f"Machine:   {_platform.machine()}",
+        f"Python:    {_platform.python_version()}",
+        f"Hostname:  {_platform.node()}",
+        f"CPU cores: {os.cpu_count()}",
+    ]
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    lines.append(f"RAM:       {kb / 1024 / 1024:.1f} GB")
+                    break
+    except (OSError, ValueError):
+        pass
+    try:
+        usage = shutil.disk_usage("/")
+        lines.append(f"Disk (/):  {usage.used / 1e9:.1f} / {usage.total / 1e9:.1f} GB used")
+    except OSError:
+        pass
+    try:
+        with open("/proc/uptime") as f:
+            secs = float(f.read().split()[0])
+            days, hrs = divmod(int(secs), 86400)
+            hrs //= 3600
+            lines.append(f"Uptime:    {days}d {hrs}h")
+    except (OSError, ValueError):
+        pass
+    return "\n".join(lines)
+
+def tool_unit_convert(value: float = 0, from_unit: str = "", to_unit: str = "", **kwargs: Any) -> str:
+    """Convert between common units (length, weight, temperature, data, volume, speed)."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "Error: 'value' must be a number."
+    if not from_unit or not to_unit:
+        return "Error: Provide from_unit and to_unit. E.g. from_unit='km', to_unit='miles'"
+
+    fu = from_unit.strip().lower()
+    tu = to_unit.strip().lower()
+
+    # Temperature (special handling)
+    temp_units = {"c", "celsius", "f", "fahrenheit", "k", "kelvin"}
+    if fu in temp_units or tu in temp_units:
+        if fu in ("f", "fahrenheit"):
+            celsius = (value - 32) * 5 / 9
+        elif fu in ("k", "kelvin"):
+            celsius = value - 273.15
+        else:
+            celsius = value
+        if tu in ("f", "fahrenheit"):
+            result = celsius * 9 / 5 + 32
+        elif tu in ("k", "kelvin"):
+            result = celsius + 273.15
+        else:
+            result = celsius
+        return f"{value} {from_unit} = {result:.4f} {to_unit}"
+
+    factors: dict[str, tuple[float, str]] = {
+        "m": (1.0, "length"), "meter": (1.0, "length"), "meters": (1.0, "length"),
+        "km": (1000.0, "length"), "kilometer": (1000.0, "length"),
+        "cm": (0.01, "length"), "mm": (0.001, "length"),
+        "mi": (1609.344, "length"), "mile": (1609.344, "length"), "miles": (1609.344, "length"),
+        "ft": (0.3048, "length"), "foot": (0.3048, "length"), "feet": (0.3048, "length"),
+        "in": (0.0254, "length"), "inch": (0.0254, "length"), "inches": (0.0254, "length"),
+        "yd": (0.9144, "length"), "yard": (0.9144, "length"), "yards": (0.9144, "length"),
+        "nm": (1852.0, "length"), "nautical mile": (1852.0, "length"),
+        "kg": (1.0, "weight"), "kilogram": (1.0, "weight"),
+        "g": (0.001, "weight"), "gram": (0.001, "weight"),
+        "mg": (0.000001, "weight"), "milligram": (0.000001, "weight"),
+        "lb": (0.453592, "weight"), "pound": (0.453592, "weight"), "pounds": (0.453592, "weight"),
+        "oz": (0.0283495, "weight"), "ounce": (0.0283495, "weight"),
+        "ton": (1000.0, "weight"), "tonne": (1000.0, "weight"),
+        "st": (6.35029, "weight"), "stone": (6.35029, "weight"),
+        "b": (1.0, "data"), "byte": (1.0, "data"), "bytes": (1.0, "data"),
+        "kb": (1024.0, "data"), "mb": (1024**2, "data"),
+        "gb": (1024**3, "data"), "tb": (1024**4, "data"),
+        "pb": (1024**5, "data"),
+        "l": (1.0, "volume"), "liter": (1.0, "volume"), "litre": (1.0, "volume"),
+        "ml": (0.001, "volume"), "gal": (3.78541, "volume"), "gallon": (3.78541, "volume"),
+        "qt": (0.946353, "volume"), "pt": (0.473176, "volume"),
+        "cup": (0.236588, "volume"), "tbsp": (0.0147868, "volume"),
+        "tsp": (0.00492892, "volume"),
+        "m/s": (1.0, "speed"), "km/h": (1/3.6, "speed"), "kph": (1/3.6, "speed"),
+        "mph": (0.44704, "speed"), "knot": (0.514444, "speed"), "knots": (0.514444, "speed"),
+    }
+
+    if fu not in factors:
+        return f"Error: Unknown unit '{from_unit}'."
+    if tu not in factors:
+        return f"Error: Unknown unit '{to_unit}'."
+
+    f_factor, f_cat = factors[fu]
+    t_factor, t_cat = factors[tu]
+
+    if f_cat != t_cat:
+        return f"Error: Cannot convert {f_cat} to {t_cat}."
+
+    result = value * f_factor / t_factor
+    if result == int(result) and abs(result) < 1e15:
+        result_str = str(int(result))
+    else:
+        result_str = f"{result:.6f}".rstrip("0").rstrip(".")
+    return f"{value} {from_unit} = {result_str} {to_unit}"
+
+def tool_hash_encode(text: str = "", method: str = "sha256", **kwargs: Any) -> str:
+    """Hash text or encode/decode base64."""
+    if not text:
+        return "Error: No text provided."
+    method = method.strip().lower()
+    try:
+        if method == "base64_enc":
+            return base64.b64encode(text.encode()).decode()
+        elif method == "base64_dec":
+            return base64.b64decode(text.encode()).decode("utf-8", errors="replace")
+        elif method in ("md5", "sha1", "sha256", "sha512"):
+            h = _hashlib.new(method)
+            h.update(text.encode())
+            return f"{method.upper()}: {h.hexdigest()}"
+        else:
+            return f"Error: Unknown method '{method}'. Use: md5, sha1, sha256, sha512, base64_enc, base64_dec"
+    except Exception as exc:
+        return f"Error: {exc}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL REGISTRY + SCHEMAS
+# ─────────────────────────────────────────────────────────────────────────────
+
 TOOLS_REGISTRY: dict[str, Any] = {
     "get_time":      tool_get_time,
     "calculator":    tool_calculator,
@@ -1640,6 +1988,12 @@ TOOLS_REGISTRY: dict[str, Any] = {
     "web_research":  tool_web_research,
     "fetch_url":     tool_fetch_url,
     "wikipedia":     tool_wikipedia,
+    "weather":       tool_weather,
+    "dictionary":    tool_dictionary,
+    "password_gen":  tool_password_gen,
+    "system_info":   tool_system_info,
+    "unit_convert":  tool_unit_convert,
+    "hash_encode":   tool_hash_encode,
 }
 
 OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
@@ -1658,9 +2012,7 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
             "description": "Evaluate a mathematical expression. Use ** for exponentiation, ^ for XOR.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "expression": {"type": "string"},
-                },
+                "properties": {"expression": {"type": "string"}},
                 "required": ["expression"],
             },
         },
@@ -1670,7 +2022,7 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "function": {
             "name": "web_search",
             "description": (
-                "Quick web lookup via Startpage. Returns candidate results only. "
+                "Quick web lookup via Startpage/DuckDuckGo. Returns candidate results only. "
                 "Do not rely on this alone for final factual/current answers; prefer web_research."
             ),
             "parameters": {
@@ -1688,8 +2040,8 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "function": {
             "name": "web_research",
             "description": (
-                "Deep web research. Searches multiple query variants, fetches multiple pages from "
-                "different domains, and returns numbered sources with relevant excerpts."
+                "Deep web research. Searches multiple query variants via Startpage and DuckDuckGo, "
+                "fetches multiple pages from different domains, and returns numbered sources with excerpts."
             ),
             "parameters": {
                 "type": "object",
@@ -1731,6 +2083,85 @@ OPENAI_TOOLS_SCHEMA: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "weather",
+            "description": "Get current weather for a location. No API key needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City name, e.g. 'London', 'New York'"},
+                },
+                "required": ["location"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dictionary",
+            "description": "Look up the definition, pronunciation, synonyms of an English word.",
+            "parameters": {
+                "type": "object",
+                "properties": {"word": {"type": "string"}},
+                "required": ["word"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "password_gen",
+            "description": "Generate cryptographically secure random passwords.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "length": {"type": "integer", "description": "Password length (8-128, default 16)"},
+                    "count": {"type": "integer", "description": "How many passwords (1-10, default 1)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "system_info",
+            "description": "Get current system info: OS, CPU, RAM, disk, uptime.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "unit_convert",
+            "description": "Convert between units: length (m, km, mi, ft), weight (kg, lb, oz), temperature (C, F, K), data (KB, MB, GB), volume (L, gal), speed (km/h, mph).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "value": {"type": "number"},
+                    "from_unit": {"type": "string"},
+                    "to_unit": {"type": "string"},
+                },
+                "required": ["value", "from_unit", "to_unit"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hash_encode",
+            "description": "Hash text (md5/sha1/sha256/sha512) or encode/decode base64.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "method": {"type": "string", "description": "md5, sha1, sha256, sha512, base64_enc, base64_dec"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
 ]
 
 GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
@@ -1749,7 +2180,7 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
             {
                 "name": "web_search",
                 "description": (
-                    "Quick web lookup via Startpage. Returns candidate results only. "
+                    "Quick web lookup via Startpage/DuckDuckGo. Returns candidate results only. "
                     "Do not rely on this alone for final factual/current answers; prefer web_research."
                 ),
                 "parameters": {
@@ -1764,8 +2195,8 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
             {
                 "name": "web_research",
                 "description": (
-                    "Deep web research. Searches multiple query variants, fetches multiple pages from "
-                    "different domains, and returns numbered sources with relevant excerpts."
+                    "Deep web research. Searches multiple query variants via Startpage and DuckDuckGo, "
+                    "fetches multiple pages from different domains, and returns numbered sources with excerpts."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1798,6 +2229,66 @@ GEMINI_TOOLS_SCHEMA: list[dict[str, Any]] = [
                         "lang": {"type": "string"},
                     },
                     "required": ["query"],
+                },
+            },
+            {
+                "name": "weather",
+                "description": "Get current weather for a location. No API key needed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                    },
+                    "required": ["location"],
+                },
+            },
+            {
+                "name": "dictionary",
+                "description": "Look up the definition, pronunciation, synonyms of an English word.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"word": {"type": "string"}},
+                    "required": ["word"],
+                },
+            },
+            {
+                "name": "password_gen",
+                "description": "Generate cryptographically secure random passwords.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "length": {"type": "integer"},
+                        "count": {"type": "integer"},
+                    },
+                },
+            },
+            {
+                "name": "system_info",
+                "description": "Get current system info: OS, CPU, RAM, disk, uptime.",
+            },
+            {
+                "name": "unit_convert",
+                "description": "Convert between units: length, weight, temperature, data, volume, speed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "number"},
+                        "from_unit": {"type": "string"},
+                        "to_unit": {"type": "string"},
+                    },
+                    "required": ["value", "from_unit", "to_unit"],
+                },
+            },
+            {
+                "name": "hash_encode",
+                "description": "Hash text (md5/sha1/sha256/sha512) or encode/decode base64.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "method": {"type": "string"},
+                    },
+                    "required": ["text"],
                 },
             },
         ],
@@ -2093,9 +2584,7 @@ def _read_picker_key() -> str:
     if b in (b"\x7f", b"\x08"):
         return "BACKSPACE"
     if b == b"\x1b":
-        # FIX: Increased timeout from 0.05s to 0.1s to reduce false ESC
-        # detection on slow SSH connections where escape sequence bytes
-        # may arrive with slight delays.
+        # FIX: Increased timeout from 0.05s to 0.1s for slow SSH connections
         if _select.select([fd], [], [], 0.1)[0]:
             nxt = os.read(fd, 1)
             if nxt in (b"[", b"O"):
@@ -2148,7 +2637,7 @@ def _interactive_confirm(prompt: str, default: bool = True, color: str = C.INFO)
                 if ans in ("n", "no"):
                     return False
             except (EOFError, KeyboardInterrupt):
-                # FIX: Return default instead of sys.exit(0) for graceful handling
+                # FIX: Return default instead of sys.exit(0)
                 return default
 
     selected = default
@@ -2627,8 +3116,7 @@ def _parse_openai_chunk(obj: dict[str, Any], provider: str) -> _ChunkResult:
         msg_obj = obj.get("message", {})
         r.text = msg_obj.get("content") or ""
         r.think = msg_obj.get("thinking") or ""
-        # FIX: Use truthiness check instead of `is True` for Ollama's done field.
-        # Some Ollama versions send done as 1, "true", etc.
+        # FIX: Use truthiness check instead of `is True`
         if obj.get("done"):
             r.finish = obj.get("done_reason") or "stop"
         for tc in (msg_obj.get("tool_calls") or []):
@@ -3223,6 +3711,7 @@ def print_chat_help() -> None:
 
 {C.TOOL}Tools:{C.RESET}
   get_time · calculator · web_search · web_research · fetch_url · wikipedia
+  weather · dictionary · password_gen · system_info · unit_convert · hash_encode
 """)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3458,7 +3947,6 @@ def chat_loop(
             tool_loop_ok = False
 
         # FIX: Improved history compaction — keep a brief tool-usage summary
-        # so the model retains context about what tools were called.
         if tool_loop_ok and had_tool_calls and final_ai_text is not None:
             tool_summary = ""
             if tool_names_used:
