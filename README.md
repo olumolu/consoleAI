@@ -21,7 +21,7 @@ Pure stdlib · Python 3.9+ · No `pip install` — ever.
 |---|---|---|
 | **Dependencies** | Zero — pure Python stdlib | `pip install openai requests rich …` |
 | **Providers** | 9 built-in, switchable at runtime | Usually 1–2 |
-| **Web research** | Multi-source engine (Startpage + DuckDuckGo) with auto-enforcement | None |
+| **Web research** | Multi-source engine (Startpage) with auto-enforcement | None |
 | **Tools** | 12 built-in (search, fetch, weather, calculator, …) | Basic or none |
 | **Security** | SSRF protection with DNS-pinning on every URL | Rarely considered |
 | **UI** | Interactive TUI pickers, live spinner, Markdown + LaTeX rendering | Plain text |
