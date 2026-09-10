@@ -213,12 +213,6 @@ When enabled (`/toggletools`), the model autonomously invokes tools as needed:
 | `web_research` | Deep multi-source research with excerpts | ❌ |
 | `fetch_url` | Fetch & extract readable text from any URL | ❌ |
 | `wikipedia` | Search Wikipedia, return relevant excerpts | ❌ |
-| `weather` | Current conditions for any city (wttr.in) | ❌ |
-| `dictionary` | Definitions, phonetics, synonyms, antonyms | ❌ |
-| `password_gen` | Cryptographically secure passwords | ❌ |
-| `system_info` | OS, CPU, RAM, disk usage, uptime | ❌ |
-| `unit_convert` | Length, weight, temp, data, volume, speed | ❌ |
-| `hash_encode` | MD5 / SHA-1 / SHA-256 / SHA-512 / Base64 | ❌ |
 
 > Every tool runs in a sandboxed thread with a 60-second timeout. The calculator uses AST walking — **no `eval()`**.
 
