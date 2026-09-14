@@ -1,7 +1,7 @@
 #!/bin/bash
 # Universal Chat CLI (Bash/curl/jq/bc) - With Model Selection, HISTORY, SYSTEM PROMPT, STREAMING, IMAGE SUPPORT, THINKING OUTPUT
 # REQUIREMENTS: bash, curl, jq, bc, grep, sed, file, base64 (must be pre-installed on the system)
-# Supports: Gemini, OpenRouter, Groq, Together AI, Cerebras AI, Novita AI, Ollama Cloud, NVIDIA NIM, Cloudflare AI
+# Supports: Gemini, OpenRouter, Groq, Together AI, Novita AI, Ollama Cloud, NVIDIA NIM, Cloudflare AI
 # To Run This Tool First Make It executable with $ chmod +x ai.sh
 # Run This $ ./ai.sh provider
 # filter support added [filter]... (e.g., ./ai.sh openrouter 32b or ./ai.sh gemini pro)
@@ -91,9 +91,6 @@ GROQ_API_KEY=""
 # Together: https://api.together.ai/settings/api-keys
 TOGETHER_API_KEY=""
 
-# Cerebras: https://cloud.cerebras.ai/
-CEREBRAS_API_KEY=""
-
 # Novita: https://novita.ai/
 NOVITA_API_KEY=""
 
@@ -104,7 +101,7 @@ OLLAMA_API_KEY=""
 CLOUDFLARE_API_TOKEN=""
 CLOUDFLARE_ACCOUNT_ID=""
 
-# NVIDIA NIM: https://build.nvidia.com/
+# NVIDIA NIM: https://build.nvidia.com/ (get API key from "Get API Key" on any model page)
 NVIDIA_API_KEY=""
 
 # --- API Endpoints ---
@@ -113,7 +110,6 @@ GEMINI_CHAT_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models/"
 OPENROUTER_CHAT_URL="https://openrouter.ai/api/v1/chat/completions"
 GROQ_CHAT_URL="https://api.groq.com/openai/v1/chat/completions"
 TOGETHER_CHAT_URL="https://api.together.ai/v1/chat/completions"
-CEREBRAS_CHAT_URL="https://api.cerebras.ai/v1/chat/completions"
 NOVITA_CHAT_URL="https://api.novita.ai/v3/openai/chat/completions"
 OLLAMA_CHAT_URL="https://ollama.com/api/chat"
 NVIDIA_CHAT_URL="https://integrate.api.nvidia.com/v1/chat/completions"
@@ -125,7 +121,6 @@ GEMINI_MODELS_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
 GROQ_MODELS_URL="https://api.groq.com/openai/v1/models"
 TOGETHER_MODELS_URL="https://api.together.ai/v1/models"
-CEREBRAS_MODELS_URL="https://api.cerebras.ai/v1/models"
 NOVITA_MODELS_URL="https://api.novita.ai/v3/openai/models"
 OLLAMA_MODELS_URL="https://ollama.com/api/tags"
 NVIDIA_MODELS_URL="https://integrate.api.nvidia.com/v1/models"
@@ -171,7 +166,7 @@ function print_usage() {
   echo -e "  Supports thinking output for reasoning models!"
   echo -e ""
   echo -e "${COLOR_INFO}Supported Providers:${COLOR_RESET}"
-  echo -e "  gemini, openrouter, groq, together, cerebras, novita, ollama, cloudflare, ${COLOR_NVIDIA}nvidia${COLOR_RESET}"
+  echo -e "  gemini, openrouter, groq, together, novita, ollama, cloudflare, ${COLOR_NVIDIA}nvidia${COLOR_RESET}"
   echo -e ""
   echo -e "${COLOR_INFO}Chat Commands:${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}/help${COLOR_RESET}            - Show available commands"
@@ -190,7 +185,6 @@ function print_usage() {
   echo -e "    ${COLOR_BOLD}${COLOR_USER}OpenRouter:${COLOR_RESET} https://openrouter.ai/models"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Groq:${COLOR_RESET}       https://console.groq.com/docs/models"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Together:${COLOR_RESET}   https://docs.together.ai/docs/inference-models"
-  echo -e "    ${COLOR_BOLD}${COLOR_USER}Cerebras:${COLOR_RESET}   https://cloud.cerebras.ai"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Novita:${COLOR_RESET}     https://docs.novita.ai"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Ollama:${COLOR_RESET}     https://ollama.com/library"
   echo -e "    ${COLOR_BOLD}${COLOR_USER}Cloudflare:${COLOR_RESET} https://developers.cloudflare.com/workers-ai/models"
@@ -201,7 +195,6 @@ function print_usage() {
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 groq llama${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 openrouter claude${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 together${COLOR_RESET}"
-  echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 cerebras${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 novita${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 ollama${COLOR_RESET}"
   echo -e "  ${COLOR_BOLD}${COLOR_AI}$0 cloudflare${COLOR_RESET}"
@@ -272,9 +265,6 @@ check_placeholder_key() {
     elif [[ "$provider_name" == "groq" && "$key_value" == "gsk_"* && ${#key_value} -lt 10 ]]; then
         placeholder_found=true
         message="appears to be an incomplete Groq key (starts with gsk_ but is too short)"
-    elif [[ "$provider_name" == "cerebras" && "$key_value" == "csk-" ]]; then
-        placeholder_found=true
-        message="is the default Cerebras prefix placeholder ('csk-')"
     elif [[ "$provider_name" == "novita" && ${#key_value} -lt 10 ]]; then
         placeholder_found=true
         message="appears to be too short to be a valid key"
@@ -445,7 +435,6 @@ case "$PROVIDER" in
     openrouter) API_KEY="$OPENROUTER_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
     groq)       API_KEY="$GROQ_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
     together)   API_KEY="$TOGETHER_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
-    cerebras)   API_KEY="$CEREBRAS_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
     novita)     API_KEY="$NOVITA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
     ollama)     API_KEY="$OLLAMA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
     nvidia)     API_KEY="$NVIDIA_API_KEY"; check_placeholder_key "$API_KEY" "$PROVIDER"; key_check_status=$? ;;
@@ -468,7 +457,7 @@ case "$PROVIDER" in
         fi
         ;;
     *)
-        echo -e "${COLOR_ERROR}Error: Unknown provider '$PROVIDER'. Choose from: gemini, openrouter, groq, together, cerebras, novita, ollama, cloudflare, nvidia${COLOR_RESET}" >&2
+        echo -e "${COLOR_ERROR}Error: Unknown provider '$PROVIDER'. Choose from: gemini, openrouter, groq, together, novita, ollama, cloudflare, nvidia${COLOR_RESET}" >&2
         print_usage
         exit 1
         ;;
@@ -506,11 +495,6 @@ case "$PROVIDER" in
         MODELS_URL="$TOGETHER_MODELS_URL"
         MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
         JQ_QUERY='. | sort_by(.id) | .[].id'
-        ;;
-    cerebras)
-        MODELS_URL="$CEREBRAS_MODELS_URL"
-        MODELS_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
-        JQ_QUERY='.data | sort_by(.id) | .[].id'
         ;;
     novita)
         MODELS_URL="$NOVITA_MODELS_URL"
@@ -685,7 +669,7 @@ case "$PROVIDER" in
         CHAT_API_URL="${GEMINI_CHAT_URL_BASE}${MODEL_ID}:streamGenerateContent?key=${API_KEY}&alt=sse"
         IS_OPENAI_COMPATIBLE=false
         ;;
-    openrouter|groq|together|cerebras|novita|ollama|nvidia|cloudflare)
+    openrouter|groq|together|novita|ollama|nvidia|cloudflare)
         CHAT_AUTH_HEADER="Authorization: Bearer ${API_KEY}"
         IS_OPENAI_COMPATIBLE=true
         case "$PROVIDER" in
@@ -696,7 +680,6 @@ case "$PROVIDER" in
                 ;;
             groq)       CHAT_API_URL="$GROQ_CHAT_URL" ;;
             together)   CHAT_API_URL="$TOGETHER_CHAT_URL" ;;
-            cerebras)   CHAT_API_URL="$CEREBRAS_CHAT_URL" ;;
             novita)     CHAT_API_URL="$NOVITA_CHAT_URL" ;;
             nvidia)
                 CHAT_API_URL="$NVIDIA_CHAT_URL"
