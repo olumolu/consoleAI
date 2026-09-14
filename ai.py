@@ -20,7 +20,7 @@ Features:
 Usage:
   python ai.py [provider] [filter]...
 
-Providers: gemini, openrouter, groq, together, cerebras, novita, cloudflare, ollama, nvidia
+Providers: gemini, openrouter, groq, together, novita, cloudflare, ollama, nvidia
 
 Chat commands:
   /history            Show conversation history
@@ -104,7 +104,6 @@ API_KEYS: dict[str, str] = {
     "openrouter": "",   # https://openrouter.ai/keys
     "groq":       "",   # https://console.groq.com/keys
     "together":   "",   # https://api.together.ai/settings/api-keys
-    "cerebras":   "",   # https://cloud.cerebras.ai/
     "novita":     "",   # https://novita.ai/
     "ollama":     "",   # https://ollama.com/ (leave blank for local)
     "cloudflare": "",   # https://dash.cloudflare.com Format: ACCOUNT_ID:API_TOKEN
@@ -434,10 +433,6 @@ ENDPOINTS: dict[str, dict[str, str]] = {
     "together": {
         "chat":   "https://api.together.ai/v1/chat/completions",
         "models": "https://api.together.ai/v1/models",
-    },
-    "cerebras": {
-        "chat":   "https://api.cerebras.ai/v1/chat/completions",
-        "models": "https://api.cerebras.ai/v1/models",
     },
     "novita": {
         "chat":   "https://api.novita.ai/v3/openai/chat/completions",
@@ -2201,8 +2196,7 @@ def _render_provider_picker(providers: list[str], selected: int) -> None:
         display_name = {
             "openrouter": "OpenRouter", "cloudflare": "Cloudflare",
             "gemini": "Gemini", "groq": "Groq", "together": "Together",
-            "cerebras": "Cerebras", "novita": "Novita", "nvidia": "Nvidia",
-            "ollama": "Ollama",
+            "novita": "Novita", "nvidia": "Nvidia", "ollama": "Ollama",
         }.get(p, p.title())
         row = f"  {num}. {display_name}"
         if idx == selected:
@@ -2597,9 +2591,6 @@ def build_payload(
             "num_predict": DEFAULT_MAX_TOKENS,
             "top_p": DEFAULT_TOP_P,
         }
-    elif provider == "cerebras":
-        out["max_completion_tokens"] = DEFAULT_MAX_TOKENS
-        out["top_p"] = DEFAULT_TOP_P
     elif provider != "together":
         out["max_tokens"] = DEFAULT_MAX_TOKENS
         out["top_p"] = DEFAULT_TOP_P
@@ -3187,7 +3178,7 @@ def print_usage() -> None:
   python {me} [provider] [filter]...
 
 {C.INFO}Providers:{C.RESET}
-  gemini  openrouter  groq  together  cerebras  novita  cloudflare  ollama  nvidia
+  gemini  openrouter  groq  together  novita  cloudflare  ollama  nvidia
 
 {C.INFO}Commands:{C.RESET}
   /history
