@@ -157,7 +157,6 @@ On launch you'll be asked:
 | **OpenRouter** | `openrouter.ai` | [Keys](https://openrouter.ai/keys) | 200+ models via one key |
 | **Groq** | `api.groq.com` | [Console](https://console.groq.com/keys) | Ultra-fast inference |
 | **Together** | `api.together.ai` | [Settings](https://api.together.ai/settings/api-keys) | Open-source models |
-| **Cerebras** | `api.cerebras.ai` | [Cloud](https://cloud.cerebras.ai/) | Wafer-scale speed |
 | **Novita** | `api.novita.ai` | [Dashboard](https://novita.ai/) | 200+ serverless models |
 | **Cloudflare** | `api.cloudflare.com` | [Dash](https://dash.cloudflare.com/) | Format: `ACCOUNT_ID:API_TOKEN` |
 | **Nvidia** | `integrate.api.nvidia.com` | [Build](https://build.nvidia.com/) | NIM endpoints |
