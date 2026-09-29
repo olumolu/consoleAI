@@ -2979,11 +2979,9 @@ def stream_response(
     if error_msg:
         if renderer.full_text or tool_calls_out:
             eprint(f"{C.WARN}(Stream ended after partial output: {error_msg}){C.RESET}")
-        full_text = renderer.full_text[:MAX_MESSAGE_LENGTH]
-        clean = strip_think_tags(full_text)
-        return (clean if clean else ""), tool_calls_out
-    cprint(f"{C.ERROR}{error_msg}{C.RESET}")
-    return None, []
+        else:
+            cprint(f"{C.ERROR}{error_msg}{C.RESET}")
+            return None, []
 
     full_text = renderer.full_text[:MAX_MESSAGE_LENGTH]
     clean = strip_think_tags(full_text)
