@@ -1,7 +1,7 @@
 #!/bin/bash
 # Universal Chat CLI (Bash/curl/jq/bc)
 # REQUIREMENTS: bash 4.4+, curl, jq, bc, grep, sed, file, base64
-# Supports: Gemini, OpenRouter, Groq, Together AI, Novita AI, Ollama (cloud or local),
+# Supports: Gemini, OpenRouter, Groq, Novita AI, Ollama (cloud or local),
 #           NVIDIA NIM, Cloudflare Workers AI
 #
 # Run:   chmod +x ai.sh && ./ai.sh <provider> [filter]...
@@ -51,21 +51,32 @@ RL_E=$'\002'   # readline: end of non-printing sequence
 ##########################################################################
 #                    !!! EDIT YOUR API KEYS HERE !!!                     #
 ##########################################################################
-GEMINI_API_KEY=""          # https://aistudio.google.com/app/apikey
-OPENROUTER_API_KEY=""      # https://openrouter.ai/keys
-GROQ_API_KEY=""            # https://console.groq.com/keys
-TOGETHER_API_KEY=""        # https://api.together.ai/settings/api-keys
-NOVITA_API_KEY=""          # https://novita.ai/
-OLLAMA_API_KEY=""          # https://ollama.com/  (leave EMPTY to use local Ollama)
-CLOUDFLARE_API_TOKEN=""    # https://developers.cloudflare.com/workers-ai/
-CLOUDFLARE_ACCOUNT_ID=""
-NVIDIA_API_KEY=""          # https://build.nvidia.com/
+# Gemini: https://aistudio.google.com/app/apikey
+GEMINI_API_KEY="${GEMINI_API_KEY:-}"
+
+# OpenRouter: https://openrouter.ai/keys
+OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
+
+# Groq: https://console.groq.com/keys
+GROQ_API_KEY="${GROQ_API_KEY:-}"
+
+# Novita: https://novita.ai/
+NOVITA_API_KEY="${NOVITA_API_KEY:-}"
+
+# Ollama Cloud: https://ollama.com/
+OLLAMA_API_KEY="${OLLAMA_API_KEY:-}"
+
+# Cloudflare AI: https://developers.cloudflare.com/workers-ai/
+CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
+CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-}"
+
+# NVIDIA NIM: https://build.nvidia.com/ (get API key from "Get API Key" on any model page)
+NVIDIA_API_KEY="${NVIDIA_API_KEY:-}"
 
 # --- Endpoints ---
 GEMINI_CHAT_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models/"
 OPENROUTER_CHAT_URL="https://openrouter.ai/api/v1/chat/completions"
 GROQ_CHAT_URL="https://api.groq.com/openai/v1/chat/completions"
-TOGETHER_CHAT_URL="https://api.together.ai/v1/chat/completions"
 NOVITA_CHAT_URL="https://api.novita.ai/v3/openai/chat/completions"
 OLLAMA_CHAT_URL="https://ollama.com/api/chat"
 NVIDIA_CHAT_URL="https://integrate.api.nvidia.com/v1/chat/completions"
@@ -73,7 +84,6 @@ NVIDIA_CHAT_URL="https://integrate.api.nvidia.com/v1/chat/completions"
 GEMINI_MODELS_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
 GROQ_MODELS_URL="https://api.groq.com/openai/v1/models"
-TOGETHER_MODELS_URL="https://api.together.ai/v1/models"
 NOVITA_MODELS_URL="https://api.novita.ai/v3/openai/models"
 OLLAMA_MODELS_URL="https://ollama.com/api/tags"
 NVIDIA_MODELS_URL="https://integrate.api.nvidia.com/v1/models"
@@ -140,7 +150,7 @@ print_usage() {
     echo -e "${COLOR_INFO}Usage: $0 <provider> [filter]...${COLOR_RESET}"
     echo -e ""
     echo -e "${COLOR_INFO}Supported providers:${COLOR_RESET}"
-    echo -e "  gemini, openrouter, groq, together, novita, ollama, cloudflare, ${COLOR_NVIDIA}nvidia${COLOR_RESET}"
+    echo -e "  gemini, openrouter, groq, novita, ollama, cloudflare, ${COLOR_NVIDIA}nvidia${COLOR_RESET}"
     echo -e ""
     print_chat_help
     echo -e ""
@@ -452,7 +462,6 @@ case "$PROVIDER" in
     gemini)     API_KEY="$GEMINI_API_KEY" ;;
     openrouter) API_KEY="$OPENROUTER_API_KEY" ;;
     groq)       API_KEY="$GROQ_API_KEY" ;;
-    together)   API_KEY="$TOGETHER_API_KEY" ;;
     novita)     API_KEY="$NOVITA_API_KEY" ;;
     ollama)     API_KEY="$OLLAMA_API_KEY" ;;
     nvidia)     API_KEY="$NVIDIA_API_KEY" ;;
@@ -500,11 +509,6 @@ case "$PROVIDER" in
         MODELS_URL="$GROQ_MODELS_URL"
         MODELS_HEADERS+=("Authorization: Bearer ${API_KEY}")
         JQ_QUERY='.data | sort_by(.id) | .[].id'
-        ;;
-    together)
-        MODELS_URL="$TOGETHER_MODELS_URL"
-        MODELS_HEADERS+=("Authorization: Bearer ${API_KEY}")
-        JQ_QUERY='(if type=="array" then . else .data end) | sort_by(.id) | .[].id'
         ;;
     novita)
         MODELS_URL="$NOVITA_MODELS_URL"
@@ -645,7 +649,7 @@ case "$PROVIDER" in
         CHAT_HEADERS+=("x-goog-api-key: ${API_KEY}")
         IS_OPENAI_COMPATIBLE=false
         ;;
-    openrouter|groq|together|novita|ollama|nvidia|cloudflare)
+    openrouter|groq|novita|ollama|nvidia|cloudflare)
         IS_OPENAI_COMPATIBLE=true
         [[ -n "$API_KEY" ]] && CHAT_HEADERS+=("Authorization: Bearer ${API_KEY}")
         case "$PROVIDER" in
@@ -654,7 +658,6 @@ case "$PROVIDER" in
                 CHAT_HEADERS+=("HTTP-Referer: urn:chatcli:bash" "X-Title: BashChatCLI")
                 ;;
             groq)       CHAT_API_URL="$GROQ_CHAT_URL" ;;
-            together)   CHAT_API_URL="$TOGETHER_CHAT_URL" ;;
             novita)     CHAT_API_URL="$NOVITA_CHAT_URL" ;;
             nvidia)     CHAT_API_URL="$NVIDIA_CHAT_URL" ;;
             ollama)     CHAT_API_URL="$OLLAMA_CHAT_URL" ;;
@@ -989,8 +992,6 @@ while true; do
                     '. + {max_tokens: ($max_tokens_str | tonumber), top_p: ($top_p_str | tonumber)}' \
                     <<< "$base_payload")
             fi
-        elif [[ "$PROVIDER" == "together" ]]; then
-            json_payload="$base_payload"
         else
             json_payload=$(jq -c \
                 --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
@@ -1090,7 +1091,7 @@ while true; do
                 IFS= read -r -d $'\x1f' chunk_error
             } < <(jq -j '[
                     ([.candidates[0].content.parts[]? | select(.thought != true) | .text // ""] | join("")),
-                    "",
+                    ([.candidates[0].content.parts[]? | select(.thought == true) | .text // ""] | join("")),
                     (.candidates[0].finishReason // ""),
                     (.error.message? // .promptFeedback.blockReason? // "")
                 ] | .[] | (tostring, "\u001f")' <<< "$json_chunk")
