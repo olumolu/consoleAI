@@ -8,7 +8,7 @@ Features:
   - LaTeX rendering (Greek letters, superscripts, fractions → Unicode)
   - Image attachment support (Vision models)
   - Multi-line input (backslash continuation + /paste mode)
-  - Multi-provider support (Gemini, OpenRouter, Groq, Together, etc.)
+  - Multi-provider support (Gemini, OpenRouter, Groq, etc.)
   - Tool/Function calling (Web search, fetch, Calculator, Time, Wikipedia)
   - Deep web research via Startpage HTML scraping
   - Live tool progress spinner
@@ -20,7 +20,7 @@ Features:
 Usage:
   python ai.py [provider] [filter]...
 
-Providers: gemini, openrouter, groq, together, novita, cloudflare, ollama, nvidia
+Providers: gemini, openrouter, groq, novita, cloudflare, ollama, nvidia
 
 Chat commands:
   /history            Show conversation history
@@ -103,7 +103,6 @@ API_KEYS: dict[str, str] = {
     "gemini":     "",   # https://aistudio.google.com/app/apikey
     "openrouter": "",   # https://openrouter.ai/keys
     "groq":       "",   # https://console.groq.com/keys
-    "together":   "",   # https://api.together.ai/settings/api-keys
     "novita":     "",   # https://novita.ai/
     "ollama":     "",   # https://ollama.com/ (leave blank for local)
     "cloudflare": "",   # https://dash.cloudflare.com Format: ACCOUNT_ID:API_TOKEN
@@ -429,10 +428,6 @@ ENDPOINTS: dict[str, dict[str, str]] = {
     "groq": {
         "chat":   "https://api.groq.com/openai/v1/chat/completions",
         "models": "https://api.groq.com/openai/v1/models",
-    },
-    "together": {
-        "chat":   "https://api.together.ai/v1/chat/completions",
-        "models": "https://api.together.ai/v1/models",
     },
     "novita": {
         "chat":   "https://api.novita.ai/v3/openai/chat/completions",
@@ -1976,9 +1971,6 @@ def fetch_models(provider: str, api_key: str) -> Optional[list[str]]:
             ]
         elif provider == "ollama":
             models = [m["name"] for m in data.get("models", [])]
-        elif provider == "together":
-            arr = data if isinstance(data, list) else data.get("data", [])
-            models = sorted(m["id"] for m in arr)
         elif provider == "cloudflare":
             models = sorted(
                 m["name"] for m in data.get("result", [])
@@ -2195,7 +2187,7 @@ def _render_provider_picker(providers: list[str], selected: int) -> None:
         num = idx + 1
         display_name = {
             "openrouter": "OpenRouter", "cloudflare": "Cloudflare",
-            "gemini": "Gemini", "groq": "Groq", "together": "Together",
+            "gemini": "Gemini", "groq": "Groq",
             "novita": "Novita", "nvidia": "Nvidia", "ollama": "Ollama",
         }.get(p, p.title())
         row = f"  {num}. {display_name}"
@@ -2591,9 +2583,6 @@ def build_payload(
             "num_predict": DEFAULT_MAX_TOKENS,
             "top_p": DEFAULT_TOP_P,
         }
-    elif provider != "together":
-        out["max_tokens"] = DEFAULT_MAX_TOKENS
-        out["top_p"] = DEFAULT_TOP_P
     if provider == "nvidia" and enable_thinking:
         out["chat_template_kwargs"] = {"thinking": True, "reasoning_effort": "max"}
     return out
@@ -3176,7 +3165,7 @@ def print_usage() -> None:
   python {me} [provider] [filter]...
 
 {C.INFO}Providers:{C.RESET}
-  gemini  openrouter  groq  together  novita  cloudflare  ollama  nvidia
+  gemini  openrouter  groq  novita  cloudflare  ollama  nvidia
 
 {C.INFO}Commands:{C.RESET}
   /history
