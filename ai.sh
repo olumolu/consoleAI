@@ -1,8 +1,8 @@
 #!/bin/bash
 # Universal Chat CLI (Bash/curl/jq/bc)
 # REQUIREMENTS: bash 4.4+, curl, jq, bc, grep, sed, file, base64
-# Supports: Gemini, OpenRouter, Groq, Novita AI, Ollama (cloud or local),
-#           NVIDIA NIM, Cloudflare Workers AI
+# Supports: Gemini, OpenRouter, Groq, Novita AI, NVIDIA NIM,
+#           Cloudflare Workers AI
 #
 # Run:   chmod +x ai.sh && ./ai.sh <provider> [filter]...
 # e.g.:  ./ai.sh openrouter 32b     ./ai.sh gemini pro
@@ -63,9 +63,6 @@ GROQ_API_KEY="${GROQ_API_KEY:-}"
 # Novita: https://novita.ai/
 NOVITA_API_KEY="${NOVITA_API_KEY:-}"
 
-# Ollama Cloud: https://ollama.com/
-OLLAMA_API_KEY="${OLLAMA_API_KEY:-}"
-
 # Cloudflare AI: https://developers.cloudflare.com/workers-ai/
 CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
 CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-}"
@@ -78,14 +75,12 @@ GEMINI_CHAT_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models/"
 OPENROUTER_CHAT_URL="https://openrouter.ai/api/v1/chat/completions"
 GROQ_CHAT_URL="https://api.groq.com/openai/v1/chat/completions"
 NOVITA_CHAT_URL="https://api.novita.ai/v3/openai/chat/completions"
-OLLAMA_CHAT_URL="https://ollama.com/api/chat"
 NVIDIA_CHAT_URL="https://integrate.api.nvidia.com/v1/chat/completions"
 
 GEMINI_MODELS_URL_BASE="https://generativelanguage.googleapis.com/v1beta/models"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
 GROQ_MODELS_URL="https://api.groq.com/openai/v1/models"
 NOVITA_MODELS_URL="https://api.novita.ai/v3/openai/models"
-OLLAMA_MODELS_URL="https://ollama.com/api/tags"
 NVIDIA_MODELS_URL="https://integrate.api.nvidia.com/v1/models"
 
 # Interactive shells get readline history (up-arrow recall)
@@ -150,7 +145,7 @@ print_usage() {
     echo -e "${COLOR_INFO}Usage: $0 <provider> [filter]...${COLOR_RESET}"
     echo -e ""
     echo -e "${COLOR_INFO}Supported providers:${COLOR_RESET}"
-    echo -e "  gemini, openrouter, groq, novita, ollama, cloudflare, ${COLOR_NVIDIA}nvidia${COLOR_RESET}"
+    echo -e "  gemini, openrouter, groq, novita, cloudflare, ${COLOR_NVIDIA}nvidia${COLOR_RESET}"
     echo -e ""
     print_chat_help
     echo -e ""
@@ -196,10 +191,6 @@ validate_session_name() {
 check_placeholder_key() {
     local key_value="$1" provider_name="$2" message=""
 
-    if [[ "$provider_name" == "ollama" && -z "$key_value" ]]; then
-        return 0   # local Ollama needs no key
-    fi
-
     if [[ -z "$key_value" ]]; then
         message="is empty"
     elif [[ "$key_value" == "YOUR_"* || "$key_value" == *"-HERE" || "$key_value" == *"..." ]]; then
@@ -210,7 +201,7 @@ check_placeholder_key() {
         message="is the default OpenRouter prefix placeholder"
     elif [[ "$provider_name" == "groq" && "$key_value" == "gsk_"* && ${#key_value} -lt 10 ]]; then
         message="appears to be an incomplete Groq key"
-    elif [[ "$provider_name" =~ ^(novita|ollama|cloudflare|nvidia)$ && ${#key_value} -lt 10 ]]; then
+    elif [[ "$provider_name" =~ ^(novita|cloudflare|nvidia)$ && ${#key_value} -lt 10 ]]; then
         message="appears to be too short to be a valid key"
     fi
 
@@ -463,7 +454,6 @@ case "$PROVIDER" in
     openrouter) API_KEY="$OPENROUTER_API_KEY" ;;
     groq)       API_KEY="$GROQ_API_KEY" ;;
     novita)     API_KEY="$NOVITA_API_KEY" ;;
-    ollama)     API_KEY="$OLLAMA_API_KEY" ;;
     nvidia)     API_KEY="$NVIDIA_API_KEY" ;;
     cloudflare)
         if [[ -z "$CLOUDFLARE_ACCOUNT_ID" ]]; then
@@ -480,13 +470,6 @@ case "$PROVIDER" in
 esac
 check_placeholder_key "$API_KEY" "$PROVIDER" || key_check_status=1
 if [[ "$key_check_status" -ne 0 ]]; then exit 1; fi
-
-# Ollama with no key => local server
-if [[ "$PROVIDER" == "ollama" && -z "$API_KEY" ]]; then
-    OLLAMA_CHAT_URL="http://localhost:11434/api/chat"
-    OLLAMA_MODELS_URL="http://localhost:11434/api/tags"
-    echo -e "${COLOR_INFO}No Ollama key set: using local server at localhost:11434.${COLOR_RESET}"
-fi
 
 # --- Fetch and select model ---
 echo -e "${COLOR_INFO}Fetching available models for ${PROVIDER^^}...${COLOR_RESET}"
@@ -514,11 +497,6 @@ case "$PROVIDER" in
         MODELS_URL="$NOVITA_MODELS_URL"
         MODELS_HEADERS+=("Authorization: Bearer ${API_KEY}")
         JQ_QUERY='.data | sort_by(.id) | .[].id'
-        ;;
-    ollama)
-        MODELS_URL="$OLLAMA_MODELS_URL"
-        [[ -n "$API_KEY" ]] && MODELS_HEADERS+=("Authorization: Bearer ${API_KEY}")
-        JQ_QUERY='.models[] | .name'
         ;;
     nvidia)
         MODELS_URL="$NVIDIA_MODELS_URL"
@@ -649,9 +627,9 @@ case "$PROVIDER" in
         CHAT_HEADERS+=("x-goog-api-key: ${API_KEY}")
         IS_OPENAI_COMPATIBLE=false
         ;;
-    openrouter|groq|novita|ollama|nvidia|cloudflare)
+    openrouter|groq|novita|nvidia|cloudflare)
         IS_OPENAI_COMPATIBLE=true
-        [[ -n "$API_KEY" ]] && CHAT_HEADERS+=("Authorization: Bearer ${API_KEY}")
+        CHAT_HEADERS+=("Authorization: Bearer ${API_KEY}")
         case "$PROVIDER" in
             openrouter)
                 CHAT_API_URL="$OPENROUTER_CHAT_URL"
@@ -660,7 +638,6 @@ case "$PROVIDER" in
             groq)       CHAT_API_URL="$GROQ_CHAT_URL" ;;
             novita)     CHAT_API_URL="$NOVITA_CHAT_URL" ;;
             nvidia)     CHAT_API_URL="$NVIDIA_CHAT_URL" ;;
-            ollama)     CHAT_API_URL="$OLLAMA_CHAT_URL" ;;
             cloudflare) CHAT_API_URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions" ;;
         esac
         ;;
@@ -907,11 +884,6 @@ while true; do
                 --arg mime "$CURRENT_IMAGE_MIME" \
                 --rawfile data <(printf '%s' "$CURRENT_IMAGE_BASE64") \
                 '{role: "user", parts: [{text: $text}, {inlineData: {mimeType: $mime, data: $data}}]}')
-        elif [[ "$PROVIDER" == "ollama" ]]; then
-            user_message_json=$(jq -n \
-                --arg content "$user_input" \
-                --rawfile image_data <(printf '%s' "$CURRENT_IMAGE_BASE64") \
-                '{role: "user", content: $content, images: [$image_data]}')
         else
             user_message_json=$(jq -n \
                 --arg text "$user_input" \
@@ -970,13 +942,6 @@ while true; do
 
         if [[ -z "$base_payload" ]]; then
             json_payload=""
-        elif [[ "$PROVIDER" == "ollama" ]]; then
-            json_payload=$(jq -c \
-                --arg max_tokens_str "$DEFAULT_OAI_MAX_TOKENS" \
-                --arg top_p_str "$DEFAULT_OAI_TOP_P" \
-                --argjson think "$ENABLE_THINKING_OUTPUT" \
-                '. + {think: $think, options: {num_predict: ($max_tokens_str | tonumber), top_p: ($top_p_str | tonumber)}}' \
-                <<< "$base_payload")
         elif [[ "$PROVIDER" == "nvidia" ]]; then
             model_lc="${MODEL_ID,,}"
             if [[ "$ENABLE_THINKING_OUTPUT" == true && ( "$model_lc" == *deepseek* || "$model_lc" == *reason* || "$model_lc" == *nemotron* || "$model_lc" == *qwq* ) ]]; then
@@ -1058,31 +1023,17 @@ while true; do
         # One jq call per chunk; fields are \x1f-terminated so embedded newlines survive.
         text_chunk="" thinking_chunk="" current_sfr="" chunk_error=""
         if [[ "$IS_OPENAI_COMPATIBLE" == true ]]; then
-            if [[ "$PROVIDER" == "ollama" ]]; then
-                {
-                    IFS= read -r -d $'\x1f' text_chunk
-                    IFS= read -r -d $'\x1f' thinking_chunk
-                    IFS= read -r -d $'\x1f' current_sfr
-                    IFS= read -r -d $'\x1f' chunk_error
-                } < <(jq -j '[
-                        (.message.content // ""),
-                        (.message.thinking // ""),
-                        (if .done == true then (.done_reason // "stop") else "" end),
-                        (.error // "")
-                    ] | .[] | (tostring, "\u001f")' <<< "$json_chunk")
-            else
-                {
-                    IFS= read -r -d $'\x1f' text_chunk
-                    IFS= read -r -d $'\x1f' thinking_chunk
-                    IFS= read -r -d $'\x1f' current_sfr
-                    IFS= read -r -d $'\x1f' chunk_error
-                } < <(jq -j '[
-                        (.choices[0].delta.content // .choices[0].text // ""),
-                        (.choices[0].delta.reasoning_content // .choices[0].delta.reasoning // ""),
-                        (.choices[0].finish_reason // ""),
-                        (.error.message? // .error? // .detail? // "")
-                    ] | .[] | (tostring, "\u001f")' <<< "$json_chunk")
-            fi
+            {
+                IFS= read -r -d $'\x1f' text_chunk
+                IFS= read -r -d $'\x1f' thinking_chunk
+                IFS= read -r -d $'\x1f' current_sfr
+                IFS= read -r -d $'\x1f' chunk_error
+            } < <(jq -j '[
+                    (.choices[0].delta.content // .choices[0].text // ""),
+                    (.choices[0].delta.reasoning_content // .choices[0].delta.reasoning // ""),
+                    (.choices[0].finish_reason // ""),
+                    (.error.message? // .error? // .detail? // "")
+                ] | .[] | (tostring, "\u001f")' <<< "$json_chunk")
         else
             {
                 IFS= read -r -d $'\x1f' text_chunk
@@ -1128,7 +1079,6 @@ while true; do
             fi
             break
         fi
-        if [[ "$PROVIDER" == "ollama" && -n "$stream_finish_reason" ]]; then break; fi
     done
 
     # Flush any held-back partial tag that never completed
